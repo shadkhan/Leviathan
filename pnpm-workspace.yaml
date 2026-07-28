@@ -1,0 +1,7 @@
+packages:
+  - 'packages/*'
+
+# pnpm 10 blocks install scripts by default. esbuild's fetches its platform
+# binary, so it has to be allowed explicitly — an allowlist of exactly one.
+onlyBuiltDependencies:
+  - esbuild

@@ -1,0 +1,108 @@
+# CI for Leviathan.
+#
+# Two jobs, split by what they prove:
+#
+#   engine — the Rust core is correct, lint-clean, and still portable.
+#   shell  — the WASM package builds, runs, and fits the bundle budget.
+#
+# The layering check lives in `engine` on purpose: "the core is reusable" is a
+# property of the core, and it should fail there rather than downstream.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings everywhere, not just clippy's own lints.
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: engine (rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      # The contract that keeps leviathan-core publishable on its own:
+      # no wasm-bindgen, no async runtime, no I/O. See DEEP_REASONING.md C2.
+      - name: Layering contract
+        run: bash scripts/check-layering.sh
+
+      # docs.rs has to build clean before M7 can publish; catching a broken
+      # intra-doc link now is cheaper than catching it at release.
+      - name: Docs
+        run: cargo doc --package leviathan-core --no-deps
+
+  shell:
+    name: shell (wasm + typescript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Must precede typecheck: the WASM package's .d.ts is generated, not
+      # committed, and the Worker imports it.
+      - name: Build WASM package
+        run: pnpm build:wasm
+
+      - name: Smoke-test the engine
+        run: pnpm -C packages/extension smoke
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # Also enforces the ≤150 KB gz JS/CSS budget (SPEC §M2).
+      - name: Build extension
+        run: pnpm build
+
+      - name: Upload unpacked extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: leviathan-unpacked
+          path: packages/extension/dist
+          if-no-files-found: error

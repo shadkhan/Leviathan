@@ -1,0 +1,11 @@
+{
+  // The Worker project. `lib` is WebWorker, not DOM — which is the point: this
+  // is the compiler enforcing that engine code cannot touch the document. It
+  // lives inside src/worker so editors pick it up automatically for these files.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "WebWorker"],
+    "types": []
+  },
+  "include": [".", "../protocol", "../wasm"]
+}

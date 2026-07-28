@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/leviathan-core", "crates/leviathan-wasm", "crates/leviathan-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shadkhan/leviathan"
+homepage = "https://github.com/shadkhan/leviathan"
+authors = ["Shad Khan"]
+
+[workspace.dependencies]
+leviathan-core = { version = "0.1.0", path = "crates/leviathan-core" }
+
+# Size-first: the .wasm is a bundled extension asset, so bytes are user-visible.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Speed-first, for native benchmarking only.
+#
+# Benchmarks must not run under `release`: `opt-level = "s"` is the right choice
+# for a browser extension and the wrong one for a throughput number, and
+# publishing a MB/s figure produced by a size-optimized build would understate
+# the engine and mislead anyone reproducing it.
+#
+#   cargo run --profile bench-native -p leviathan-cli -- bench ...
+#
+# `panic = "unwind"` so a panic inside one workload is reported against that
+# workload rather than killing the whole run.
+[profile.bench-native]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = 1
+strip = false

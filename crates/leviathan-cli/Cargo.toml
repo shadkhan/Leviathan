@@ -1,0 +1,20 @@
+[package]
+name = "leviathan-cli"
+description = "Command-line harness for leviathan-core: format detection, fixtures and benchmarks."
+categories = ["command-line-utilities", "parser-implementations"]
+keywords = ["json", "ndjson", "streaming", "benchmark"]
+publish = false # published from M7, once it does something worth installing
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "leviathan"
+path = "src/main.rs"
+
+[dependencies]
+leviathan-core.workspace = true

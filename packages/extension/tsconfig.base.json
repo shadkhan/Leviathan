@@ -1,0 +1,28 @@
+{
+  // Shared compiler settings. The UI and the Worker split from here because
+  // they have genuinely different globals — `window` does not exist in a
+  // Worker, and letting the compiler believe otherwise is how you ship a
+  // `document.` reference into a Worker bundle and find out at runtime.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+
+    // esbuild does the emitting; tsc is here purely as a checker.
+    "noEmit": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "useUnknownInCatchVariables": true,
+    "forceConsistentCasingInFileNames": true
+  }
+}

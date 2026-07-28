@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Leviathan",
+  "version": "0.1.0",
+  "description": "A JSON viewer that survives large files. Streams and indexes multi-gigabyte JSON and NDJSON entirely on your machine.",
+  "minimum_chrome_version": "111",
+  "action": {
+    "default_title": "Open Leviathan"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [],
+  "host_permissions": [],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'"
+  }
+}

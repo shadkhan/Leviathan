@@ -1,0 +1,281 @@
+/*
+ * Viewer styling.
+ *
+ * Dark-first, system font stack, no framework and no web fonts: this ships in
+ * an extension package where every kilobyte is user-visible (SPEC §M2 budget:
+ * ≤150 KB gz for all JS and CSS). Light mode follows the OS.
+ *
+ * The palette is defined once here as custom properties so the M2 tree renderer
+ * inherits it rather than inventing a second one.
+ */
+
+:root {
+  color-scheme: dark light;
+
+  --bg: #0d1117;
+  --bg-raised: #161b22;
+  --bg-sunken: #010409;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --accent: #4a9eff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  --radius: 6px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff;
+    --bg-raised: #f6f8fa;
+    --bg-sunken: #eaeef2;
+    --border: #d0d7de;
+    --text: #1f2328;
+    --text-dim: #656d76;
+    --accent: #0969da;
+    --ok: #1a7f37;
+    --warn: #9a6700;
+    --err: #cf222e;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+
+footer.bar {
+  border-bottom: none;
+  border-top: 1px solid var(--border);
+  margin-top: auto;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+footer.bar a {
+  margin-left: auto;
+  color: var(--text-dim);
+}
+
+.wordmark {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.tagline {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.status {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex: none;
+}
+
+.dot[data-state="pending"] {
+  background: var(--warn);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.dot[data-state="ready"] {
+  background: var(--ok);
+}
+.dot[data-state="failed"] {
+  background: var(--err);
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dot[data-state="pending"] {
+    animation: none;
+  }
+}
+
+main {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.panel {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.panel h2 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+
+.prose {
+  margin: 0 0 14px;
+  color: var(--text-dim);
+  max-width: 62ch;
+}
+
+.row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field.block {
+  margin-top: 12px;
+}
+
+.field > span {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+input,
+textarea,
+button {
+  font-family: var(--mono);
+  font-size: 13px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  background: var(--bg-sunken);
+  color: var(--text);
+}
+
+textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+.drop:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+button {
+  background: var(--bg);
+  cursor: pointer;
+  font-family: var(--sans);
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.result {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-dim);
+  min-height: 1.5em;
+}
+
+.result[data-state="ok"] {
+  color: var(--ok);
+}
+.result[data-state="err"] {
+  color: var(--err);
+}
+
+.drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 22px 16px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+}
+
+.drop[data-over="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.drop .or {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@leviathan/extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Leviathan MV3 extension shell — UI, worker host, and typed protocol.",
+  "scripts": {
+    "build:wasm": "wasm-pack build ../../crates/leviathan-wasm --target web --out-dir ../../packages/extension/src/wasm --out-name leviathan_wasm",
+    "build": "pnpm build:wasm && node build.mjs",
+    "dev": "pnpm build:wasm && node build.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p src/worker/tsconfig.json --noEmit",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.28",
+    "esbuild": "^0.27.0",
+    "typescript": "^5.9.3"
+  }
+}

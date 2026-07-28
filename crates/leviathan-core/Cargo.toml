@@ -1,0 +1,23 @@
+[package]
+name = "leviathan-core"
+description = "Streaming JSON indexing core: parse, navigate, validate and query JSON far larger than memory. Sans-IO, dependency-free, WASM-ready."
+categories = ["parser-implementations", "encoding", "wasm"]
+keywords = ["json", "streaming", "parser", "ndjson", "index"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+
+# LAYERING CONTRACT (enforced by scripts/check-layering.sh in CI):
+# This crate must never depend on wasm-bindgen, js-sys, web-sys, tokio, or any
+# I/O runtime. It is sans-IO by construction so the same code runs in a Web
+# Worker, a native CLI, and a future MCP server without modification.
+# See DEEP_REASONING.md C2.
