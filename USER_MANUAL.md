@@ -187,13 +187,16 @@ means all green.
 
 | Command | What it proves | Expected |
 |---|---|---|
-| `cargo test --workspace` | Core logic — format detection, byte ranges, CLI | 26 passed |
+| `cargo test --workspace` | Core logic — lexer, grammar, tier-1 index, row materialization, byte ranges, fixtures, bench harness | 186 passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | No lint warnings | `Finished` |
 | `cargo fmt --all --check` | Formatting | no output |
 | `bash scripts/check-layering.sh` | Core has no wasm/IO dependency, still builds for `wasm32` | `layering contract holds.` |
 | `pnpm -C packages/extension smoke` | The built `.wasm` instantiates; its `Format` strings match the Rust tests | `all good` |
 | `pnpm typecheck` | Both TS projects typecheck | no output |
 | `pnpm build` | Bundles and enforces the size budget | size table |
+
+Test counts move as milestones land; `cargo test --workspace` reporting a number
+*lower* than a previous run is the thing worth investigating.
 
 The layering check is worth understanding, because it is what makes
 "`leviathan-core` is reusable" a fact rather than a claim. It asserts three
@@ -303,6 +306,115 @@ drive memory use holds everywhere, not just in the browser.
 That this binary compiles at all is itself a test: it links the same crate the
 extension compiles to WASM, against real files, with no changes. If the core
 ever grows a browser assumption, this stops building.
+
+### 3.6 Generating fixtures
+
+`leviathan fixtures` replaces the hand-rolled snippets in §3.4 with something
+reproducible. The same `--seed` produces the same bytes on any machine, forever
+— which is what makes a benchmark number something another person can check
+rather than something they have to believe.
+
+```sh
+cargo run -q -p leviathan-cli -- fixtures list
+cargo run -q -p leviathan-cli -- fixtures ndjson --size 500MB
+cargo run -q -p leviathan-cli -- fixtures wide --count 5000000
+cargo run -q -p leviathan-cli -- fixtures deep --depth 100000
+```
+
+Output lands in `fixtures/generated/` (gitignored) unless `--out` says otherwise.
+A 500 MB NDJSON fixture takes under two seconds.
+
+| Kind | What it is for |
+|---|---|
+| `ndjson` | The primary benchmark fixture: log/API records, one per line |
+| `array` | The same records as one top-level array |
+| `nested` | A single document that is a tree of nested objects |
+| `deep` | Stack safety — nesting `--depth` levels deep |
+| `wide` | Random access — a flat array of `--count` scalars |
+| `bigstring` | One string value larger than any read buffer |
+| `dupkeys` | Duplicate keys within objects (M5) |
+| `badutf8` | Valid JSON structure containing invalid UTF-8 |
+| `truncated` | Cut off mid-record, as a killed export would be |
+
+The last six exist because a large JSON file is usually a *broken* large JSON
+file, and those are the cases most likely to panic a parser.
+
+### 3.7 Benchmarking
+
+```sh
+cargo run --profile bench-native -p leviathan-cli -- bench fixtures/generated/ndjson-500.0MB.ndjson
+```
+
+**Use `--profile bench-native`.** The default `release` profile is tuned for
+WASM binary size (`opt-level = "s"`), which understates native throughput. The
+harness prints the profile it was built with and labels a debug build *"do not
+publish these numbers"*.
+
+Three workloads run per fixture:
+
+Six workloads run per fixture — two ceilings, then the engine layer by layer:
+
+| Workload | Measures |
+|---|---|
+| `read` | Streaming a file in chunks. The I/O ceiling |
+| `scan` | Counting newlines. The memory-bandwidth ceiling, and the operation NDJSON tier-1 indexing is built from |
+| `sniff` | Format detection latency on a 64 KiB prefix |
+| `lex` | Tokenizing the whole file |
+| `walk` | Tokenizing *and* checking the grammar — i.e. full well-formedness validation |
+| `index` | Building the tier-1 index. Reports the index's **size** as well as the time |
+| `rows` | Fetching 50 rows from deep inside the index, re-reading the file for every field |
+
+The gap between `lex` and `walk` is what enforcing JSON's grammar costs on top of
+recognizing its tokens. The gap between `walk` and `index` is the point of the
+whole product: on NDJSON, indexing is ~6× faster than parsing, because it scans
+for newlines and never parses at all.
+
+`rows` is the other half of that bargain. The index stores 8 bytes per node and
+nothing else, so a row's key, kind, preview and child count are all rebuilt from
+the file when it is painted. It reports two times — the **cold** fetch you feel
+when you drag the scrollbar somewhere new, and the repeated **warm** mean that
+continuous scrolling costs — plus how many of the slice's containers it managed
+to count exactly within their budget.
+
+Add `--json` for machine-readable output, `--workload <name>` to run one, and
+`--chunk <size>` to vary the read size.
+
+Three things in the output are worth understanding, because they all exist to
+stop the harness flattering itself:
+
+- **`n/a †` in the throughput column** is deliberate. `sniff` stops as soon as it
+  has an answer, so it does not read the bytes it was given — a bytes/second
+  figure would be division by work that never happened. Its wall time *is* the
+  result.
+- **`n/a ‡`** means the workload hit a syntax error and stopped. For the
+  `truncated` and `badutf8` fixtures that is the *correct* outcome, not a failed
+  run: the observed column names the byte, line and column where it stopped, and
+  the size column shows how far it got.
+- **`(mean of N)`** means the workload finished faster than the timer can
+  resolve, so it was repeated and averaged. Timing a single sub-microsecond pass
+  measures the clock, not the code.
+
+`lex` reports both MB/s and tokens/s, and the second is the one to watch. A file
+of nothing but `[` costs about one token per byte and a file of long strings
+costs one per hundred, so MB/s is partly a statement about your fixture rather
+than about the engine — the `deep` fixture reads as 96 MB/s while actually being
+the *fastest* run by tokens/s.
+
+Two things you should see on a 500 MB NDJSON fixture:
+
+- **Peak RSS of a few megabytes**, unchanged whether the run is lexing, walking
+  or just reading. That is the entire memory thesis, visible in one column. The
+  `index` row is the exception and should be higher by roughly the index size,
+  because that is the one workload that keeps something.
+- **`index` finishing at close to the `scan` rate**, and `walk` at roughly a
+  sixth of it. If `index` ever slows to `walk`'s rate, the newline-scan path has
+  been lost and the file no longer opens before it is validated.
+
+Try `bench` on the `truncated` and `badutf8` fixtures to see this from the other
+side: `index` succeeds and reports its records, `rows` materializes 50 perfectly
+good rows out of the middle, and only `walk` stops — at the exact byte where the
+file went wrong. A broken file still opens, scrolls and displays. That is
+deliberate, and it is the behaviour most other JSON viewers get wrong.
 
 ---
 

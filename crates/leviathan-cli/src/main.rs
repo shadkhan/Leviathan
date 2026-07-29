@@ -17,6 +17,7 @@
 
 mod bench;
 mod cli;
+mod file_source;
 mod fixtures;
 mod sys;
 
@@ -50,7 +51,7 @@ FIXTURES OPTIONS:
     --count <N>             Element count, for `wide`. Default 5000000
 
 BENCH OPTIONS:
-    --workload <NAME>       One of read, scan, sniff. Repeatable. Default: all
+    --workload <NAME>       One of read, scan, sniff, lex. Repeatable. Default: all
     --chunk <SIZE>          Read chunk size. Default 1MiB
     --json                  Machine-readable output, for CI regression tracking
 
@@ -60,6 +61,9 @@ WASM size and will understate throughput:
     cargo run --profile bench-native -p leviathan-cli -- bench <FILE>
 
 Later milestones add: index, query, validate, dedup, export.
+
+Workload order is meaningful: read and scan are ceilings (I/O and memory
+bandwidth), lex is the engine. The useful number is the ratio between them.
 ";
 
 /// How much of a file is enough to tell single-document from NDJSON.

@@ -182,17 +182,57 @@ benchmarks, and Playwright end-to-end tests.
 ## Benchmarks
 
 Reproducible via `leviathan-cli bench`, on a documented machine, against
-generated fixtures. **Deliberately empty until M1 measures it** — the numbers
-below are targets, not results.
+generated fixtures. Rows fill in as milestones land; anything still `—` has not
+been built, and no row is ever filled from an estimate.
 
 | Fixture | Metric | Target | Naive `JSON.parse` | Measured |
 |---|---|---|---|---|
-| 500 MB NDJSON | Peak memory | < 400 MB | ✗ crashes | — |
-| 500 MB NDJSON | Index size | < 40 MB | n/a | — |
+| 500 MB NDJSON | Tier-1 index build | — | ✗ crashes | **0.39–0.95 s** |
+| 500 MB NDJSON | Index size | < 40 MB | n/a | **14.2 MB** (2.8 %) ✅ |
+| 500 MB NDJSON | Peak memory, indexed | < 400 MB | ✗ crashes | **22 MB** ✅ |
+| 500 MB NDJSON | Lex throughput (native) | ≥ 200 MB/s | — | **248–327 MB/s** ✅ |
+| 500 MB NDJSON | Parse + validate | — | ✗ crashes | **218 MB/s** |
+| 500 MB NDJSON | Tokens/s (native) | — | — | **54–71 M/s** |
+| **5 M-element array** | **Random row access** | **< 20 ms** | ✗ crashes | **65–119 µs** ✅ |
+| 500 MB NDJSON | Random row access | < 20 ms | ✗ crashes | **0.74–1.09 ms** ✅ |
 | 500 MB NDJSON | First rows painted | < 2 s | ✗ never | — |
 | 500 MB NDJSON | Index throughput | ≥ 100 MB/s (WASM) | — | — |
-| 5 M-element array | Random row access | < 20 ms | ✗ crashes | — |
 | 500 MB NDJSON | First query results | < 500 ms | ✗ crashes | — |
+
+*Machine: 8 × x86_64, Windows, `bench-native` profile. Figures are ranges over
+repeated runs, not best-of — spread on a desktop OS is ±15 %. What is exact is
+the `observed` column: the same fixture always yields 108,133,846 tokens and
+1,772,686 records, on every run and at every chunk size, and that is the figure a
+regression would actually surface in.*
+
+Three results worth reading closely:
+
+**Storing nothing was the right trade.** The index holds 8 bytes per node — no
+kind, no length, no key text — so every field of every visible row is
+reconstructed by going back to the file. That is the design's one load-bearing
+assumption, and fetching row #4,499,955 of a five-million-element array takes
+**65–119 µs cold**, against a 20 ms budget. Reading 50 rows costs *one*
+byte-range read, not fifty, because siblings are contiguous in the file — which
+matters far more in a Worker, where a `Blob.slice()` costs about a millisecond
+whatever its size. (These are warm-file numbers: the OS page cache holds the
+file, because building the index just read it.)
+
+**Opening a file is six times cheaper than parsing it.** Tier-1 indexing of
+NDJSON scans for newlines and never parses — which is exact rather than
+heuristic, because JSON forbids raw control characters in strings, so a newline
+can never occur inside a value. Against ceilings on the same file (streaming and
+touching nothing: 466 MB/s; counting newlines: 1.2 GB/s), indexing runs at
+1.3 GB/s — *at* the memory-bandwidth ceiling — while a full parse-and-validate
+runs at 218 MB/s. A 500 MB log file is therefore browsable in under half a
+second, before any of it has been validated.
+
+**The index-size result is shape-dependent, and one shape misses.** 8 bytes per
+child is 2.8 % of a record-shaped 500 MB file. For a flat array of small scalars
+it is ~80 % of the file, because the elements themselves are only ~10 bytes.
+Extrapolated, a 500 MB file of that shape would need ~400 MB of index and would
+miss the criterion by an order of magnitude. Two mitigations are identified
+(delta+varint offsets, or sparse indexing with bucket re-scan) and neither is
+built yet — see `DEEP_REASONING.md` C29 rather than take the good number alone.
 
 A pre-declared kill criterion exists: if a 500 MB file cannot be indexed under
 800 MB peak after the documented fallbacks, the published claim drops to 250 MB
@@ -212,7 +252,7 @@ ego.
 | | Milestone | Status |
 |---|---|---|
 | **M0** | Skeleton, WASM boundary, typed protocol, CI | ✅ code complete |
-| **M1** | Streaming lexer + node index ← *the make-or-break phase* | ⬜ next |
+| **M1** | Streaming lexer + node index ← *the make-or-break phase* | 🟡 lexer, grammar, tier-1 index, row materialization done; tier-2 + WASM next |
 | **M2** | Virtualized tree renderer | ⬜ |
 | **M3** | Validation: byte-accurate errors, JSON Schema | ⬜ |
 | **M4** | Query: JSONPath (RFC 9535) over the index | ⬜ |

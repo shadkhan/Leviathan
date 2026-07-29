@@ -6,20 +6,43 @@
 //! measuring apparatus comes first and the numbers land in it as they are
 //! earned. See DEEP_REASONING C7.
 //!
-//! ## What is measured today
+//! ## What is measured
 //!
-//! The lexer does not exist yet, so what runs here are **ceilings** — the
-//! fastest anything could possibly go on this machine and this file:
+//! Two workloads are **ceilings** — the fastest anything could possibly go on
+//! this machine and this file — and the rest are the engine, layer by layer:
 //!
 //! - `read` — stream the file in chunks and touch nothing. The I/O ceiling.
 //! - `scan` — count newlines. The memory-bandwidth ceiling, and the operation
 //!   the NDJSON tier-1 index is built out of (DEEP_REASONING C3).
 //! - `sniff` — format detection on a 64 KiB prefix. Bounded work, so its cost
 //!   should not move with file size; if it ever does, that is a bug.
+//! - `lex` — tokenize the whole file.
+//! - `walk` — tokenize *and* check the grammar. Sits next to `lex` so the
+//!   structural layer's cost is attributable rather than absorbed. This is also
+//!   full well-formedness validation, arriving early.
+//! - `index` — build the tier-1 index. The row that answers the index-size exit
+//!   criterion, because it reports the index's size as well as the build time.
+//! - `rows` — fetch a slice of fifty rows from deep inside the index, going back
+//!   to the file for every field. The other half of the same bargain: an index
+//!   that stores almost nothing is only a good trade if this is cheap.
 //!
-//! These are not filler. When `index` lands next to them, "we hit 40 % of memory
-//! bandwidth" is a far more useful statement than a bare MB/s, and the exit
-//! criterion (≥200 MB/s native) is only meaningful against a known ceiling.
+//! `index` is the only workload whose *path* depends on the file: NDJSON scans
+//! for newlines and never parses, a single document is walked. The two are
+//! nearly an order of magnitude apart, and that gap is the product thesis.
+//!
+//! The ceilings are not filler. "300 MB/s" says nothing on its own; "300 MB/s
+//! against a 960 MB/s memory-bandwidth ceiling" says there is roughly 3× of
+//! headroom left, which is what decides whether the R2 fallback ladder (SIMD,
+//! bigger chunks) is worth climbing.
+//!
+//! ## On reading these numbers
+//!
+//! Run-to-run spread on an ordinary desktop OS is ±15 %, so a single run is a
+//! sample and not a result. Two things guard against reading too much into one:
+//! the `observed` column is exact and deterministic (the same fixture always
+//! lexes to the same token count, so a changed count is a bug and not noise),
+//! and published figures are stated as ranges over repeated runs. Cherry-picking
+//! the fastest of five is how benchmarks stop meaning anything.
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -49,6 +72,10 @@ pub enum Metric {
     /// Cost is bounded and data-dependent. The wall time *is* the result;
     /// dividing it by a byte count would say nothing true.
     Latency,
+    /// The workload stopped at an error. Its wall time measures how long it took
+    /// to *find* the error, which is dominated by opening the file, so a
+    /// throughput computed from it is noise wearing a unit.
+    Aborted,
 }
 
 /// One workload run against one fixture.
@@ -78,7 +105,7 @@ impl Run {
     /// Throughput in bytes per second, or `None` when that would be a fiction.
     #[must_use]
     pub fn throughput(&self) -> Option<f64> {
-        if self.metric == Metric::Latency {
+        if self.metric != Metric::Throughput {
             return None;
         }
         let seconds = self.wall.as_secs_f64();
@@ -87,7 +114,12 @@ impl Run {
 }
 
 /// Every workload the harness knows, in run order.
-pub const WORKLOADS: [&str; 3] = ["read", "scan", "sniff"];
+///
+/// The order is the point: `read` and `scan` are ceilings, `lex` is the engine,
+/// and reading them top to bottom says what fraction of the possible the engine
+/// achieved. A bare MB/s says nothing; "62 % of memory bandwidth" says whether
+/// there is headroom left worth chasing.
+pub const WORKLOADS: [&str; 7] = ["read", "scan", "sniff", "lex", "walk", "index", "rows"];
 
 /// Run every workload in `workloads` against `path`.
 ///
@@ -108,11 +140,17 @@ pub fn run_file(path: &Path, workloads: &[&'static str], chunk: usize) -> io::Re
                 // workloads report something: a loop whose result is unused is
                 // a loop the optimizer is entitled to delete.
                 *state = state.wrapping_add(buf.len() as u64);
+                Flow::Continue
             })?,
             "scan" => measure(&name, "scan", path, chunk, |buf, state| {
                 *state += buf.iter().filter(|b| **b == b'\n').count() as u64;
+                Flow::Continue
             })?,
             "sniff" => sniff(&name, path)?,
+            "lex" => lex(&name, path, chunk)?,
+            "walk" => walk(&name, path, chunk)?,
+            "index" => index(&name, path, chunk)?,
+            "rows" => rows(&name, path, chunk)?,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -123,6 +161,18 @@ pub fn run_file(path: &Path, workloads: &[&'static str], chunk: usize) -> io::Re
         runs.push(run);
     }
     Ok(runs)
+}
+
+/// Whether the read loop should keep going.
+///
+/// Exists for one case: a workload that hits a syntax error has stopped doing
+/// work, and reading the remaining 400 MB would put time on the clock that no
+/// bytes were spent on. That is the same class of mistake as the 228 GB/s
+/// `sniff` (see [`Metric`]) — a throughput divided by work that never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Stop,
 }
 
 /// Stream `path` in `chunk`-sized reads, applying `step` to each chunk.
@@ -138,7 +188,7 @@ fn measure<F>(
     mut step: F,
 ) -> io::Result<Run>
 where
-    F: FnMut(&[u8], &mut u64),
+    F: FnMut(&[u8], &mut u64) -> Flow,
 {
     let mut file = File::open(path)?;
     let mut buf = vec![0u8; chunk];
@@ -151,8 +201,11 @@ where
         if n == 0 {
             break;
         }
-        step(&buf[..n], &mut state);
+        let flow = step(&buf[..n], &mut state);
         bytes += n as u64;
+        if flow == Flow::Stop {
+            break;
+        }
     }
     let wall = start.elapsed();
 
@@ -168,9 +221,402 @@ where
         peak_rss: sys::peak_rss(),
         observed: match workload {
             "scan" => format!("{state} lines"),
+            "lex" => format!("{state} tokens"),
             _ => format!("{} read", human_bytes(bytes)),
         },
     })
+}
+
+/// Tokenize the whole file with [`leviathan_core::Lexer`].
+///
+/// This is the first workload that measures the engine rather than a ceiling,
+/// and it is deliberately *only* the lexer: no index, no allocation, no
+/// structure. Whatever the index costs on top of this is then a number that can
+/// be attributed, instead of a single figure with no way to tell which half is
+/// slow.
+///
+/// A malformed fixture is not a failure of the run — `truncated` and `badutf8`
+/// exist to be lexed and rejected. It stops at the error, reports it with its
+/// position, and bills itself only for the bytes it actually reached.
+fn lex(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
+    let mut lexer = leviathan_core::Lexer::new();
+    let mut tokens = 0u64;
+    let mut failure = None;
+
+    let mut run = measure(name, "lex", path, chunk, |buf, state| {
+        for token in lexer.feed(buf) {
+            match token {
+                Ok(_) => tokens += 1,
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        // Mirrored into `state` so the token loop cannot be optimized away, and
+        // so `measure` can render it without knowing what a token is.
+        *state = tokens;
+        if failure.is_some() {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    })?;
+
+    if failure.is_none() {
+        match lexer.finish() {
+            Ok(Some(_)) => tokens += 1,
+            Ok(None) => {}
+            Err(err) => failure = Some(err),
+        }
+    }
+
+    if let Some(err) = failure {
+        // Bill only the bytes that were lexed, not the bytes that were read —
+        // and do not report a rate at all, because finding an error 19 bytes in
+        // measures `File::open`, not the lexer.
+        run.bytes = lexer.offset();
+        run.metric = Metric::Aborted;
+        run.observed = format!("{tokens} tokens, then {err}");
+    } else {
+        run.observed = format!("{tokens} tokens ({})", rate(tokens, run.wall));
+    }
+    Ok(run)
+}
+
+/// Tokenize *and* check the grammar.
+///
+/// Sits directly next to `lex` so the structural layer's cost is attributable
+/// rather than absorbed: the difference between the two rows is what enforcing
+/// JSON's grammar costs on top of recognizing its tokens.
+///
+/// This is also full well-formedness validation — M3's job, arriving early
+/// because it is what the walk already does.
+fn walk(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
+    let mut lexer = leviathan_core::Lexer::new();
+    // `Many` accepts everything `One` accepts, so it is the safe mode for a
+    // fixture whose format has not been established.
+    let mut structure = leviathan_core::Structure::new(leviathan_core::Documents::Many);
+    let mut events = 0u64;
+    let mut failure = None;
+
+    let mut run = measure(name, "walk", path, chunk, |buf, state| {
+        for token in lexer.feed(buf) {
+            let outcome = token
+                .map_err(|e| e.to_string())
+                .and_then(|t| structure.push(t).map_err(|e| e.to_string()));
+            match outcome {
+                Ok(Some(_)) => events += 1,
+                Ok(None) => {}
+                Err(text) => {
+                    failure = Some(text);
+                    break;
+                }
+            }
+        }
+        *state = events;
+        if failure.is_some() {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    })?;
+
+    if failure.is_none() {
+        match close_out(&mut lexer, &mut structure) {
+            Ok(Some(_)) => events += 1,
+            Ok(None) => {}
+            Err(text) => failure = Some(text),
+        }
+    }
+
+    if let Some(text) = failure {
+        run.bytes = lexer.offset();
+        run.metric = Metric::Aborted;
+        run.observed = format!("{events} events, then {text}");
+    } else {
+        run.observed = format!(
+            "{events} events, {} documents ({})",
+            structure.completed(),
+            rate(events, run.wall)
+        );
+    }
+    Ok(run)
+}
+
+/// Drain the last pending token and close both machines.
+///
+/// Easy to forget, and silent when forgotten — which is why it is a named
+/// function rather than three lines copied twice. Only a *number* can still be
+/// pending at end of input (every other token is self-terminating), so omitting
+/// this drops exactly one value from exactly those files that end without a
+/// delimiter: `...,42` with no trailing newline. That is a large share of
+/// hand-written NDJSON, and the loss would show up as an off-by-one nobody
+/// could explain.
+fn close_out(
+    lexer: &mut leviathan_core::Lexer,
+    structure: &mut leviathan_core::Structure,
+) -> Result<Option<leviathan_core::Event>, String> {
+    let trailing = match lexer.finish().map_err(|e| e.to_string())? {
+        Some(token) => structure.push(token).map_err(|e| e.to_string())?,
+        None => None,
+    };
+    structure.finish().map_err(|e| e.to_string())?;
+    Ok(trailing)
+}
+
+/// Build the tier-1 index, the way the engine actually would.
+///
+/// Format is sniffed from a prefix first, and the two paths genuinely differ:
+/// NDJSON scans for newlines (exact, not heuristic — see `leviathan_core::index`)
+/// while a single document is walked. The row reports the resulting index size,
+/// which is the M1 exit criterion nobody can argue with.
+fn index(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
+    let format = sniff_prefix(path)?;
+
+    match format {
+        leviathan_core::Format::Ndjson => {
+            let mut scanner = leviathan_core::RecordScanner::new();
+            let mut run = measure(name, "index", path, chunk, |buf, state| {
+                scanner.feed(buf);
+                *state = scanner.records() as u64;
+                Flow::Continue
+            })?;
+            let table = scanner.finish();
+            run.observed = format!(
+                "{} records, {} index ({})",
+                table.len(),
+                human_bytes(table.heap_bytes() as u64),
+                share_of(table.heap_bytes() as u64, run.bytes),
+            );
+            Ok(run)
+        }
+        _ => {
+            let mut lexer = leviathan_core::Lexer::new();
+            let mut structure = leviathan_core::Structure::new(leviathan_core::Documents::One);
+            let mut collector = leviathan_core::RootCollector::new();
+            let mut failure = None;
+
+            let mut run = measure(name, "index", path, chunk, |buf, state| {
+                for token in lexer.feed(buf) {
+                    let outcome = token
+                        .map_err(|e| e.to_string())
+                        .and_then(|t| structure.push(t).map_err(|e| e.to_string()));
+                    match outcome {
+                        Ok(Some(event)) => collector.observe(event),
+                        Ok(None) => {}
+                        Err(text) => {
+                            failure = Some(text);
+                            break;
+                        }
+                    }
+                }
+                *state = collector.rooted().into();
+                if failure.is_some() {
+                    Flow::Stop
+                } else {
+                    Flow::Continue
+                }
+            })?;
+
+            if failure.is_none() {
+                match close_out(&mut lexer, &mut structure) {
+                    Ok(Some(event)) => collector.observe(event),
+                    Ok(None) => {}
+                    Err(text) => failure = Some(text),
+                }
+            }
+
+            if let Some(text) = failure {
+                run.bytes = lexer.offset();
+                run.metric = Metric::Aborted;
+                run.observed = format!("index abandoned: {text}");
+            } else {
+                let table = collector.finish();
+                run.observed = format!(
+                    "{} root children, {} index ({})",
+                    table.len(),
+                    human_bytes(table.heap_bytes() as u64),
+                    share_of(table.heap_bytes() as u64, run.bytes),
+                );
+            }
+            Ok(run)
+        }
+    }
+}
+
+/// How many rows a screen of virtual scrolling asks for at once.
+///
+/// Fifty is a tall window plus overscan. The number matters because the exit
+/// criterion is stated per *slice*, not per row: the engine is allowed one byte
+/// range for the whole window, so a per-row figure would understate the design.
+const SLICE: usize = 50;
+
+/// Fetch a slice of rows from the middle of the index — the M1 random-access
+/// exit criterion.
+///
+/// The criterion reads: *fetch rows 900 000–900 050 of a 5 M-element array in
+/// under 20 ms, including byte-range re-read*. That "including" is the whole
+/// test. The index stores only offsets, so every visible field — key, kind,
+/// preview, child count — is reconstructed here by going back to the file. If
+/// this is slow, C1's bargain was a bad one and the index should have stored
+/// more.
+///
+/// Building the index is not timed: the criterion is about scrolling, and by the
+/// time a user scrolls, the index exists.
+fn rows(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
+    let table = build_table(path, chunk)?;
+    let mut source = crate::file_source::FileSource::open(path)?;
+    let options = leviathan_core::RowOptions::default();
+
+    if table.is_empty() {
+        return Ok(Run {
+            fixture: name.to_string(),
+            workload: "rows",
+            bytes: 0,
+            metric: Metric::Aborted,
+            wall: Duration::ZERO,
+            reps: 0,
+            peak_rss: sys::peak_rss(),
+            observed: "no indexable rows".to_string(),
+        });
+    }
+
+    // Deep into the table, never at the start: reading row 0 of anything is
+    // easy, and would measure nothing the product depends on.
+    let start = table.len().saturating_sub(SLICE) * 9 / 10;
+
+    // The cold fetch is the one a user feels when they drag the scrollbar
+    // somewhere new; the warm mean is what continuous scrolling costs. Both are
+    // worth knowing and they are not the same number.
+    let cold_start = Instant::now();
+    let first = leviathan_core::materialize(&table, start, SLICE, &mut source, &options)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let cold = cold_start.elapsed();
+
+    let (wall, reps, sample) = repeat(|| {
+        leviathan_core::materialize(&table, start, SLICE, &mut source, &options)
+            .map(|rows| rows.len())
+            .unwrap_or(0)
+    });
+
+    let containers = first.iter().filter(|r| r.kind.is_container()).count();
+    let exact = first
+        .iter()
+        .filter(|r| r.children.is_exact() && r.kind.is_container())
+        .count();
+
+    // The size column reports the file span the slice covers — which is what
+    // was re-read to draw it, and the number that makes "including byte-range
+    // re-read" checkable rather than a claim.
+    let span = match (first.first(), first.last()) {
+        (Some(a), Some(b)) => b.value_end.unwrap_or(b.offset).saturating_sub(a.offset),
+        _ => 0,
+    };
+
+    Ok(Run {
+        fixture: name.to_string(),
+        workload: "rows",
+        bytes: span,
+        metric: Metric::Latency,
+        wall,
+        reps,
+        peak_rss: sys::peak_rss(),
+        observed: format!(
+            "{sample} rows from #{start}, {cold_text} cold, {containers} containers ({exact} counted exactly)",
+            cold_text = human_duration(cold),
+        ),
+    })
+}
+
+/// Build whichever tier-1 table this file supports, for workloads that need one.
+fn build_table(path: &Path, chunk: usize) -> io::Result<leviathan_core::ChildTable> {
+    let format = sniff_prefix(path)?;
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; chunk];
+
+    if format == leviathan_core::Format::Ndjson {
+        let mut scanner = leviathan_core::RecordScanner::new();
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            scanner.feed(&buf[..n]);
+        }
+        return Ok(scanner.finish());
+    }
+
+    let mut lexer = leviathan_core::Lexer::new();
+    let mut structure = leviathan_core::Structure::new(leviathan_core::Documents::One);
+    let mut collector = leviathan_core::RootCollector::new();
+    'outer: loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for token in lexer.feed(&buf[..n]) {
+            match token
+                .map_err(|e| e.to_string())
+                .and_then(|t| structure.push(t).map_err(|e| e.to_string()))
+            {
+                Ok(Some(event)) => collector.observe(event),
+                Ok(None) => {}
+                // A malformed document still indexes as far as it got: the rows
+                // before the error are perfectly good rows (C6).
+                Err(_) => break 'outer,
+            }
+        }
+    }
+    let _ = close_out(&mut lexer, &mut structure).map(|trailing| {
+        if let Some(event) = trailing {
+            collector.observe(event);
+        }
+    });
+    Ok(collector.finish())
+}
+
+/// Detect the format from the same 64 KiB prefix the engine would use.
+fn sniff_prefix(path: &Path) -> io::Result<leviathan_core::Format> {
+    const PREFIX: usize = 64 * 1024;
+    let mut file = File::open(path)?;
+    let mut buf = Vec::with_capacity(PREFIX);
+    file.by_ref().take(PREFIX as u64).read_to_end(&mut buf)?;
+    Ok(leviathan_core::sniff_format(&buf))
+}
+
+/// Render `part` as a percentage of `whole`, for the index-size criterion.
+fn share_of(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        return "—".to_string();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let percent = (part as f64 / whole as f64) * 100.0;
+    format!("{percent:.1}% of file")
+}
+
+/// Tokens per second, rendered.
+///
+/// Reported alongside MB/s because the two say different things, and only one of
+/// them is about the lexer. A document of `[[[[[` costs about one token per
+/// byte; a document of long strings costs one per hundred. So MB/s is largely a
+/// statement about the *fixture's* token density, while tokens/s is a statement
+/// about the engine — and across fixtures whose MB/s differ four-fold, the
+/// tokens/s barely moves. See DEEP_REASONING C22.
+fn rate(tokens: u64, wall: Duration) -> String {
+    let seconds = wall.as_secs_f64();
+    if seconds <= 0.0 || tokens == 0 {
+        return "—".to_string();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let per_second = tokens as f64 / seconds;
+    if per_second >= 1e6 {
+        format!("{:.1} M/s", per_second / 1e6)
+    } else if per_second >= 1e3 {
+        format!("{:.1} k/s", per_second / 1e3)
+    } else {
+        format!("{per_second:.0}/s")
+    }
 }
 
 /// The shortest total run the harness will draw a conclusion from.
@@ -261,15 +707,19 @@ pub fn report(runs: &[Run], machine: &Machine) -> String {
 
     let mut repeated = false;
     let mut latency_seen = false;
+    let mut aborted_seen = false;
     for run in runs {
         let throughput = run.throughput().map_or_else(
-            || {
-                if run.metric == Metric::Latency {
+            || match run.metric {
+                Metric::Latency => {
                     latency_seen = true;
                     "n/a †".to_string()
-                } else {
-                    "—".to_string()
                 }
+                Metric::Aborted => {
+                    aborted_seen = true;
+                    "n/a ‡".to_string()
+                }
+                Metric::Throughput => "—".to_string(),
             },
             |bps| format!("{}/s", human_bytes(bps as u64)),
         );
@@ -311,9 +761,19 @@ pub fn report(runs: &[Run], machine: &Machine) -> String {
     if latency_seen {
         let _ = writeln!(
             out,
-            "  † this workload stops as soon as it has its answer, so it does not\n  \
-             consume the bytes it was given. Its wall time is the result; a\n  \
-             throughput would be division by work that never happened."
+            "  † a bounded workload: its cost does not scale with the file, so the\n  \
+             wall time is the result and a rate would be division by work that\n  \
+             never happened. `sniff` stops as soon as it has its answer; `rows`\n  \
+             reads only the window its slice needs, which is the size shown."
+        );
+    }
+    if aborted_seen {
+        let _ = writeln!(
+            out,
+            "  ‡ this workload stopped at a syntax error — which for a malformed\n  \
+             fixture is the correct outcome, not a failed run. The size column is\n  \
+             the bytes it reached, and no rate is reported: the clock was mostly\n  \
+             spent opening the file."
         );
     }
     out.push('\n');
@@ -361,10 +821,10 @@ pub fn report_json(runs: &[Run], machine: &Machine) -> String {
             r#"{{"fixture":"{}","workload":"{}","metric":"{}","bytes":{},"wall_ns":{},"reps":{},"throughput_bps":{},"peak_rss":{},"observed":"{}"}}"#,
             escape(&run.fixture),
             run.workload,
-            if run.metric == Metric::Latency {
-                "latency"
-            } else {
-                "throughput"
+            match run.metric {
+                Metric::Latency => "latency",
+                Metric::Aborted => "aborted",
+                Metric::Throughput => "throughput",
             },
             run.bytes,
             run.wall.as_nanos(),
@@ -448,6 +908,180 @@ mod tests {
             assert_eq!(runs[0].bytes, data.len() as u64, "chunk {chunk}");
             assert_eq!(runs[1].observed, "500 lines", "chunk {chunk}");
         }
+    }
+
+    #[test]
+    fn lex_counts_every_token_in_the_file() {
+        // 3 records × 5 tokens: `{`, key, `:`, value, `}`.
+        let (_dir, path) = fixture(b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n");
+        let runs = run_file(&path, &["lex"], DEFAULT_CHUNK).unwrap();
+        assert!(
+            runs[0].observed.starts_with("15 tokens ("),
+            "{}",
+            runs[0].observed
+        );
+        assert_eq!(runs[0].metric, Metric::Throughput);
+        assert!(runs[0].throughput().is_some());
+    }
+
+    #[test]
+    fn the_chunk_size_does_not_change_the_token_count() {
+        // The lexer's resumability, asserted through the harness rather than in
+        // its own unit tests: chunk boundaries are an I/O accident and must
+        // never be visible in a benchmark result.
+        let mut data = Vec::new();
+        for i in 0..500 {
+            let _ = writeln!(data, r#"{{"id":{i},"name":"row \"{i}\"","ok":true}}"#);
+        }
+        let (_dir, path) = fixture(&data);
+
+        for chunk in [1, 3, 7, 64, 4096, 1 << 20] {
+            let runs = run_file(&path, &["lex"], chunk).unwrap();
+            assert!(
+                runs[0].observed.starts_with("6500 tokens"),
+                "chunk {chunk}: {}",
+                runs[0].observed
+            );
+            assert_eq!(runs[0].bytes, data.len() as u64, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn a_file_ending_in_a_bare_number_does_not_lose_its_last_value() {
+        // The bug this guards: a number is the one token that cannot be emitted
+        // until the byte after it arrives, so a workload that forgets
+        // `lexer.finish()` silently drops the final value of any file that ends
+        // without a delimiter — which is most hand-written NDJSON.
+        let (_dir, path) = fixture(b"1\n2\n3");
+        let runs = run_file(&path, &["walk", "index"], DEFAULT_CHUNK).unwrap();
+        assert!(
+            runs[0].observed.contains("3 documents"),
+            "{}",
+            runs[0].observed
+        );
+        assert!(
+            runs[1].observed.starts_with("3 records"),
+            "{}",
+            runs[1].observed
+        );
+
+        // And the same file with a trailing newline must agree.
+        let (_dir2, path2) = fixture(b"1\n2\n3\n");
+        let with_newline = run_file(&path2, &["walk"], DEFAULT_CHUNK).unwrap();
+        assert!(with_newline[0].observed.contains("3 documents"));
+    }
+
+    #[test]
+    fn walk_validates_what_lex_accepts() {
+        // `[1,2` lexes perfectly — every token is well formed — and is still not
+        // a document. That gap is exactly what the walk workload measures.
+        let (_dir, path) = fixture(b"[1,2");
+        let runs = run_file(&path, &["lex", "walk"], DEFAULT_CHUNK).unwrap();
+        assert_eq!(runs[0].metric, Metric::Throughput, "lex is happy");
+        assert_eq!(runs[1].metric, Metric::Aborted, "walk is not");
+        assert!(
+            runs[1].observed.contains("unclosed"),
+            "{}",
+            runs[1].observed
+        );
+    }
+
+    #[test]
+    fn rows_materializes_a_slice_from_the_middle() {
+        let mut data = Vec::new();
+        for i in 0..500 {
+            let _ = writeln!(data, r#"{{"id":{i},"name":"row {i}"}}"#);
+        }
+        let (_dir, path) = fixture(&data);
+
+        let runs = run_file(&path, &["rows"], DEFAULT_CHUNK).unwrap();
+        assert_eq!(runs[0].metric, Metric::Latency, "a slice has no throughput");
+        assert!(runs[0].observed.contains("50 rows"), "{}", runs[0].observed);
+        assert!(
+            runs[0]
+                .observed
+                .contains("50 containers (50 counted exactly)"),
+            "{}",
+            runs[0].observed
+        );
+        assert!(
+            runs[0].bytes > 0,
+            "the slice's file span should be reported"
+        );
+    }
+
+    #[test]
+    fn rows_on_an_unindexable_file_reports_rather_than_failing() {
+        let (_dir, path) = fixture(b"   \n\n  \n");
+        let runs = run_file(&path, &["rows"], DEFAULT_CHUNK).unwrap();
+        assert_eq!(runs[0].metric, Metric::Aborted);
+        assert_eq!(runs[0].observed, "no indexable rows");
+    }
+
+    #[test]
+    fn index_size_is_eight_bytes_per_record() {
+        // The M1 exit criterion is a number, so the harness has to report the
+        // real one: 100 records is 800 bytes of index, not "about" 800.
+        let mut data = Vec::new();
+        for i in 0..100 {
+            let _ = writeln!(data, r#"{{"id":{i}}}"#);
+        }
+        let (_dir, path) = fixture(&data);
+
+        let runs = run_file(&path, &["index"], DEFAULT_CHUNK).unwrap();
+        assert!(
+            runs[0].observed.starts_with("100 records, 800 B index"),
+            "{}",
+            runs[0].observed
+        );
+    }
+
+    #[test]
+    fn a_malformed_file_still_indexes_because_tier_one_does_not_parse() {
+        // C6, degrade never abort: the NDJSON index is a newline scan, so a file
+        // that fails validation still opens and is browsable. `walk` is the one
+        // that objects, and it objects separately.
+        let (_dir, path) = fixture(b"{\"a\":1}\n{oops\n{\"c\":3}\n");
+        let runs = run_file(&path, &["index", "walk"], DEFAULT_CHUNK).unwrap();
+        assert!(
+            runs[0].observed.starts_with("3 records"),
+            "{}",
+            runs[0].observed
+        );
+        assert_eq!(runs[0].metric, Metric::Throughput);
+        assert_eq!(runs[1].metric, Metric::Aborted);
+    }
+
+    #[test]
+    fn lex_reports_a_syntax_error_and_bills_only_what_it_read() {
+        // The `truncated` and `badutf8` fixtures are supposed to fail. A run
+        // over them must say where, and must not claim throughput over the
+        // bytes it never reached — the same mistake that produced 228 GB/s.
+        let mut data = Vec::from(b"{\"a\":1}\n");
+        data.extend(std::iter::repeat_n(b'x', 100_000));
+        let (_dir, path) = fixture(&data);
+
+        let runs = run_file(&path, &["lex"], 64).unwrap();
+        assert!(
+            runs[0].observed.contains("5 tokens, then"),
+            "{}",
+            runs[0].observed
+        );
+        assert!(runs[0].observed.contains("byte 8"), "{}", runs[0].observed);
+        assert_eq!(runs[0].bytes, 8, "billed for the bytes lexed, not the file");
+        assert_eq!(runs[0].metric, Metric::Aborted);
+        assert_eq!(
+            runs[0].throughput(),
+            None,
+            "no rate from a run that stopped"
+        );
+
+        let text = report(&runs, &Machine::detect());
+        assert!(text.contains("n/a ‡"), "{text}");
+        assert!(
+            text.contains("correct outcome"),
+            "footnote missing:\n{text}"
+        );
     }
 
     #[test]
