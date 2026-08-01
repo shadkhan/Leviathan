@@ -87,7 +87,7 @@ export class Engine {
 
     return new Promise<Result<M>>((resolve, reject) => {
       this.#pending.set(id, { resolve: resolve as Pending['resolve'], reject });
-      this.#worker.postMessage(request, transferables<M>(params));
+      this.#worker.postMessage(request, transferables(params));
     });
   }
 

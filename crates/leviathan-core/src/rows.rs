@@ -38,7 +38,7 @@
 
 use crate::index::ChildTable;
 use crate::lexer::{Lexer, TokenKind};
-use crate::source::{ByteRange, SourceError};
+use crate::source::{ByteRange, SourceError, read_clamped};
 use crate::structure::{Documents, Event, Structure};
 
 /// What kind of value a row holds.
@@ -265,33 +265,6 @@ fn window_span(offsets: &[u64], next: usize, options: &RowOptions) -> u64 {
     wanted.min(options.effective_window()).max(1)
 }
 
-/// Read `len` bytes, shortening the request if the source is smaller.
-///
-/// A row window is speculative by nature — it asks for a budget past the last
-/// row without knowing whether the file extends that far — so running off the
-/// end is the normal case at the bottom of a file, not an error.
-fn read_clamped<S: ByteRange>(source: &mut S, start: u64, len: u64) -> Result<&[u8], SourceError> {
-    let mut len = match source.len_hint() {
-        Some(total) => len.min(total.saturating_sub(start)),
-        None => len,
-    };
-
-    // A source that will not state its length can still be asked. The
-    // out-of-range error carries the size, so one probe always suffices — and
-    // this branch is skipped entirely by every source that knows its own length.
-    if source.len_hint().is_none() {
-        if let Err(SourceError::OutOfRange { available, .. }) = source.read(start, as_u32(len)) {
-            len = available.saturating_sub(start);
-        }
-    }
-
-    source.read(start, as_u32(len))
-}
-
-fn as_u32(len: u64) -> u32 {
-    u32::try_from(len).unwrap_or(u32::MAX)
-}
-
 /// Reconstruct one row from bytes beginning at its offset.
 fn materialize_one(offset: u64, bytes: &[u8], keyed: bool, options: &RowOptions) -> Row {
     let mut row = Row {
@@ -345,7 +318,15 @@ fn materialize_one(offset: u64, bytes: &[u8], keyed: bool, options: &RowOptions)
     match token.kind {
         TokenKind::ObjectOpen | TokenKind::ArrayOpen => {
             row.kind = ValueKind::of_token(token.kind);
-            let (children, end) = count_children(offset, bytes, options);
+            // From the *value*, not from the row. For an array element those are
+            // the same offset, which is why passing the row's start went
+            // unnoticed until an object member held a container: the walk then
+            // began at the key, read a complete string document, and called the
+            // colon after it trailing garbage — reporting every such container
+            // as empty. See C44.
+            let from = usize::try_from(token.start.saturating_sub(offset)).unwrap_or(usize::MAX);
+            let (children, end) =
+                count_children(token.start, bytes.get(from..).unwrap_or(&[]), options);
             row.children = children;
             row.value_end = end;
         }
@@ -710,6 +691,27 @@ mod tests {
         let source = br#"[[1,2,3,4,5]]"#;
         let table = root_table(source);
         assert_eq!(rows(source, &table, 0, 1)[0].children, Count::Exact(5));
+    }
+
+    #[test]
+    fn an_object_members_container_is_counted_from_the_value_not_the_key() {
+        // C44. Every test above this one used an array element, where the row's
+        // offset and its value's offset are the same number — so counting from
+        // the wrong one of the two was invisible. Here they differ, and counting
+        // from the key reads `"items"` as a whole document and reports zero.
+        let source = br#"{"items":[1,2,3],"meta":{"a":1,"b":2},"empty":[]}"#;
+        let table = root_table(source);
+        let rows = rows(source, &table, 0, 10);
+
+        assert_eq!(rows[0].children, Count::Exact(3), "array under a key");
+        assert_eq!(rows[1].children, Count::Exact(2), "object under a key");
+        assert_eq!(rows[2].children, Count::Exact(0), "and an empty one");
+        assert!(rows[0].expandable());
+        assert!(!rows[2].expandable(), "nothing to expand into");
+
+        // The extent is found too, which is what a viewer needs to select the
+        // whole value.
+        assert_eq!(rows[0].value_end, Some(16));
     }
 
     // ---- previews and escapes ---------------------------------------------

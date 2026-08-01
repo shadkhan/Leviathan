@@ -1,15 +1,28 @@
 /**
- * Viewer page entry point.
+ * Viewer page entry point — the tree, and everything that drives it.
  *
- * M0's viewer is a self-check rather than a tree: the milestone is the
- * boundary, so the page shows the boundary. What it demonstrates is not the
- * button — it is that a file dropped here is read 64 KiB at a time and never
- * handed to the page whole. That constraint is the product; it is established
- * now, while it is cheap, rather than retrofitted in M2.
+ * This thread renders. It does not parse, it does not read the file, and it
+ * never holds more rows than fit on a screen. What lives here is the join
+ * between three small pieces that each know one thing:
+ *
+ * - {@link Tree} knows the *shape* — which containers are open and therefore
+ *   what row 4 812 907 is. It holds no row data at all.
+ * - {@link RowStore} knows the *content* — a bounded cache of decoded blocks,
+ *   and how to ask the Worker for one that is missing.
+ * - {@link VirtualList} knows the *geometry* — how many rows exist, which are
+ *   visible, and which DOM element to reuse for each.
+ *
+ * Keeping them apart is what makes the hard case boring: expanding a five
+ * million element array changes one number in the tree, invalidates nothing in
+ * the store, and moves no DOM at all.
  */
 
-import { SNIFF_PREFIX_BYTES, type Format, type WorkerEvent } from '../protocol/index.js';
+import { type Format, type WorkerEvent } from '../protocol/index.js';
+import { RowBlock, type Row } from '../protocol/rows.js';
 import { Engine, EngineError } from './engine.js';
+import { VirtualList } from './list.js';
+import { BLOCK_ROWS, RowStore } from './store.js';
+import { Tree, type Branch, type Located } from './tree.js';
 
 /** Look up a required element, failing loudly rather than at first null deref. */
 function el<T extends HTMLElement>(id: string): T {
@@ -24,24 +37,60 @@ const statusDot = el('status').querySelector<HTMLElement>('.dot');
 const statusText = el('status-text');
 const engineVersion = el('engine-version');
 
-const echoForm = el<HTMLFormElement>('echo-form');
-const echoInput = el<HTMLInputElement>('echo-input');
-const echoResult = el<HTMLOutputElement>('echo-result');
+const fileInfo = el('file-info');
+const fileName = el('file-name');
+const fileFacts = el('file-facts');
 
-const drop = el('drop');
 const pick = el<HTMLButtonElement>('pick');
-const file = el<HTMLInputElement>('file');
+const pickEmpty = el<HTMLButtonElement>('pick-empty');
+const filePicker = el<HTMLInputElement>('file');
+const drop = el('drop');
 const paste = el<HTMLTextAreaElement>('paste');
-const sniffResult = el<HTMLOutputElement>('sniff-result');
+const empty = el('empty');
+
+const crumbs = el('crumbs');
+const indexing = el('indexing');
+const progressFill = el('progress-fill');
+const indexState = el('index-state');
+const cancel = el<HTMLButtonElement>('cancel');
+
+const viewport = el('viewport');
+const canvas = el('canvas');
+
+const selectionInfo = el('selection');
+const copyPath = el<HTMLButtonElement>('copy-path');
+const copyValue = el<HTMLButtonElement>('copy-value');
+const notice = el<HTMLOutputElement>('notice');
+
+/**
+ * Row height, taken from the stylesheet rather than duplicated here.
+ *
+ * The renderer positions every row by multiplying this; a stylesheet that
+ * disagreed with it would put every row in the wrong place, which is a bug that
+ * looks like a rendering glitch and is actually a constant in two files.
+ */
+const ROW_HEIGHT =
+  Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 22;
+
+/**
+ * How far ahead of the viewport a container is kept indexed.
+ *
+ * Two blocks: far enough that scrolling at speed reaches indexed rows, close
+ * enough that opening a huge array does not index the whole thing (C39).
+ */
+const PREFETCH_ROWS = BLOCK_ROWS * 2;
+
+/** Bytes of a value the clipboard will take before it is cut short. */
+const COPY_LIMIT = 4 * 1024 * 1024;
 
 function setStatus(state: 'pending' | 'ready' | 'failed', text: string): void {
   statusDot?.setAttribute('data-state', state);
   statusText.textContent = text;
 }
 
-function show(output: HTMLOutputElement, state: 'ok' | 'err' | '', text: string): void {
-  output.dataset['state'] = state;
-  output.textContent = text;
+function say(state: 'ok' | 'err' | '', text: string): void {
+  notice.dataset['state'] = state;
+  notice.textContent = text;
 }
 
 /** Render a thrown value in a way that names the layer that failed. */
@@ -54,148 +103,725 @@ function describe(thrown: unknown): string {
 
 /** How each detected format reads to someone who just dropped a file. */
 const FORMAT_LABEL: Record<Format, string> = {
-  'single-document': 'Single JSON document',
-  ndjson: 'NDJSON / JSON-lines',
-  empty: 'Empty — no content to read',
-  unknown: 'Not JSON — nothing here starts a JSON value',
+  'single-document': 'JSON document',
+  ndjson: 'NDJSON',
+  empty: 'empty',
+  unknown: 'not JSON',
 };
+
+/** Why indexing stopped early, said the way a user would say it. */
+const STOPPED: Record<'malformed' | 'cancelled' | 'error', string> = {
+  malformed: 'stopped at a syntax error',
+  cancelled: 'stopped',
+  error: 'unreadable',
+};
+
+const UNITS = ['B', 'kB', 'MB', 'GB', 'TB'];
+
+function humanBytes(bytes: number): string {
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < UNITS.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  const digits = unit === 0 || value >= 100 ? 0 : 1;
+  return `${value.toFixed(digits)} ${UNITS[unit]}`;
+}
+
+// ---------------------------------------------------------------- the parts
 
 const worker = new Worker(new URL('worker.js', import.meta.url), {
   type: 'module',
   name: 'leviathan-engine',
 });
 
-const engine = new Engine(worker, (event: WorkerEvent) => {
+const engine = new Engine(worker, onEvent);
+const tree = new Tree();
+
+const store = new RowStore(engine, {
+  rows: () => {
+    list.refresh();
+  },
+  count: (container, count, complete) => {
+    const branch = tree.branchOf(container);
+    if (branch) {
+      tree.setCount(branch, count, complete);
+      sync();
+    }
+  },
+  incomplete: (container) => {
+    const branch = tree.branchOf(container);
+    say('err', `A container ends early — showing the ${branch?.count ?? 0} children found.`);
+  },
+  failed: (thrown) => {
+    say('err', describe(thrown));
+  },
+});
+
+const list = new VirtualList({
+  viewport,
+  canvas,
+  rowHeight: ROW_HEIGHT,
+  create: createRow,
+  paint: paintRow,
+});
+
+/** The row the keyboard acts on. Held as (container, index), never as a flat
+ * index: a flat index changes meaning whenever anything above it opens. */
+interface Selection {
+  branch: Branch;
+  index: number;
+}
+
+let selection: Selection | undefined;
+
+/** Whether tier-1 indexing is still running. */
+let busy = false;
+
+// ------------------------------------------------------------------- rows
+
+interface Parts {
+  gutter: HTMLElement;
+  twisty: HTMLButtonElement;
+  key: HTMLElement;
+  value: HTMLElement;
+  note: HTMLElement;
+}
+
+/**
+ * The element parts of a row, keyed by the row element.
+ *
+ * A `WeakMap` rather than fields on the element, and a lookup rather than a
+ * query: `paint` runs for every visible row on every frame of a scroll, and
+ * `querySelector` in that loop is the kind of cost that only shows up on the
+ * file the product exists for.
+ */
+const parts = new WeakMap<HTMLElement, Parts>();
+
+function createRow(): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'tree-row';
+  row.setAttribute('role', 'treeitem');
+
+  const gutter = document.createElement('span');
+  gutter.className = 'gutter';
+
+  const twisty = document.createElement('button');
+  twisty.type = 'button';
+  twisty.className = 'twisty';
+  twisty.tabIndex = -1;
+  twisty.setAttribute('aria-hidden', 'true');
+
+  const key = document.createElement('span');
+  key.className = 'key';
+
+  const value = document.createElement('span');
+  value.className = 'val';
+
+  const note = document.createElement('span');
+  note.className = 'note';
+
+  row.append(gutter, twisty, key, value, note);
+  parts.set(row, { gutter, twisty, key, value, note });
+  return row;
+}
+
+function paintRow(element: HTMLElement, flat: number): void {
+  const part = parts.get(element);
+  if (!part) {
+    return;
+  }
+
+  const at = tree.locate(flat);
+  const row = store.rowAt(at.branch.container, at.index);
+
+  element.dataset['flat'] = String(flat);
+  element.id = `row-${flat}`;
+  element.style.setProperty('--depth', String(at.depth));
+  element.setAttribute('aria-level', String(at.depth + 1));
+  element.setAttribute('aria-posinset', String(at.index + 1));
+  element.setAttribute('aria-setsize', String(at.branch.complete ? at.branch.count : -1));
+
+  const selected = isSelected(at);
+  element.setAttribute('aria-selected', selected ? 'true' : 'false');
+  if (selected) {
+    viewport.setAttribute('aria-activedescendant', element.id);
+  }
+
+  part.gutter.textContent = at.index.toLocaleString();
+
+  if (!row) {
+    // The bytes have not arrived. The row still occupies its place, so nothing
+    // moves when it does.
+    element.dataset['loading'] = 'true';
+    element.dataset['kind'] = 'pending';
+    element.removeAttribute('aria-expanded');
+    part.twisty.textContent = '';
+    part.key.textContent = '';
+    part.value.textContent = '…';
+    part.note.textContent = '';
+    keepIndexed(at);
+    return;
+  }
+
+  delete element.dataset['loading'];
+  element.dataset['kind'] = row.kind;
+
+  const open = row.expandable ? tree.branchOf(row.offset) : undefined;
+  if (row.expandable) {
+    element.setAttribute('aria-expanded', open ? 'true' : 'false');
+    part.twisty.textContent = open ? '▾' : '▸';
+  } else {
+    element.removeAttribute('aria-expanded');
+    part.twisty.textContent = '';
+  }
+
+  part.key.textContent = row.key === null ? '' : `${JSON.stringify(row.key)}:`;
+  part.value.textContent = summarize(row);
+  part.note.textContent = open && !open.complete ? 'indexing…' : '';
+
+  keepIndexed(at);
+}
+
+/**
+ * Keep the container a visible row belongs to indexed a little further ahead.
+ *
+ * The root grows on its own while tier 1 runs; an expanded container only grows
+ * when someone asks, and the someone is this. Asking from `paint` means a
+ * container is extended exactly when it is scrolled into, and never otherwise.
+ */
+function keepIndexed(at: Located): void {
+  const container = at.branch.container;
+  if (typeof container === 'number' && !at.branch.complete) {
+    if (at.index + PREFETCH_ROWS >= at.branch.count) {
+      store.grow(container, at.index + PREFETCH_ROWS);
+    }
+  }
+}
+
+/** The one-line rendering of a value: its text, or its shape and size. */
+function summarize(row: Row): string {
+  if (row.kind === 'object' || row.kind === 'array') {
+    const [openBracket, closeBracket] = row.kind === 'object' ? ['{', '}'] : ['[', ']'];
+    if (row.children === 0) {
+      return `${openBracket}${closeBracket}`;
+    }
+    // An inexact count is the budget having run out, not a mystery — C33.
+    const count = `${row.children.toLocaleString()}${row.childrenExact ? '' : '+'}`;
+    return `${openBracket} ${count} ${row.children === 1 ? 'item' : 'items'} ${closeBracket}`;
+  }
+  return row.truncated ? `${row.preview}…` : row.preview;
+}
+
+// -------------------------------------------------------------- structure
+
+/** Push the model's current size into the list and refresh what is on screen. */
+function sync(): void {
+  list.setCount(tree.size);
+  list.refresh();
+  renderCrumbs();
+}
+
+function isSelected(at: Located): boolean {
+  return selection !== undefined && selection.branch === at.branch && selection.index === at.index;
+}
+
+/** Open or close the container at a flat row index. */
+function toggle(flat: number): void {
+  const at = tree.locate(flat);
+  const row = store.rowAt(at.branch.container, at.index);
+  if (!row?.expandable) {
+    return;
+  }
+
+  const open = tree.branchOf(row.offset);
+  if (open) {
+    // Collapsing takes the subtree's expansions with it. Telling the engine is
+    // courtesy, not correctness — a byte offset stays valid either way (C36).
+    for (const offset of tree.close(open)) {
+      store.forget(offset);
+    }
+    if (selection && !isReachable(selection.branch)) {
+      select({ branch: at.branch, index: at.index });
+    }
+  } else {
+    const extent = store.extentOf(row.offset);
+    tree.open(at, row.offset, extent.count, extent.complete);
+    store.grow(row.offset, PREFETCH_ROWS);
+  }
+
+  sync();
+}
+
+/** Whether a branch is still part of the tree, after a collapse elsewhere. */
+function isReachable(branch: Branch): boolean {
+  let node: Branch | null = branch;
+  while (node.parent) {
+    if (!node.parent.children.includes(node)) {
+      return false;
+    }
+    node = node.parent;
+  }
+  return node === tree.root;
+}
+
+// -------------------------------------------------------------- selection
+
+function select(next: Selection | undefined, reveal = true): void {
+  selection = next;
+  const enabled = next !== undefined;
+  copyPath.disabled = !enabled;
+  copyValue.disabled = !enabled;
+
+  if (next && reveal) {
+    list.reveal(tree.flatIndexOf(next.branch, next.index));
+  }
+  list.refresh();
+  renderCrumbs();
+  renderSelectionInfo();
+}
+
+/** Move the selection by whole rows, through the flat view of the tree. */
+function move(delta: number): void {
+  if (tree.size === 0) {
+    return;
+  }
+  const from = selection ? tree.flatIndexOf(selection.branch, selection.index) : -1;
+  const to = Math.max(0, Math.min(tree.size - 1, from + delta));
+  select(tree.locate(to));
+}
+
+function selectFlat(flat: number): void {
+  if (tree.size === 0) {
+    return;
+  }
+  select(tree.locate(Math.max(0, Math.min(tree.size - 1, flat))));
+}
+
+/**
+ * The row for a (container, index), from cache if it is there.
+ *
+ * Used by the parts of the UI that need a row they are not painting — the
+ * breadcrumb and copy-path walk ancestors, which are usually cached because you
+ * had to see a node to open it, and are fetched individually when they are not.
+ */
+async function rowFor(branch: Branch, index: number): Promise<Row | undefined> {
+  const cached = store.rowAt(branch.container, index);
+  if (cached) {
+    return cached;
+  }
+  const { packed } = await engine.call('rows', {
+    container: branch.container,
+    start: index,
+    count: 1,
+  });
+  const block = new RowBlock(packed);
+  return block.length === 0 ? undefined : block.row(0);
+}
+
+/** One step of a path: `.key`, `["odd key"]`, or `[7]`. */
+function segment(row: Row | undefined, index: number): string {
+  if (!row || row.key === null) {
+    return `[${index}]`;
+  }
+  return /^[A-Za-z_$][\w$]*$/.test(row.key) ? `.${row.key}` : `[${JSON.stringify(row.key)}]`;
+}
+
+/** The chain of (branch, index) from the root down to a selection. */
+function ancestry(of: Selection): Selection[] {
+  const chain: Selection[] = [];
+  let branch: Branch = of.branch;
+  let index = of.index;
+  for (;;) {
+    chain.unshift({ branch, index });
+    const parent = branch.parent;
+    if (!parent) {
+      return chain;
+    }
+    index = branch.indexInParent;
+    branch = parent;
+  }
+}
+
+/** The full path of a selection, fetching any ancestor rows not in cache. */
+async function pathOf(of: Selection): Promise<string> {
+  const steps = await Promise.all(
+    ancestry(of).map(async (step) => segment(await rowFor(step.branch, step.index), step.index)),
+  );
+  return `$${steps.join('')}`;
+}
+
+function renderCrumbs(): void {
+  crumbs.replaceChildren();
+  if (!selection) {
+    return;
+  }
+
+  const chain = ancestry(selection);
+  const root = document.createElement('span');
+  root.className = 'sep';
+  root.textContent = '$';
+  crumbs.append(root);
+
+  for (const [depth, step] of chain.entries()) {
+    // Cache-only: the breadcrumb repaints on every arrow key, and a fetch per
+    // keystroke to label a crumb the user can already see is a poor trade. A
+    // missing row shows as its index, which is what it is.
+    const label = segment(store.rowAt(step.branch.container, step.index), step.index);
+    const last = depth === chain.length - 1;
+
+    if (last) {
+      const here = document.createElement('span');
+      here.className = 'here';
+      here.textContent = label;
+      crumbs.append(here);
+      continue;
+    }
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.addEventListener('click', () => {
+      select(step);
+    });
+    crumbs.append(button);
+  }
+}
+
+function renderSelectionInfo(): void {
+  selectionInfo.replaceChildren();
+  if (!selection) {
+    const hint = document.createElement('span');
+    hint.className = 'hint';
+    hint.textContent = 'Select a row to see its path and offset.';
+    selectionInfo.append(hint);
+    return;
+  }
+
+  const row = store.rowAt(selection.branch.container, selection.index);
+  const path = document.createElement('span');
+  path.className = 'path';
+  path.textContent = `$${ancestry(selection)
+    .map((step) => segment(store.rowAt(step.branch.container, step.index), step.index))
+    .join('')}`;
+
+  const facts = document.createElement('span');
+  facts.className = 'facts';
+  facts.textContent = row
+    ? `${row.kind} · byte ${row.valueStart.toLocaleString()}${
+        row.valueEnd === null ? '' : ` · ${humanBytes(row.valueEnd - row.valueStart)}`
+      }`
+    : 'loading…';
+
+  selectionInfo.append(path, facts);
+}
+
+// ------------------------------------------------------------------ copy
+
+async function toClipboard(text: string, what: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    say('ok', `${what} copied — ${text.length.toLocaleString()} characters`);
+  } catch (thrown) {
+    say('err', `Could not copy: ${describe(thrown)}`);
+  }
+}
+
+copyPath.addEventListener('click', () => {
+  if (!selection) {
+    return;
+  }
+  void pathOf(selection).then((path) => toClipboard(path, 'Path'));
+});
+
+copyValue.addEventListener('click', () => {
+  void copySelectedValue();
+});
+
+/**
+ * Copy the selected value's actual bytes, not its preview.
+ *
+ * The preview is truncated by design (C33), so copying it would silently hand
+ * over the wrong thing. The Worker re-reads the value's byte range from the
+ * file instead — bounded, because a single value can be larger than memory and
+ * the clipboard is not the place to discover that.
+ */
+async function copySelectedValue(): Promise<void> {
+  if (!selection) {
+    return;
+  }
+  const row = await rowFor(selection.branch, selection.index);
+  if (!row) {
+    say('err', 'That row is not loaded yet.');
+    return;
+  }
+
+  try {
+    const { text, truncated } = await engine.call('text', {
+      start: row.valueStart,
+      end: row.valueEnd,
+      limit: COPY_LIMIT,
+    });
+    await toClipboard(text, 'Value');
+    if (truncated) {
+      say('err', `Value copied, cut at ${humanBytes(COPY_LIMIT)}.`);
+    }
+  } catch (thrown) {
+    say('err', describe(thrown));
+  }
+}
+
+// ------------------------------------------------------------- interaction
+
+viewport.addEventListener('mousedown', (event) => {
+  const target = event.target as HTMLElement;
+  const rowElement = target.closest<HTMLElement>('.tree-row');
+  const flat = Number(rowElement?.dataset['flat']);
+  if (!rowElement || Number.isNaN(flat)) {
+    return;
+  }
+
+  if (target.classList.contains('twisty')) {
+    event.preventDefault();
+    toggle(flat);
+    selectFlat(flat);
+    return;
+  }
+  selectFlat(flat);
+});
+
+viewport.addEventListener('dblclick', (event) => {
+  const rowElement = (event.target as HTMLElement).closest<HTMLElement>('.tree-row');
+  const flat = Number(rowElement?.dataset['flat']);
+  if (rowElement && !Number.isNaN(flat)) {
+    toggle(flat);
+  }
+});
+
+viewport.addEventListener('keydown', (event) => {
+  if (event.altKey || event.ctrlKey || event.metaKey) {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'c') {
+      event.preventDefault();
+      if (event.shiftKey) {
+        if (selection) {
+          void pathOf(selection).then((path) => toClipboard(path, 'Path'));
+        }
+      } else {
+        void copySelectedValue();
+      }
+    }
+    return;
+  }
+
+  const flat = selection ? tree.flatIndexOf(selection.branch, selection.index) : 0;
+
+  switch (event.key) {
+    case 'ArrowDown':
+      move(1);
+      break;
+    case 'ArrowUp':
+      move(-1);
+      break;
+    case 'PageDown':
+      move(list.pageSize);
+      break;
+    case 'PageUp':
+      move(-list.pageSize);
+      break;
+    case 'Home':
+      selectFlat(0);
+      break;
+    case 'End':
+      selectFlat(tree.size - 1);
+      break;
+    case 'ArrowRight': {
+      if (!selection) {
+        selectFlat(0);
+        break;
+      }
+      const row = store.rowAt(selection.branch.container, selection.index);
+      if (row?.expandable && !tree.branchOf(row.offset)) {
+        toggle(flat);
+      } else {
+        move(1);
+      }
+      break;
+    }
+    case 'ArrowLeft': {
+      if (!selection) {
+        selectFlat(0);
+        break;
+      }
+      const row = store.rowAt(selection.branch.container, selection.index);
+      if (row?.expandable && tree.branchOf(row.offset)) {
+        toggle(flat);
+      } else if (selection.branch.parent) {
+        select({ branch: selection.branch.parent, index: selection.branch.indexInParent });
+      }
+      break;
+    }
+    case 'Enter':
+    case ' ':
+      toggle(flat);
+      break;
+    default:
+      return;
+  }
+
+  event.preventDefault();
+});
+
+// ------------------------------------------------------------------ files
+
+/** Hand a file to the engine and show its root. */
+async function openFile(source: File): Promise<void> {
+  say('', `opening ${source.name}…`);
+  selection = undefined;
+  copyPath.disabled = true;
+  copyValue.disabled = true;
+  tree.reset();
+  store.clear();
+  list.reset();
+  list.setCount(0);
+  renderCrumbs();
+  renderSelectionInfo();
+
+  try {
+    const { format, size } = await engine.call('open', { file: source });
+
+    fileInfo.hidden = false;
+    fileName.textContent = source.name;
+    fileFacts.textContent = `${humanBytes(size)} · ${FORMAT_LABEL[format]}`;
+    empty.hidden = true;
+    viewport.hidden = false;
+    indexing.hidden = false;
+    viewport.focus();
+    say('', '');
+
+    if (format === 'unknown' || format === 'empty') {
+      say('err', `Nothing to show — this file is ${FORMAT_LABEL[format]}.`);
+    }
+  } catch (thrown) {
+    say('err', describe(thrown));
+  }
+}
+
+function onEvent(event: WorkerEvent): void {
   if (event.kind === 'ready') {
     setStatus('ready', 'Engine ready');
     engineVersion.textContent = `engine ${event.core} · protocol ${event.protocol}`;
-  } else {
-    setStatus('failed', 'Engine failed to start');
-    show(sniffResult, 'err', describe(new EngineError(event.error)));
+    return;
   }
-});
+
+  if (event.kind === 'fatal') {
+    setStatus('failed', 'Engine failed to start');
+    say('err', describe(new EngineError(event.error)));
+    return;
+  }
+
+  const percent = event.total === 0 ? 100 : (event.consumed / event.total) * 100;
+  progressFill.style.width = `${Math.min(100, percent).toFixed(1)}%`;
+  busy = !event.done;
+  cancel.disabled = event.done;
+  viewport.setAttribute('aria-busy', busy ? 'true' : 'false');
+
+  const rows = `${event.rows.toLocaleString()} rows`;
+  if (!event.done) {
+    progressFill.dataset['state'] = '';
+    indexState.textContent = `${humanBytes(event.consumed)} · ${rows}`;
+  } else if (event.stopped) {
+    progressFill.dataset['state'] = 'stopped';
+    indexState.textContent = `${STOPPED[event.stopped]} · ${rows}`;
+    if (event.error) {
+      say('err', describe(new EngineError(event.error)));
+    }
+  } else {
+    progressFill.dataset['state'] = 'done';
+    progressFill.style.width = '100%';
+    indexState.textContent = rows;
+  }
+
+  // Tier 1 only ever appends, so a growing root is a taller scrollbar and
+  // nothing else — no row on screen moves, and nothing cached is invalidated.
+  store.noteRoot(event.rows, event.done);
+  tree.setCount(tree.root, event.rows, event.done);
+  sync();
+}
 
 // Confirms the loaded `.wasm` matches this bundle. Also the first message sent,
 // which is what triggers instantiation in the Worker.
 engine.checkVersion().catch((thrown: unknown) => {
   setStatus('failed', 'Engine failed to start');
-  show(echoResult, 'err', describe(thrown));
+  say('err', describe(thrown));
 });
 
-echoForm.addEventListener('submit', (event) => {
-  event.preventDefault();
-  const value = echoInput.valueAsNumber;
-  show(echoResult, '', 'calling…');
-
-  engine.call('echo', { value }).then(
-    (result) => {
-      const intact = result.value === value;
-      show(
-        echoResult,
-        intact ? 'ok' : 'err',
-        intact
-          ? `${result.value} — round-tripped intact`
-          : `sent ${value}, received ${result.value}`,
-      );
-    },
-    (thrown: unknown) => {
-      show(echoResult, 'err', describe(thrown));
-    },
-  );
+cancel.addEventListener('click', () => {
+  cancel.disabled = true;
+  void engine.call('cancel', {}).catch(() => {
+    // The final progress event reports the outcome; nothing to add here.
+  });
 });
 
-/**
- * Send a prefix to the engine and report the format.
- *
- * `prefix` is transferred, so this function is the last owner of that buffer.
- */
-async function sniff(prefix: ArrayBuffer, label: string): Promise<void> {
-  const bytes = prefix.byteLength;
-  show(sniffResult, '', `reading ${label}…`);
-  try {
-    const { format } = await engine.call('sniff', { prefix });
-    show(
-      sniffResult,
-      format === 'unknown' || format === 'empty' ? 'err' : 'ok',
-      `${FORMAT_LABEL[format]} — from ${bytes.toLocaleString()} bytes of ${label}`,
-    );
-  } catch (thrown) {
-    show(sniffResult, 'err', describe(thrown));
-  }
+for (const button of [pick, pickEmpty]) {
+  button.addEventListener('click', () => {
+    filePicker.click();
+  });
 }
 
-/**
- * Read at most {@link SNIFF_PREFIX_BYTES} from a file.
- *
- * `File.slice` is lazy — this reads 64 KiB whether the file is 2 KB or 2 GB,
- * and it is the same mechanism the M1 `ByteRange` implementation will use to
- * service the core's re-lexing requests.
- */
-async function prefixOf(source: File): Promise<ArrayBuffer> {
-  return source.slice(0, SNIFF_PREFIX_BYTES).arrayBuffer();
-}
-
-async function handleFile(source: File): Promise<void> {
-  await sniff(await prefixOf(source), source.name);
-}
-
-pick.addEventListener('click', () => {
-  file.click();
-});
-
-file.addEventListener('change', () => {
-  const chosen = file.files?.[0];
+filePicker.addEventListener('change', () => {
+  const chosen = filePicker.files?.[0];
   if (chosen) {
-    void handleFile(chosen);
+    void openFile(chosen);
   }
 });
 
 drop.addEventListener('click', (event) => {
-  if (event.target !== pick) {
-    file.click();
+  if (event.target !== pickEmpty) {
+    filePicker.click();
   }
 });
 
 drop.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' || event.key === ' ') {
     event.preventDefault();
-    file.click();
+    filePicker.click();
   }
 });
 
-drop.addEventListener('dragover', (event) => {
+// Drops land anywhere on the page, not just on the empty state: once a file is
+// open the drop zone is not on screen, and "drag another file in" is the most
+// natural way to open the next one.
+document.addEventListener('dragover', (event) => {
   event.preventDefault();
   drop.dataset['over'] = 'true';
 });
 
 for (const type of ['dragleave', 'drop'] as const) {
-  drop.addEventListener(type, () => {
+  document.addEventListener(type, () => {
     delete drop.dataset['over'];
   });
 }
 
-drop.addEventListener('drop', (event) => {
+document.addEventListener('drop', (event) => {
   event.preventDefault();
   const dropped = event.dataTransfer?.files[0];
   if (dropped) {
-    void handleFile(dropped);
+    void openFile(dropped);
   }
 });
 
-// Pasted text is bounded the same way a file is. Debounced so that typing does
-// not queue a call per keystroke — the same batching discipline the M2 tree
-// applies to scroll events, established here at trivial scale.
+// Pasted text becomes a `File` and takes exactly the same path as a dropped
+// one. Not a shortcut — a second entry point with its own handling would be a
+// second set of bugs, and this way paste is tested by everything file is.
+// Debounced so typing does not open a document per keystroke.
 let pasteTimer: number | undefined;
 paste.addEventListener('input', () => {
   clearTimeout(pasteTimer);
   pasteTimer = self.setTimeout(() => {
     const text = paste.value;
-    if (text.length === 0) {
-      show(sniffResult, '', '');
-      return;
+    if (text.length > 0) {
+      void openFile(new File([text], 'pasted.json', { type: 'application/json' }));
     }
-    const encoded = new TextEncoder().encode(text.slice(0, SNIFF_PREFIX_BYTES));
-    // `.slice()` guarantees an exactly-sized buffer we own and may transfer.
-    void sniff(encoded.slice().buffer as ArrayBuffer, 'pasted text');
   }, 150);
 });

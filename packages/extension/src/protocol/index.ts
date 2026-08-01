@@ -32,7 +32,7 @@
  * `dist/` after a rebuild is the single most likely cause of a confusing bug in
  * this project, so it fails loudly at boot instead of subtly at use.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 3;
 
 /** Input shapes the core can index. Mirrors `leviathan_core::Format`. */
 export type Format = 'single-document' | 'ndjson' | 'empty' | 'unknown';
@@ -46,10 +46,17 @@ export interface ProtocolError {
 }
 
 /**
+ * A container's byte offset, or `null` for the document root.
+ *
+ * Byte offsets are the node ids of this system, and they are ordinary numbers
+ * rather than `BigInt`s — see `rows.ts` and `DEEP_REASONING.md` C36 and C43.
+ */
+export type NodeId = number | null;
+
+/**
  * Every call the UI can make, as `method → { params, result }`.
  *
- * This is the single source of truth for the request surface. M1 adds `index`,
- * `getRows`, and `cancel` here.
+ * This is the single source of truth for the request surface.
  */
 export interface Calls {
   /**
@@ -76,6 +83,85 @@ export interface Calls {
    * design rests on that never happening at file scale.
    */
   sniff: { params: { prefix: ArrayBuffer }; result: { format: Format } };
+
+  /**
+   * Take ownership of a file and begin indexing it.
+   *
+   * The `File` is structure-cloned, which moves a *handle*, not the bytes — the
+   * Worker reads ranges out of it on demand and the file is never held whole
+   * anywhere. This resolves as soon as the format is known, which is one 64 KiB
+   * read: the UI can name the file and its format immediately, seconds before
+   * the tree is finished. Indexing then continues on its own and reports
+   * through {@link WorkerEvent}s of kind `progress`.
+   *
+   * Opening a second file replaces the first.
+   */
+  open: {
+    params: { file: File };
+    result: { format: Format; size: number };
+  };
+
+  /**
+   * Stop indexing where it is.
+   *
+   * The partial index stays usable — every row found so far is a real row — so
+   * this is "that is enough of this file", not "throw it away".
+   */
+  cancel: { params: Record<string, never>; result: { consumed: number; rows: number } };
+
+  /** How many rows a container currently offers. `null` is the root. */
+  rowCount: { params: { container: NodeId }; result: { count: number } };
+
+  /**
+   * Materialize a run of rows, packed into one transferable buffer.
+   *
+   * Decode with `RowBlock` from `./rows.js`. The buffer is transferred, so the
+   * Worker's copy is detached the moment it is sent — which is the point, and
+   * why nothing here is ever shared by reference.
+   */
+  rows: {
+    params: { container: NodeId; start: number; count: number };
+    result: { packed: ArrayBuffer };
+  };
+
+  /**
+   * Index the next batch of one container's children, and say how far it got.
+   *
+   * Called repeatedly by the UI for a container large enough to need it. The
+   * children found so far are addressable after every call, so a five-million
+   * element array fills in rather than blocking (`DEEP_REASONING.md` C39).
+   */
+  expand: {
+    params: { offset: number };
+    result: { children: number; done: boolean; complete: boolean };
+  };
+
+  /**
+   * Read a value's bytes back out of the file, as text.
+   *
+   * What "copy value" needs and what a row cannot give it: a row's preview is
+   * truncated by design (`DEEP_REASONING.md` C33), so copying what is on screen
+   * would silently hand over the wrong thing. `end` is `null` for a value whose
+   * extent was never determined — the read then runs to `limit` and says it was
+   * cut short, because a single value can be larger than memory and the
+   * clipboard is not where that should be discovered.
+   */
+  text: {
+    params: { start: number; end: number | null; limit: number };
+    result: { text: string; truncated: boolean };
+  };
+
+  /**
+   * Forget a container's expansion — what collapsing a node does.
+   *
+   * Never required for correctness: the cache evicts on its own, and a byte
+   * offset stays valid whether or not its expansion is resident (C36). This is
+   * the UI telling the engine what it already knows it will not need.
+   */
+  forget: { params: { offset: number }; result: Record<string, never> };
+
+  /** Close the current file and release every index built over it. */
+  close: { params: Record<string, never>; result: Record<string, never> };
 }
 
 /** Name of a declared call. */
@@ -106,12 +192,35 @@ export type ResponseEnvelope<M extends Method = Method> =
 /**
  * Unsolicited Worker → UI messages.
  *
- * Distinguished from responses by having no `id`. M1 adds
- * `{ kind: 'progress' }` here for cancellable indexing.
+ * Distinguished from responses by having no `id`.
+ *
+ * `progress` is an event rather than the result of a call because the indexing
+ * loop belongs to the Worker. Driving it from the UI would put a round-trip
+ * between every 4 MB of a 500 MB file — 125 of them — to communicate something
+ * the UI only ever reacts to.
  */
 export type WorkerEvent =
   | { kind: 'ready'; core: string; protocol: number }
-  | { kind: 'fatal'; error: ProtocolError };
+  | { kind: 'fatal'; error: ProtocolError }
+  | {
+      kind: 'progress';
+      /** Bytes indexed so far. */
+      consumed: number;
+      /** Bytes in the file. */
+      total: number;
+      /** Root rows found so far — already paintable. */
+      rows: number;
+      /** Whether indexing has stopped, for any reason. */
+      done: boolean;
+      /** Why, when it is worth saying: a malformed document, or a cancel. The
+       * rows found before that point are still real rows (C6). */
+      stopped?: 'malformed' | 'cancelled' | 'error';
+      /** Present when `stopped` is `'error'`. */
+      error?: ProtocolError;
+    };
+
+/** The indexing report, named so the Worker can build one before posting it. */
+export type ProgressEvent = Extract<WorkerEvent, { kind: 'progress' }>;
 
 /** Anything the Worker may post to the UI. */
 export type FromWorker = ResponseEnvelope | WorkerEvent;
@@ -122,15 +231,15 @@ export function isEvent(message: FromWorker): message is WorkerEvent {
 }
 
 /**
- * The `ArrayBuffer`s in `params` that should move rather than copy.
+ * The `ArrayBuffer`s in a payload that should move rather than copy.
  *
- * Transferring is why a 64 KiB sniff prefix costs nothing, and it is the same
- * mechanism M1 uses for index row blocks. The sender's buffer is detached
- * afterwards — callers must not reuse it, which is why every call site slices a
- * fresh buffer off the source.
+ * Used in both directions: a 64 KiB sniff prefix on the way in, and a packed
+ * row block on the way back. The sender's buffer is detached afterwards —
+ * callers must not reuse it, which is why every call site hands over a buffer
+ * it has just produced and does not keep.
  */
-export function transferables<M extends Method>(params: Params<M>): Transferable[] {
-  return Object.values(params).filter(
+export function transferables(payload: object): Transferable[] {
+  return Object.values(payload).filter(
     (value): value is ArrayBuffer => value instanceof ArrayBuffer,
   );
 }

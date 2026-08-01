@@ -13,11 +13,12 @@ Open multi-gigabyte JSON and NDJSON in your browser. No freezing, no upload, no 
 </div>
 
 > [!WARNING]
-> **Status: M0 — skeleton.** The Rust core, the WASM boundary, and the extension
-> shell are built and green in CI. The streaming lexer, the node index, and the
-> tree renderer are not written yet, so Leviathan cannot open a large file
-> *today*. The benchmark table below is empty on purpose — no number goes in it
-> until it has been measured. See [Roadmap](#roadmap).
+> **Status: M1 — the engine works, the UI does not exist yet.** The streaming
+> lexer, both index tiers, row materialization and the WASM boundary are built,
+> measured and green in CI: a file opens, indexes in batches, and its rows cross
+> into JavaScript. What is *not* built is the virtualized tree — the viewer page
+> is still a self-check that lists rows and walks into one container at a time.
+> Leviathan is not yet something you would install. See [Roadmap](#roadmap).
 
 ---
 
@@ -252,8 +253,8 @@ ego.
 | | Milestone | Status |
 |---|---|---|
 | **M0** | Skeleton, WASM boundary, typed protocol, CI | ✅ code complete |
-| **M1** | Streaming lexer + node index ← *the make-or-break phase* | 🟡 lexer, grammar, tier-1 index, row materialization done; tier-2 + WASM next |
-| **M2** | Virtualized tree renderer | ⬜ |
+| **M1** | Streaming lexer + node index ← *the make-or-break phase* | ✅ lexer, grammar, both index tiers, row materialization, WASM boundary — all measured |
+| **M2** | Virtualized tree renderer ← *next* | ⬜ |
 | **M3** | Validation: byte-accurate errors, JSON Schema | ⬜ |
 | **M4** | Query: JSONPath (RFC 9535) over the index | ⬜ |
 | **M5** | Dedup: duplicate keys and elements, with locations | ⬜ |

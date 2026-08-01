@@ -660,9 +660,336 @@ hit exactly the same case.
 
 ---
 
+## 2026-08-01 — Tier 2: what a click costs
+
+### C36 — An expansion is disposable because a node id is a byte offset — **validated**
+
+C3 committed to a tier 2 that is built on demand and thrown away under memory
+pressure, and left the hard half unstated: if expansions can be evicted, what is
+a node id?
+
+The tempting answer is an index into the index — a `u32` row number, dense and
+half the width. It does not survive eviction. The moment tier 2 drops an
+expansion, every outstanding id that pointed into it means something else or
+nothing — and the UI is holding those ids: in a scroll position, in a breadcrumb,
+in a request that crossed the Worker boundary two frames ago. Making that safe
+needs generation counters, an invalidation message, and a rule for what the UI
+does when its selection evaporates. That is a protocol spanning three layers,
+existing to service an implementation detail of a cache.
+
+A byte offset is 8 bytes instead of 4 and has none of it. It is derived from the
+file rather than from the index, so it is stable for the life of the file no
+matter what the cache does. Eviction therefore loses *work* and never
+*addressability*, and re-expanding the same offset produces a byte-identical
+table — asserted directly, because the entire argument rests on it
+(`an_evicted_expansion_rebuilds_identically`).
+
+That is why `ExpansionCache` is a pure LRU: no generation counters, no
+invalidation protocol, no callback to the UI. It may drop anything at any moment
+and the only cost is doing the work again. Its lookup is a linear scan for the
+same reason — a person expands a few dozen nodes by hand, not a few thousand, so
+a scan over tens of entries beats a hash map's overhead and one more
+dependency-shaped decision.
+
+*Rules out:* node ids that index into anything the cache owns; an invalidation
+protocol between tier 2 and its consumers.
+
+### C37 — The end-of-source flush is a bug class, not a bug — **validated**
+
+Third sighting. C30 found it in two bench workloads at once; `rows` carries a
+comment citing C30 at the single place it lexes to a boundary; expansion had it
+again, in what is now `stop_at_source_end`.
+
+The shape never changes. A number is the only JSON token that cannot be emitted
+until the byte after it arrives (C20), so any path that stops feeding the lexer
+without calling `Lexer::finish()` drops a final pending value. It is silent, and
+it is silent on exactly the wrong inputs: every fixture ending in `}` or `]`
+behaves identically with the bug and without it. What breaks is `[1,2,3,4` — a
+container truncated by a killed export or a full disk, where the user is looking
+at the file *because* it is damaged, and where losing the last element quietly is
+the worst failure available.
+
+C30's conclusion was to make the shutdown one named function with the reasoning
+attached. That was right and it was not sufficient, because the sequence is not
+actually shared: `rows` stops at a budget, expansion stops at a container close,
+the bench workloads stop at end of file, and each derives its own path to the
+same edge. Three occurrences across four consumers says the interface invites the
+omission rather than that the callers were careless.
+
+What caught it here was not review. It was a test that feeds `[1,2,3,4` and
+asserts **four** children (`a_truncated_container_keeps_the_children_it_found`).
+That test is now the price of admission: a new consumer of `Lexer` owes a
+truncated-input case before it owes anything else.
+
+*Rules out:* relying on review, or on a well-commented helper, to prevent this;
+adding a lexer consumer without a truncated-input test.
+
+### C38 — A growing index and a resident index have different costs — **validated**
+
+`ChildTable` is a `Vec`, and a `Vec` grown to five million entries holds capacity
+for 8 388 608 — it doubles, and the final doubling is always mostly unused. At 8
+bytes per child (C29) that is **67.1 MB of allocation for 40.0 MB of contents**.
+The 27 MB of difference is not transient. It is charged against the cache's
+256 MB budget for as long as the expansion is resident, which is the rest of the
+session, and it can never be used, because the container is closed and no further
+child can arrive.
+
+So a terminal stop seals the table. Measured on the 5 M-element fixture: **40.0
+MB for 5 000 000 children**, exactly 8 bytes each, no headroom. That is 40 % more
+expansions per budget, bought with one `shrink_to_fit` at the one moment it is
+provably free.
+
+Only at a terminal stop, though. A batch-limited stop keeps every byte of its
+capacity, because a table about to grow again would only re-allocate and re-copy
+— the same reasoning that makes amortized growth worth having at all. There are
+two tests, one per side, because the distinction is the point and neither half is
+interesting alone.
+
+The general shape: a structure with amortized growth living inside a memory
+budget has two lifetimes, and the allocator's default policy is tuned for one of
+them.
+
+*Rules out:* treating index size as a single number; a blanket shrink after every
+batch.
+
+### C39 — Expansion yields, because the container that stalls is the one worth opening — **validated**
+
+Enumerating a container's children means walking it, and there is no way around
+that: child *n*'s offset is not knowable without having walked children 0..*n*.
+Expanding the root of the 5 M-element fixture takes **515 ms**. Doing that inside
+a single call means a viewer that stops answering for half a second when someone
+clicks a triangle — the failure this project exists to remove, reintroduced at
+the last remaining interaction.
+
+`Expansion::advance` therefore returns after `batch` children (10 000) holding
+its lexer, grammar and collector state, and the caller decides whether to
+continue. The 515 ms is 501 such calls of roughly a millisecond each, and between
+any two of them the Worker can paint what it has, honour a cancel, or simply not
+come back. Rows appear as they are found rather than after all of them are found
+— which SPEC's risk R2 had already noted is "arguably the better UX anyway".
+
+This is only possible because of a property established two layers down: dropping
+the lexer's chunk iterator early folds the consumed count into an absolute offset
+(C20), so stopping mid-window costs nothing and needs no buffer. Two tests pin
+the consequence — the batch size never changes the result, and neither does the
+window size.
+
+The rate is **96.0 MB/s**, against the same walk performed by tier 1 in one pass:
+
+| Workload | Wall | Rate | Result |
+|---|---:|---:|---|
+| `lex` | 350 ms | 141.1 MB/s | 10 000 001 tokens |
+| `index` (tier 1) | 382 ms | 129.5 MB/s | 40.0 MB table |
+| `expand` (tier 2) | 515 ms | 96.0 MB/s | the same 40.0 MB table |
+
+Same bytes, same lexer, same collector, 35 % slower. The likely cause is read
+size: tier 1 streams 1 MB chunks, while expansion reads a 256 KiB window chosen
+to be one `Blob.slice` in the Worker. That is a hypothesis, not a measurement —
+`ExpandOptions::window` is not reachable from the bench CLI yet. **Open:** wire it
+through and find out whether the 35 % is the window, the per-batch bookkeeping,
+or both. The answer decides whether the Worker's window should be larger than a
+comfortable slice.
+
+Worth stating plainly: this is the worst container in the corpus, and it is one
+no user has. Expanding a *record* — what NDJSON viewing actually does — indexes
+eleven children in **1.03 ms**.
+
+*Rules out:* a blocking `expand(node)` anywhere in the boundary; publishing
+96 MB/s as "tier 2's cost" without the caveat that it is the root of a 5 M-element
+array.
+
+### C40 — Every reader is speculative at its edge, so clamping belongs to the source — **validated**
+
+C35 established that a short read at end of file is a normal condition rather
+than an error, and `rows` grew a private `read_clamped` to deal with it.
+Expansion then needed the identical function for a different reason: `rows` asks
+for a budget past the last row without knowing whether the file extends that far,
+and expansion asks for a window past the container's close out of the same
+ignorance.
+
+Two independent readers deriving the same helper is the signal that it belongs to
+neither. It moved to `source`, beside the trait whose contract it is really
+describing: every consumer of `ByteRange` reads speculatively at its edge, and
+every one of them wants the short read rather than the diagnostic. The version
+living there keeps the probe path for sources that will not state their length —
+which is what a stream being consumed for the first time looks like, and what the
+Worker's `Blob` will look like before anyone asks it.
+
+*Rules out:* a per-module clamp; treating `len_hint()` as required for a source
+to be usable.
+
+---
+
+## 2026-08-01 — The boundary, for real
+
+### C41 — The loop around the index belongs in the core — **validated**
+
+Tier 1 was, until now, a set of parts with no assembly: `RecordScanner` for
+NDJSON, `Lexer` + `Structure` + `RootCollector` for a document, and no code
+anywhere that read a source and drove either one. Every consumer wrote its own.
+The CLI's benchmark had a `build_table` doing it, and the Worker was about to
+grow a second version in TypeScript — on the far side of the WASM boundary,
+where it could not be unit-tested and where its bugs would be indistinguishable
+from engine bugs.
+
+`Build` is that loop, and moving it into the core was worth more than the
+deduplication. It made three things true at once that were not true before:
+`Tier1` finally has something that constructs it; the flush-at-end-of-source
+rule (C37) exists in one place per format instead of once per consumer; and the
+NDJSON and single-document paths became genuinely interchangeable to callers,
+which is what C26 claimed when it said one `ChildTable` and two builders.
+
+The shape is pulled rather than pushed, which is the part that took a decision.
+Both underlying builders take fed bytes, so the obvious design is for the host
+to read a chunk and hand it over. That was rejected because tier 2 *cannot* work
+that way — `Expansion` decides where to read next and only it knows where — and
+a host that implements one byte-delivery mechanism for indexing and a different
+one for expansion has two things to get right instead of one. Everything pulls
+through `ByteRange` now, and the host implements exactly one method.
+
+**Open, and stated plainly:** the CLI's `build_table` has *not* been moved onto
+`Build` yet, so the duplication this entry describes is currently two
+implementations rather than one. That matters more than tidiness — the `index`
+benchmark now measures a code path the engine no longer uses, and its published
+throughput is therefore a number for the old loop. Porting it will change that
+figure (`Build` reads a 1 MB window and yields every 4 MB, where the bench
+streams `--chunk` bytes straight through), which is exactly why it is a separate
+change with its own before-and-after rather than a quiet edit inside this one.
+
+*Rules out:* a push-based tier-1 entry point; a second indexing loop in any
+consumer, in any language — once the CLI is ported.
+
+### C42 — `FileReaderSync` is what makes the sans-IO design work in a browser — **validated**
+
+The core reads synchronously: `ByteRange::read` returns bytes, not a future.
+That was chosen for portability (C2) and it collides head-on with the browser,
+where reading a `Blob` is `slice().arrayBuffer()` — a promise. A promise cannot
+be awaited from inside a WASM call, so on the face of it the design does not run
+in the place it was designed for.
+
+There were three ways out, and the choice matters enough to write down:
+
+1. **Invert the core** so it returns "I need bytes at X" and is resumed with
+   them. Portable, and it puts an async hop inside the lexer's inner loop and a
+   state machine in every caller. It would make the CLI worse to serve the
+   browser.
+2. **Pre-buffer** windows the host predicts. Works only where reads are
+   predictable, which excludes expansion — the case that needs it most.
+3. **`FileReaderSync`.** Synchronous, blocking, and available *only* in a
+   Worker.
+
+The third is not a workaround, it is the design landing where it was aimed. The
+rule this project enforces is that the **main thread** never blocks; the Worker
+exists precisely to be the thread that may. `FileReaderSync` blocks a thread
+whose blocking is free, and the core crosses into the browser with no change at
+all — the third implementor of `ByteRange`, after `&[u8]` and the CLI's
+`FileSource`, needing no change to the trait for the third time.
+
+*Rules out:* an async `ByteRange`; the pull-inversion in option 1; running the
+engine anywhere but a Worker.
+
+### C43 — Rows cross as one buffer, and offsets cross as doubles — **validated**
+
+ADR-002 has claimed since M0 that index data reaches JS without allocating an
+object per row. It was a claim about a mechanism that did not exist. It does
+now: `pack.rs` writes a screen of rows as a header, fixed-width 40-byte records,
+and one UTF-8 blob, and the whole thing crosses as a single transferred
+`ArrayBuffer`. Fifty rows are one allocation and one transfer instead of fifty
+objects and a hundred strings, and a row's two strings are decoded only when
+that row is actually painted — so a block scrolled past costs nothing beyond the
+transfer.
+
+Two details are worth keeping because both were nearly decided the other way.
+
+**Strings are located by length, not by offset.** The decoder walks rows in
+order and accumulates, so two lengths (6 bytes) replace two offsets (8 bytes)
+and the constraint they impose — decode in order — is one the consumer obeys
+anyway. The prefix sum is built once on first random access.
+
+**Offsets are `f64`, not `BigInt`.** A double is exact to 2^53, which is nine
+petabytes; no JSON file will ever reach it. `BigInt` would be correct and would
+put a conversion in the renderer's hot path to buy a range that does not exist.
+The same reasoning applies on both sides of the boundary, so `u64` fields in the
+packed rows are read as two `u32`s rather than with `getBigUint64`.
+
+And the layout is versioned, asserted at Worker startup and again by the
+decoder. A layout skew between a rebuilt bundle and a stale `.wasm` is not a
+type error — it is plausible-looking wrong rows, which is the worst failure
+mode available. Eight bytes of header turns it into a sentence.
+
+*Rules out:* one JS object per row; `BigInt` anywhere in the row path; an
+unversioned binary layout.
+
+### C44 — The bug an array element could never have shown — **validated**
+
+Wiring the boundary turned up a defect in `rows`, sitting in code that had been
+green for two days: **an object member whose value is a container reported zero
+children.** `{"tags":[1,2,3]}` said `tags` was empty. The tree would have shown
+no expand arrow on it.
+
+The cause is one argument. `count_children` was called with the *row's* offset
+and the row's bytes, and a row's offset points at its key, not its value (C28).
+So the walk started at `"tags"`, read a complete JSON document — a string is a
+document — and called the `:` after it trailing garbage. It returned zero,
+politely, exactly as C6 says a failed walk should.
+
+What makes this worth an entry is why every existing test missed it. For an
+**array element**, the row's offset and its value's offset are the same number,
+so the wrong argument is indistinguishable from the right one. And every fixture
+that exercised child counting was an array of arrays, or NDJSON — whose tier-1
+table is unkeyed, so its rows are array-shaped too. C33 reported "50 of 50
+containers counted exactly" on the NDJSON fixture and that measurement was
+correct; it simply could not see this. A test suite built entirely on unkeyed
+tables cannot distinguish a row's offset from its value's offset, and neither
+can a reviewer reading the call.
+
+The lesson generalizes past this bug: where two quantities coincide in the
+common case, the tests must include a case where they differ, or that pair is
+untested no matter how many tests exist. There is now one for keyed containers.
+It also says something about what integration work is for — this was not found
+by review, or by 223 unit tests, but by asking the engine a question the UI
+would ask.
+
+*Rules out:* fixtures that are exclusively arrays or NDJSON for anything
+row-related; treating a row's offset and its value's offset as interchangeable.
+
+---
+
 ## Log of revisions
 
 *(Append here as concepts are validated or revised. Format: date — concept id — what changed — the number that changed it.)*
+
+- **2026-08-01 — C3 — fully discharged.** Two-tier lazy indexing has both tiers.
+  Tier 2 expands the worst container in the corpus — 5 000 000 children — in
+  **515 ms** across 501 yielding batches for a **40.0 MB** table, and the
+  eviction question C3 left open is answered by C36: byte-offset ids make the
+  cache pure, so there is no invalidation protocol to design.
+- **2026-08-01 — C6 — third mechanism.** "Degrade, never abort" was policy in C6
+  and became row-level in C34; it is now container-level. A truncated or
+  malformed container reports *why* it stopped and keeps every child it found,
+  and all three stops are terminal without being destructive.
+- **2026-08-01 — C29 — holds at tier 2.** The 8-bytes-per-child figure was
+  measured on tier 1; tier 2 reproduces it exactly for the same container, and
+  sealing (C38) makes the resident cost equal to the contents rather than 1.68×
+  them.
+- **2026-08-01 — C5 — half discharged.** The boundary now moves a payload
+  rather than a scalar, and the hazard C5 named is closed by construction on the
+  way out: wasm-bindgen copies a returned `Vec<u8>` out of linear memory before
+  JS sees it, so the buffer the Worker transfers is never a view onto WASM
+  memory and cannot be detached by a heap growth. The test C5 actually owes —
+  growing WASM memory *during* a read — is still owed, and now writable.
+- **2026-08-01 — C2 — validated by a third implementor.** `JsSource` in
+  `leviathan-wasm` implements `ByteRange` over a JS callback, with no change to
+  the trait. Three implementors — a slice, a file, a browser `Blob` — and the
+  trait has not moved once (C42).
+- **2026-08-01 — ADR-002 — claim now has a mechanism.** "Node slices cross
+  without allocating per-row objects" was an assertion in a doc comment from M0
+  until C43 built the packed layout behind it. The ADR can now be written from
+  a thing that exists.
+- **2026-08-01 — C33 — measurement stands, coverage did not.** The "50 of 50
+  containers counted exactly" figure is still correct, and it was measured
+  entirely on unkeyed tables, which is why it could not see C44. Both are true
+  and the second is the more useful thing to remember.
 
 - **2026-07-27 — C2 — validated.** Layering enforced mechanically by
   `scripts/check-layering.sh`; core has zero external dependencies and compiles

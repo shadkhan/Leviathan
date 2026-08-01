@@ -9,67 +9,77 @@
   <body>
     <header class="bar">
       <h1 class="wordmark">Leviathan</h1>
-      <p class="tagline">A JSON viewer that survives large files.</p>
+      <div class="file" id="file-info" hidden>
+        <span class="name" id="file-name"></span>
+        <span class="facts" id="file-facts"></span>
+      </div>
       <div class="status" id="status" role="status" aria-live="polite">
         <span class="dot" data-state="pending"></span>
         <span id="status-text">Starting engine…</span>
       </div>
     </header>
 
-    <main>
-      <!--
-        M0 ships a self-check page rather than a tree, on purpose: the milestone
-        is the boundary, so the boundary is what the page shows. The tree
-        replaces this in M2 and these panels move behind a debug flag.
-      -->
-      <section class="panel">
-        <h2>Boundary check</h2>
-        <p class="prose">
-          Round-trips a 32-bit integer from this page, through the Worker, across the
-          WebAssembly boundary, and back. If this works, every later milestone is only
-          about what travels — not whether anything can.
-        </p>
-        <form class="row" id="echo-form">
-          <label class="field">
-            <span>Value</span>
-            <input
-              type="number"
-              id="echo-input"
-              value="42"
-              min="0"
-              max="4294967295"
-              step="1"
-              required
-            />
-          </label>
-          <button type="submit">Round-trip</button>
-          <output class="result" id="echo-result" aria-live="polite"></output>
-        </form>
-      </section>
+    <div class="toolbar">
+      <button type="button" id="pick">Open file…</button>
+      <input type="file" id="file" accept=".json,.ndjson,.jsonl,application/json" hidden />
 
-      <section class="panel">
-        <h2>Format detection</h2>
-        <p class="prose">
-          Drop a file, or paste JSON below. Only the first 64 KiB is read — the whole
-          point of the engine is that file size never dictates memory use.
-        </p>
-        <div class="drop" id="drop" tabindex="0" role="button" aria-describedby="sniff-result">
-          <span>Drop a <code>.json</code> or <code>.ndjson</code> file here</span>
-          <span class="or">or</span>
-          <button type="button" id="pick">Choose a file…</button>
-          <input type="file" id="file" accept=".json,.ndjson,.jsonl,application/json" hidden />
+      <nav class="crumbs" id="crumbs" aria-label="Path to the selected row"></nav>
+
+      <div class="indexing" id="indexing" hidden>
+        <div class="progress" role="progressbar" aria-labelledby="index-state">
+          <div class="progress-fill" id="progress-fill"></div>
         </div>
-        <label class="field block">
-          <span>…or paste</span>
-          <textarea id="paste" rows="4" spellcheck="false" placeholder='{"leviathan":true}'></textarea>
-        </label>
-        <output class="result" id="sniff-result" aria-live="polite"></output>
-      </section>
+        <span class="state" id="index-state"></span>
+        <button type="button" id="cancel">Stop</button>
+      </div>
+    </div>
+
+    <!--
+      The tree. `role="tree"` sits on the scrolling element and the rows carry
+      `aria-level` / `aria-posinset` / `aria-setsize` themselves, because only a
+      window's worth of rows exists in the DOM at any moment — the accessibility
+      tree is told the shape of the whole list even though the document only
+      ever holds the part of it you can see.
+    -->
+    <main
+      class="viewport"
+      id="viewport"
+      tabindex="0"
+      role="tree"
+      aria-label="JSON tree"
+      aria-busy="false"
+      hidden
+    >
+      <div class="canvas" id="canvas"></div>
     </main>
 
+    <section class="empty" id="empty">
+      <div class="drop" id="drop" tabindex="0" role="button">
+        <strong>Drop a <code>.json</code> or <code>.ndjson</code> file</strong>
+        <span class="or">or</span>
+        <button type="button" id="pick-empty">Choose a file…</button>
+        <p class="prose">
+          Nothing is uploaded and nothing is read whole. The engine holds a handle to the
+          file and pulls byte ranges out of it as you scroll, which is why size does not
+          dictate memory use.
+        </p>
+      </div>
+      <label class="field">
+        <span>…or paste JSON</span>
+        <textarea id="paste" rows="3" spellcheck="false" placeholder='{"leviathan":true}'></textarea>
+      </label>
+    </section>
+
     <footer class="bar">
+      <div class="selection" id="selection">
+        <span class="hint">Select a row to see its path and offset.</span>
+      </div>
+      <div class="actions">
+        <button type="button" id="copy-path" disabled>Copy path</button>
+        <button type="button" id="copy-value" disabled>Copy value</button>
+      </div>
+      <output class="result" id="notice" aria-live="polite"></output>
       <span id="engine-version">engine —</span>
-      <a href="https://github.com/shadkhan/leviathan" target="_blank" rel="noreferrer">Source</a>
     </footer>
 
     <script type="module" src="viewer.js"></script>

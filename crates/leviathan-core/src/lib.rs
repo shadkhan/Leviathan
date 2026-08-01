@@ -5,37 +5,71 @@
 //! ## Design in one paragraph
 //!
 //! `leviathan-core` never opens a file, never awaits, and never allocates a
-//! representation of your document. Callers *push* bytes in through
-//! [`Indexer::feed`] and *pull* byte ranges back out through the [`ByteRange`]
-//! trait. What the core keeps is an index — where each node starts, what kind it
-//! is, who its parent is — which is a navigation aid, not a replica. Values and
-//! key names are re-derived by re-reading a few kilobytes at the moment they are
-//! needed. That is what lets a 500 MB document be browsed in bounded memory.
+//! representation of your document. Callers *pull* byte ranges through the
+//! [`ByteRange`] trait, and the core asks for the ranges it needs. What it keeps
+//! is an index — where each node starts and what kind it is — which is a
+//! navigation aid, not a replica. Values and key names are re-derived by
+//! re-reading a few kilobytes at the moment they are needed. That is what lets a
+//! 500 MB document be browsed in bounded memory.
 //!
 //! This "sans-IO" shape is deliberate: the same code runs unchanged in a Web
 //! Worker (byte ranges backed by `Blob.slice`), in a native CLI (backed by
 //! `pread`), or in a server process. See `DEEP_REASONING.md` C2.
 //!
+//! ## The shape of the API
+//!
+//! Indexing is two tiers, both of them incremental, and both stop and resume so
+//! a host can paint a frame or cancel between batches:
+//!
+//! | | | |
+//! |---|---|---|
+//! | **Tier 1** | [`Build`] | the root's children, over the whole source |
+//! | **Tier 2** | [`Expansion`] | one container's children, on demand |
+//! | **Rows** | [`materialize`] | a run of children, re-read into paintable [`Row`]s |
+//!
+//! Every node is addressed by its byte offset, which is stable for the life of
+//! the source. Nothing the core hands out is invalidated by anything the core
+//! later discards.
+//!
 //! ## Status
 //!
-//! **M0 — skeleton.** This release establishes the crate, its public shape and
-//! its boundary contract. [`sniff_format`] is real but heuristic; the streaming
-//! lexer and node index land in M1. The API below is not yet stable.
+//! **M1.** The lexer, the grammar walk, both index tiers and row materialization
+//! are implemented and measured; query, validation, dedup and export are not
+//! written yet. The API is not stable before 1.0.
 //!
 //! ## Example
 //!
 //! ```
-//! use leviathan_core::{sniff_format, Format};
+//! use leviathan_core::{Build, BuildOptions, Format, RowOptions, materialize, sniff_format};
 //!
-//! assert_eq!(sniff_format(br#"{"a":1}"#), Format::SingleDocument);
-//! assert_eq!(sniff_format(b"{\"a\":1}\n{\"a\":2}\n"), Format::Ndjson);
-//! assert_eq!(sniff_format(b"not json"), Format::Unknown);
+//! let source: &[u8] = br#"{"name":"leviathan","tags":[1,2,3]}"#;
+//!
+//! // 1. What kind of input is this?
+//! let format = sniff_format(source);
+//! assert_eq!(format, Format::SingleDocument);
+//!
+//! // 2. Index the root. `source` is a `ByteRange`; a file or a `Blob` works
+//! //    the same way, and `advance` would let you stop between batches.
+//! let mut build = Build::new(format);
+//! let mut bytes = source;
+//! build.run_to_end(&mut bytes, &BuildOptions::default())?;
+//! assert_eq!(build.rows(), 2);
+//!
+//! // 3. Paint some rows, re-reading only the bytes they need.
+//! let mut bytes = source;
+//! let rows = materialize(build.table(), 0, 10, &mut bytes, &RowOptions::default())?;
+//! assert_eq!(rows[0].key.as_deref(), Some("name"));
+//! assert_eq!(rows[0].preview, "leviathan");
+//! assert_eq!(rows[1].children.value(), 3);
+//! # Ok::<(), leviathan_core::SourceError>(())
 //! ```
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+mod build;
+mod expand;
 mod format;
 mod index;
 mod lexer;
@@ -43,6 +77,8 @@ mod rows;
 mod source;
 mod structure;
 
+pub use build::{Build, BuildOptions, Built};
+pub use expand::{DEFAULT_EXPANSION_BUDGET, ExpandOptions, Expansion, ExpansionCache, Stopped};
 pub use format::{Format, sniff_format};
 pub use index::{ChildTable, RecordScanner, RootCollector, Tier1};
 pub use lexer::{LexError, LexErrorKind, Lexer, Position, Token, TokenKind, Tokens};

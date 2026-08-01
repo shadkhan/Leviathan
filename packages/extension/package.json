@@ -9,6 +9,7 @@
     "build": "pnpm build:wasm && node build.mjs",
     "dev": "pnpm build:wasm && node build.mjs --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p src/worker/tsconfig.json --noEmit",
+    "test": "node scripts/ui.test.mjs",
     "smoke": "node scripts/smoke.mjs"
   },
   "devDependencies": {

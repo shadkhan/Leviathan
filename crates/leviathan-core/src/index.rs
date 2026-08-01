@@ -217,6 +217,24 @@ impl RecordScanner {
         self.table.len()
     }
 
+    /// The records found so far, without consuming the scanner.
+    ///
+    /// A tier-1 build reads this while still scanning ([`Build`](crate::Build)),
+    /// because a partially indexed file is already a browsable tree — which is
+    /// the difference between a viewer that opens a 500 MB file in two seconds
+    /// and one that opens it in fifty milliseconds.
+    #[must_use]
+    pub const fn table(&self) -> &ChildTable {
+        &self.table
+    }
+
+    /// Release the table's growth headroom, once no more records can arrive.
+    ///
+    /// See [`RootCollector::seal`] — same reasoning, and the same 40 % (C38).
+    pub fn seal(&mut self) {
+        self.table.seal();
+    }
+
     /// Finish and take the table.
     #[must_use]
     pub fn finish(mut self) -> ChildTable {
@@ -281,6 +299,38 @@ impl RootCollector {
     #[must_use]
     pub const fn rooted(&self) -> bool {
         self.rooted
+    }
+
+    /// The children found so far, without consuming the collector.
+    ///
+    /// Tier-2 expansion reads this while still building (`expand::Expansion`),
+    /// because a partially indexed container is already worth showing.
+    #[must_use]
+    pub const fn table(&self) -> &ChildTable {
+        &self.table
+    }
+
+    /// Release the table's growth headroom, once no more children can arrive.
+    ///
+    /// Only worth calling when collection is finished, and then it is worth
+    /// quite a lot: a `Vec` that grew to five million entries holds capacity for
+    /// 8.4 million, so an expansion reports **67 MB** where its contents are
+    /// 40 MB. That 40 % is charged against the cache's memory budget and would
+    /// never be used.
+    pub fn seal(&mut self) {
+        self.table.seal();
+    }
+
+    /// How many children have been found so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Whether none have been found yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
     }
 
     /// Finish and take the table.

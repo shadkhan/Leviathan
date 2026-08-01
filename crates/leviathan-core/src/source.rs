@@ -105,9 +105,69 @@ impl ByteRange for &[u8] {
     }
 }
 
+/// Read up to `len` bytes, shortening the request if the source is smaller.
+///
+/// Every reader in the engine is speculative at the edges: a row window asks for
+/// a budget past the last row, and an expansion asks for a window past the end
+/// of the container. Neither knows whether the file extends that far, so running
+/// off the end is the normal condition at the end of a file rather than an
+/// error, and both callers want the short read instead of the diagnostic.
+pub(crate) fn read_clamped<S: ByteRange>(
+    source: &mut S,
+    start: u64,
+    len: u64,
+) -> Result<&[u8], SourceError> {
+    let mut len = match source.len_hint() {
+        Some(total) => len.min(total.saturating_sub(start)),
+        None => len,
+    };
+
+    // A source that will not state its length can still be asked. The
+    // out-of-range error carries the size, so one probe always suffices — and
+    // this branch is skipped entirely by every source that knows its own length.
+    if source.len_hint().is_none() {
+        if let Err(SourceError::OutOfRange { available, .. }) = source.read(start, as_u32(len)) {
+            len = available.saturating_sub(start);
+        }
+    }
+
+    source.read(start, as_u32(len))
+}
+
+fn as_u32(len: u64) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_clamped_stops_at_the_end_of_the_source() {
+        let mut src: &[u8] = b"0123456789";
+        assert_eq!(read_clamped(&mut src, 6, 1000).unwrap(), b"6789");
+        assert_eq!(read_clamped(&mut src, 10, 1000).unwrap(), b"");
+        assert_eq!(read_clamped(&mut src, 0, 4).unwrap(), b"0123");
+    }
+
+    #[test]
+    fn read_clamped_discovers_the_end_of_a_source_that_will_not_say() {
+        /// A source that knows its length but refuses to volunteer it — which is
+        /// what a stream being consumed for the first time looks like.
+        struct Coy<'a>(&'a [u8]);
+
+        impl ByteRange for Coy<'_> {
+            fn read(&mut self, start: u64, len: u32) -> Result<&[u8], SourceError> {
+                self.0.read(start, len)
+            }
+            fn len_hint(&self) -> Option<u64> {
+                None
+            }
+        }
+
+        let mut src = Coy(b"0123456789");
+        assert_eq!(read_clamped(&mut src, 6, 1000).unwrap(), b"6789");
+    }
 
     #[test]
     fn reads_a_range() {

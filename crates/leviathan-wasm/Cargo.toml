@@ -21,4 +21,9 @@ wasm-bindgen = "0.2"
 
 [package.metadata.wasm-pack.profile.release]
 # wasm-opt tuned for size: the .wasm ships inside a browser extension.
-wasm-opt = ["-Oz", "--enable-bulk-memory"]
+#
+# `nontrapping-float-to-int` is not a choice — rustc emits `i64.trunc_sat_f64_u`
+# for every `f64 as u64`, and byte offsets cross this boundary as doubles (see
+# the crate docs). Without it wasm-opt rejects its own input. Both features have
+# been baseline in every browser since 2020, well below the MV3 floor.
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]

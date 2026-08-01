@@ -119,7 +119,9 @@ impl Run {
 /// and reading them top to bottom says what fraction of the possible the engine
 /// achieved. A bare MB/s says nothing; "62 % of memory bandwidth" says whether
 /// there is headroom left worth chasing.
-pub const WORKLOADS: [&str; 7] = ["read", "scan", "sniff", "lex", "walk", "index", "rows"];
+pub const WORKLOADS: [&str; 8] = [
+    "read", "scan", "sniff", "lex", "walk", "index", "rows", "expand",
+];
 
 /// Run every workload in `workloads` against `path`.
 ///
@@ -151,6 +153,7 @@ pub fn run_file(path: &Path, workloads: &[&'static str], chunk: usize) -> io::Re
             "walk" => walk(&name, path, chunk)?,
             "index" => index(&name, path, chunk)?,
             "rows" => rows(&name, path, chunk)?,
+            "expand" => expand(&name, path)?,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -527,6 +530,84 @@ fn rows(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
             cold_text = human_duration(cold),
         ),
     })
+}
+
+/// Expand the document's root container — tier-2 indexing, measured.
+///
+/// The root is chosen because it is the largest container a file has, so this is
+/// the worst case rather than a flattering one. On the 5 M-element fixture it
+/// expands five million children; on NDJSON it expands record zero, which is
+/// small by construction — expanding a *record* is never the expensive case, and
+/// the row that matters there is `index`.
+///
+/// Reported as a throughput because expansion cost genuinely scales with the
+/// container's bytes: unlike a row fetch, there is no way to enumerate child *n*
+/// without walking children 0..*n*.
+fn expand(name: &str, path: &Path) -> io::Result<Run> {
+    let start = first_value_offset(path)?;
+    let mut source = crate::file_source::FileSource::open(path)?;
+    let options = leviathan_core::ExpandOptions::default();
+
+    let mut expansion = leviathan_core::Expansion::at(start);
+    let mut batches = 0u32;
+
+    let began = Instant::now();
+    let reason = loop {
+        let reason = expansion
+            .advance(&mut source, &options)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        batches += 1;
+        if !reason.resumable() {
+            break reason;
+        }
+    };
+    let wall = began.elapsed();
+
+    // Bill the bytes actually walked, which for a truncated or malformed
+    // container is less than the file — and zero when there was no container
+    // there at all, which `throughput` already declines to divide by.
+    let bytes = expansion.end().unwrap_or(start).saturating_sub(start);
+
+    let complete = expansion.is_complete();
+    let children = expansion.len();
+    let heap = expansion.heap_bytes();
+
+    Ok(Run {
+        fixture: name.to_string(),
+        workload: "expand",
+        bytes,
+        metric: if complete {
+            Metric::Throughput
+        } else {
+            Metric::Aborted
+        },
+        wall,
+        reps: 1,
+        peak_rss: sys::peak_rss(),
+        observed: format!(
+            "{children} children, {} index, {batches} batch(es), {}",
+            human_bytes(heap as u64),
+            match reason {
+                leviathan_core::Stopped::Closed => "complete".to_string(),
+                other => format!("stopped: {other:?}"),
+            }
+        ),
+    })
+}
+
+/// The offset of the first non-whitespace byte — where the root value begins.
+fn first_value_offset(path: &Path) -> io::Result<u64> {
+    const PREFIX: usize = 64 * 1024;
+    let mut file = File::open(path)?;
+    let mut buf = Vec::with_capacity(PREFIX);
+    file.by_ref().take(PREFIX as u64).read_to_end(&mut buf)?;
+
+    let bom = usize::from(buf.starts_with(&[0xEF, 0xBB, 0xBF])) * 3;
+    let offset = buf[bom.min(buf.len())..]
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        .unwrap_or(0);
+    Ok((bom + offset) as u64)
 }
 
 /// Build whichever tier-1 table this file supports, for workloads that need one.
@@ -1008,6 +1089,42 @@ mod tests {
             runs[0].bytes > 0,
             "the slice's file span should be reported"
         );
+    }
+
+    #[test]
+    fn expand_indexes_a_containers_children() {
+        let (_dir, path) = fixture(br#"[10,20,30,{"a":1}]"#);
+        let runs = run_file(&path, &["expand"], DEFAULT_CHUNK).unwrap();
+        assert!(
+            runs[0].observed.starts_with("4 children"),
+            "{}",
+            runs[0].observed
+        );
+        assert!(
+            runs[0].observed.contains("complete"),
+            "{}",
+            runs[0].observed
+        );
+        assert_eq!(runs[0].metric, Metric::Throughput);
+    }
+
+    #[test]
+    fn expand_reports_a_truncated_container_without_losing_it() {
+        // C6 once more: an unclosed container still yields its children, and the
+        // run is marked so no throughput is published for a partial walk.
+        let (_dir, path) = fixture(b"[1,2,3,4");
+        let runs = run_file(&path, &["expand"], DEFAULT_CHUNK).unwrap();
+        assert!(
+            runs[0].observed.starts_with("4 children"),
+            "{}",
+            runs[0].observed
+        );
+        assert!(
+            runs[0].observed.contains("EndOfSource"),
+            "{}",
+            runs[0].observed
+        );
+        assert_eq!(runs[0].metric, Metric::Aborted);
     }
 
     #[test]
