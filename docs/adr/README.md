@@ -22,7 +22,7 @@ exists to avoid.
 
 | Document | Holds |
 |---|---|
-| [`CLAUDE.md`](../../CLAUDE.md) | Product scope, personas, non-goals, definition of done — the *what* |
+| [`README.md`](../../README.md) | Product scope, features, personas, non-goals, definition of done — the *what* |
 | [`SPEC.md`](../../SPEC.md) | Phased build plan with exit criteria — the *when* |
 | [`DEEP_REASONING.md`](../../DEEP_REASONING.md) | Running log of every core concept, dated, with what it rules out and how it was validated — the *why*, as it happened |
 | `docs/adr/` | The subset of that reasoning that became an architectural commitment, written as one narrative per decision |

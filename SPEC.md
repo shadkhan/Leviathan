@@ -4,7 +4,7 @@
 > This spec is the execution plan for that one line. Anything not traceable to it is out.
 
 Companion documents:
-- `CLAUDE.md` — product scope, non-goals, definition of done (source of truth for *what*).
+- `README.md` — product scope, features, non-goals, definition of done (source of truth for *what*).
 - `USER_PERSONAS.md` — who hits the wall and when (source of truth for *for whom*).
 - `DEEP_REASONING.md` — running log of core concepts and why they were chosen (source of truth for *why*).
 - `docs/adr/ADR-00N-*.md` — one decision each, written at the phase that closes it.
@@ -286,7 +286,7 @@ Scope:
 - **Ship:** Chrome Web Store, then the identical package to Edge Add-ons the same day.
 - Store assets, privacy policy ("no data leaves your machine" — trivially true, and verifiable because the manifest requests no host permissions).
 
-**Exit criterion:** the CLAUDE.md definition of done, executed as a scripted demo start to finish without a stumble; `cargo install leviathan-cli` and `npm i @shadkhan/leviathan-core` both work from a clean machine; extension live on both stores.
+**Exit criterion:** the definition of done, executed as a scripted demo start to finish without a stumble — *drag a 500 MB JSON/NDJSON file in, the tree appears and stays interactive, find a record by typing part of it, run a JSONPath query, see duplicate-key warnings, export the result as CSV; all client-side, no freeze, no upload, with the memory readout visibly steady throughout.* Plus: `cargo install leviathan-cli` and `npm i @shadkhan/leviathan-core` both work from a clean machine; extension live on both stores.
 
 ---
 

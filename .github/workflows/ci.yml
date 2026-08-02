@@ -2,11 +2,16 @@
 #
 # Two jobs, split by what they prove:
 #
-#   engine — the Rust core is correct, lint-clean, and still portable.
+#   engine — the Rust core is correct, conformant, robust, and still portable.
 #   shell  — the WASM package builds, runs, and fits the bundle budget.
 #
 # The layering check lives in `engine` on purpose: "the core is reusable" is a
 # property of the core, and it should fail there rather than downstream.
+#
+# Two of M1's exit criteria are gates here rather than things someone runs by
+# hand — conformance against JSONTestSuite, and fuzzing for panics and
+# chunk-boundary disagreements. A criterion that is only checked when remembered
+# is not a criterion.
 
 name: CI
 
@@ -48,6 +53,35 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-features
+
+      # M1 exit criterion 5. Pinned to a commit rather than tracking master:
+      # a conformance gate that can go red because someone else added a case
+      # is a gate that gets ignored, and then removed.
+      #
+      # Only `test_parsing` is extracted — the rest of that repository is other
+      # people's parsers, and it is 50 MB of them.
+      - name: Fetch conformance corpus
+        env:
+          CORPUS_SHA: 1ef36fa01286573e846ac449e8683f8833c5b26a
+        run: |
+          mkdir -p fixtures/generated/JSONTestSuite
+          curl -sSLf "https://codeload.github.com/nst/JSONTestSuite/tar.gz/$CORPUS_SHA" -o /tmp/corpus.tar.gz
+          tar -xzf /tmp/corpus.tar.gz -C fixtures/generated/JSONTestSuite \
+            --strip-components=1 --wildcards '*/test_parsing/*'
+          ls fixtures/generated/JSONTestSuite/test_parsing/*.json | wc -l
+
+      # Fails on an undocumented disagreement *and* on an exemption that no
+      # longer applies — a stale exemption is a false claim about the engine.
+      - name: Conformance (RFC 8259)
+        run: cargo run --release --package leviathan-cli -- conformance
+
+      # M1 exit criterion 4. The seed varies per run so CI explores new ground
+      # over time; the report prints it, so any failure is reproducible with
+      # `leviathan fuzz --seed <n>`.
+      - name: Fuzz the lexer
+        run: |
+          cargo run --release --package leviathan-cli -- \
+            fuzz --seconds 60 --seed ${{ github.run_number }}
 
       # The contract that keeps leviathan-core publishable on its own:
       # no wasm-bindgen, no async runtime, no I/O. See DEEP_REASONING.md C2.

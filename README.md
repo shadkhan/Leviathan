@@ -291,7 +291,6 @@ This repository is written to be read — the reasoning is checked in, not impli
 
 | Document | What it holds |
 |---|---|
-| [`CLAUDE.md`](CLAUDE.md) | Scope, personas, non-goals, definition of done |
 | [`USER_PERSONAS.md`](USER_PERSONAS.md) | Who hits the wall, and when |
 | [`SPEC.md`](SPEC.md) | The phased build plan, with exit criteria per milestone |
 | [`DEEP_REASONING.md`](DEEP_REASONING.md) | Every core concept, dated — what it rules out, how it was validated |
