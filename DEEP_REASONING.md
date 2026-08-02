@@ -1230,6 +1230,21 @@ cannot run on the developer's own platform.
 
 *(Append here as concepts are validated or revised. Format: date — concept id — what changed — the number that changed it.)*
 
+- **2026-08-02 — the kernel's high-water mark is not a high-water mark.** CI went
+  red on `peak_rss_never_decreases`, on Linux only. Linux computes `VmHWM` as
+  `max(mm->hiwater_rss, current_rss)`, and `hiwater_rss` is refreshed only at
+  certain points — so freeing a 64 MB allocation can drop `current_rss` while the
+  stored mark is still stale, and the next read comes back *lower* than the one
+  before it. Kernel-version dependent, which is why Windows never showed it in
+  five weeks of development.
+  The fix belongs in the implementation, not the test: `sys::peak_rss` now folds
+  every reading into an atomic maximum, so the contract the module advertises is
+  true by construction rather than by kernel. The kernel value stays the
+  *source* — it still catches spikes between samples, which polling current RSS
+  could not — it is simply not trusted to be monotone. The regression test that
+  matters is the one that feeds the wrapper a deliberately *decreasing* sequence,
+  because the live-process test can only pass on kernels that never had the
+  problem.
 - **2026-08-02 — M1 exit criterion 4 — met.** "Zero crashes on the pathological
   fixture set; 30 min of fuzzing with no panic": **1 969 106 501 cases**, no
   panic, and — the stronger claim the criterion did not ask for — no chunk-size

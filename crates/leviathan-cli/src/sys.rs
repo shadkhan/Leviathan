@@ -6,21 +6,54 @@
 //! exists, and the only reason the CLI contains any `unsafe` at all.
 //!
 //! **Peak, not current.** Sampling current RSS on a timer would miss the spike
-//! that matters. Both platforms below report a high-water mark the kernel
-//! maintains, which cannot be missed no matter when it is read.
+//! that matters, so both platforms below ask the kernel for a high-water mark.
+//!
+//! ## The kernel's mark is not actually monotone
+//!
+//! Linux reports `VmHWM`, which the kernel computes as
+//! `max(mm->hiwater_rss, current_rss)` — and `mm->hiwater_rss` is only refreshed
+//! at particular points, not on every page that goes away. Freeing a large
+//! allocation therefore drops `current_rss` immediately while the stored mark
+//! may still be stale, so a read taken *after* a big `munmap` can come back
+//! **lower** than one taken before it. Whether it does is a function of the
+//! kernel version, which is why this shows up in CI on `ubuntu-latest` and never
+//! in development on Windows.
+//!
+//! That is a property of the kernel, not a thing to assert about. This module
+//! promises a high-water mark, so it keeps its own: every reading is folded into
+//! an atomic maximum, and the number handed out never goes backwards regardless
+//! of what the OS says. The kernel's value is still the *source* — it captures
+//! spikes between samples, which polling current RSS could not — it simply is
+//! not trusted to be monotone on its own.
 //!
 //! Linux and Windows are covered — CI runs the former, development happens on
 //! the latter. Elsewhere this reports `None`, and the harness prints `—` rather
 //! than inventing a number.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The highest reading seen so far, across every caller in this process.
+static HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
 /// Peak resident set size of this process, in bytes, since it started.
+///
+/// Monotone by construction: repeated calls never report a smaller number than
+/// a previous call, even where the kernel's own counter sags after a large free.
 ///
 /// Returns `None` on platforms where it is not implemented.
 #[must_use]
 pub fn peak_rss() -> Option<u64> {
-    imp::peak_rss()
+    imp::peak_rss().map(|raw| monotone(raw, &HIGH_WATER))
+}
+
+/// Fold `raw` into `high_water` and return the running maximum.
+///
+/// Split out from [`peak_rss`] so the guarantee can be tested against a
+/// deliberately decreasing sequence — the case the OS produces and a live
+/// process cannot be made to produce on demand.
+fn monotone(raw: u64, high_water: &AtomicU64) -> u64 {
+    high_water.fetch_max(raw, Ordering::Relaxed).max(raw)
 }
 
 #[cfg(target_os = "linux")]
@@ -172,11 +205,50 @@ mod tests {
         assert_eq!(ballast.len(), 64_000_000);
         let after = peak_rss().expect("still implemented");
         assert!(after >= before, "peak went backwards: {before} -> {after}");
+
+        // Freeing 64 MB makes Linux's own `VmHWM` sag on some kernels (see the
+        // module docs). The number this module hands out must not.
         drop(ballast);
         assert!(
             peak_rss().expect("still implemented") >= after,
             "peak is not a high-water mark"
         );
+    }
+
+    #[test]
+    fn a_reading_that_goes_backwards_is_held_at_the_maximum() {
+        // Exactly what `ubuntu-latest` produces after a large `munmap`, and what
+        // a live process cannot be asked to produce on demand. Without this, the
+        // guarantee above is only tested on kernels that already provide it —
+        // which is to say, tested where it cannot fail.
+        let high_water = AtomicU64::new(0);
+
+        assert_eq!(monotone(1_000, &high_water), 1_000);
+        assert_eq!(monotone(9_000, &high_water), 9_000);
+        assert_eq!(monotone(4_000, &high_water), 9_000, "the sag is absorbed");
+        assert_eq!(monotone(0, &high_water), 9_000);
+        assert_eq!(
+            monotone(12_000, &high_water),
+            12_000,
+            "a real peak still rises"
+        );
+    }
+
+    #[test]
+    fn the_high_water_mark_is_shared_across_callers() {
+        // The bench harness reads this once per workload and prints the result
+        // as a running peak for the process. That claim is only true if every
+        // call folds into the same mark.
+        let first = peak_rss();
+        let second = peak_rss();
+        assert_eq!(
+            first.is_some(),
+            second.is_some(),
+            "availability must not flicker"
+        );
+        if let (Some(a), Some(b)) = (first, second) {
+            assert!(b >= a, "a later read reported less: {a} -> {b}");
+        }
     }
 
     #[test]

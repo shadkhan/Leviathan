@@ -520,8 +520,9 @@ impl Lexer {
 
     /// Signal end of input, and collect the last token if there is one.
     ///
-    /// Only a number can be pending here: every other token is self-terminating
-    /// (see [`Num::is_complete`]). Anything else still open at end of input is an
+    /// Only a number can be pending here: every other token is self-terminating,
+    /// while a number is only known to have ended once a byte that cannot
+    /// continue it arrives. Anything else still open at end of input is an
     /// error — a truncated file, which is one of the fixtures precisely because
     /// it is how large exports usually arrive.
     ///
