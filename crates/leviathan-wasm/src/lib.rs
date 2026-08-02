@@ -35,8 +35,8 @@
 mod pack;
 
 use leviathan_core::{
-    Build, BuildOptions, Built, ByteRange, ExpandOptions, ExpansionCache, Format, RowOptions,
-    SourceError, Stopped, materialize, sniff_format,
+    Build, BuildOptions, Built, ByteRange, ExpandOptions, ExpansionCache, Find, FindOptions,
+    FindStop, Format, RowOptions, SourceError, Stopped, materialize, rows_of, sniff_format,
 };
 use wasm_bindgen::prelude::*;
 
@@ -228,6 +228,81 @@ impl Expanded {
     }
 }
 
+/// How far a search has got, and what it has found.
+///
+/// The matched rows cross as a `Float64Array` rather than as an array of
+/// objects, for the same reason rows do (C43): a search for a common string
+/// yields thousands of results, and thousands of JS objects allocated inside a
+/// scan the user is watching is exactly the stall the scan was made resumable to
+/// avoid. Doubles because a row index is small and an offset is exact to 2^53.
+#[wasm_bindgen]
+pub struct Found {
+    rows: Vec<f64>,
+    matches: u32,
+    pending: u32,
+    scanned: f64,
+    done: bool,
+    limited: bool,
+}
+
+#[wasm_bindgen]
+impl Found {
+    /// Row indices of every match so far, ascending, one per match.
+    ///
+    /// Duplicates are meaningful: two hits in one record are two entries with
+    /// the same row, and collapsing them here would make "3 of 12" disagree with
+    /// what the user can see.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn rows(&self) -> Vec<f64> {
+        self.rows.clone()
+    }
+
+    /// Matches found so far, including any that fell before the first row.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn matches(&self) -> u32 {
+        self.matches
+    }
+
+    /// Matches found in a part of the file that has no rows yet.
+    ///
+    /// Zero in the ordinary case, because a search runs over a finished index.
+    /// Non-zero only if indexing was cancelled: the string really is in the
+    /// file, and there is no row to send anyone to. The count is reported rather
+    /// than quietly dropped — a find that says "12 matches" while listing 9 is
+    /// the kind of thing that makes a tool untrustworthy.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn pending(&self) -> u32 {
+        self.pending
+    }
+
+    /// Bytes read so far — the numerator of the search progress bar.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn scanned(&self) -> f64 {
+        self.scanned
+    }
+
+    /// Whether the scan has stopped, for any reason.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
+    /// Whether it stopped at the match limit rather than at the end of the file.
+    ///
+    /// The difference the UI must show: "1,024 matches" and "10,000+ matches"
+    /// are different claims, and only one of them is a count.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn limited(&self) -> bool {
+        self.limited
+    }
+}
+
 /// One open file, and every index built over it.
 ///
 /// Owns the tier-1 index, the tier-2 expansion cache, and the host's reader.
@@ -241,6 +316,10 @@ pub struct Document {
     row_options: RowOptions,
     build_options: BuildOptions,
     expand_options: ExpandOptions,
+    find: Option<Find>,
+    find_options: FindOptions,
+    /// Matches already handed to the host, so each step reports only new ones.
+    reported: usize,
 }
 
 #[wasm_bindgen]
@@ -284,6 +363,9 @@ impl Document {
             row_options: RowOptions::default(),
             build_options: BuildOptions::default(),
             expand_options: ExpandOptions::default(),
+            find: None,
+            find_options: FindOptions::default(),
+            reported: 0,
         })
     }
 
@@ -438,6 +520,103 @@ impl Document {
             cache.evict_to_budget();
         }
         Ok(expanded)
+    }
+
+    /// Begin a search of the file for a literal string.
+    ///
+    /// Replaces any search in progress — typing another character in the find
+    /// box is a new search, and the old one's remaining work is worthless.
+    /// Nothing is scanned yet; call [`find_step`](Document::find_step).
+    ///
+    /// `from` is where to start, for "find next from the selection"; pass
+    /// `undefined` to search the whole file.
+    #[wasm_bindgen(js_name = findStart)]
+    pub fn find_start(&mut self, needle: &str, case_sensitive: bool, from: Option<f64>) {
+        let search = Find::new(needle, case_sensitive);
+        self.find = Some(match from {
+            Some(at) => search.from(offset_of(at)),
+            None => search,
+        });
+        self.reported = 0;
+    }
+
+    /// Scan the next few megabytes, and report the rows found in them.
+    ///
+    /// `rows` holds only what *this* step discovered, so a host appends rather
+    /// than replacing a growing array every few milliseconds. `matches` is the
+    /// running total.
+    ///
+    /// A match is only reported once the row containing it has been indexed. On
+    /// a file still being indexed the search can outrun tier 1, and a match
+    /// beyond the indexed frontier would resolve to the last *known* row — which
+    /// is a real row, in the wrong place, and the user would be sent there. So
+    /// those matches are held and reported by a later step, once the index has
+    /// caught up. Counting them immediately would be honest; showing them would
+    /// not.
+    ///
+    /// # Errors
+    ///
+    /// If the host's reader fails.
+    #[wasm_bindgen(js_name = findStep)]
+    pub fn find_step(&mut self) -> Result<Found, JsError> {
+        let Document {
+            source,
+            build,
+            find,
+            find_options,
+            reported,
+            ..
+        } = self;
+
+        let Some(search) = find.as_mut() else {
+            return Ok(Found {
+                rows: Vec::new(),
+                matches: 0,
+                pending: 0,
+                scanned: 0.0,
+                done: true,
+                limited: false,
+            });
+        };
+
+        search.advance(source, find_options).map_err(to_js)?;
+
+        let indexed = if build.is_resumable() {
+            build.consumed()
+        } else {
+            u64::MAX
+        };
+        let all = search.matches();
+        let mut upto = *reported;
+        while upto < all.len() && all[upto] < indexed {
+            upto += 1;
+        }
+
+        let rows = rows_of(build.table(), &all[*reported..upto])
+            .into_iter()
+            .map(|row| row as f64)
+            .collect();
+        *reported = upto;
+
+        Ok(Found {
+            rows,
+            matches: clamp_u32(all.len()),
+            pending: clamp_u32(all.len() - upto),
+            // The scan's own state, and nothing else. Tying this to whether every
+            // match has been mapped would hang a host whose indexing was
+            // cancelled: those matches lie in a region that has no rows and
+            // never will, so waiting for them is waiting forever.
+            done: search.stopped().is_some(),
+            limited: search.stopped() == Some(FindStop::Limited),
+            scanned: search.scanned() as f64,
+        })
+    }
+
+    /// Abandon the search in progress.
+    #[wasm_bindgen(js_name = findStop)]
+    pub fn find_stop(&mut self) {
+        self.find = None;
+        self.reported = 0;
     }
 
     /// Forget one container's expansion — what a collapse does.

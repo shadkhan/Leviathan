@@ -5,6 +5,7 @@
 
 Companion documents:
 - `CLAUDE.md` — product scope, non-goals, definition of done (source of truth for *what*).
+- `USER_PERSONAS.md` — who hits the wall and when (source of truth for *for whom*).
 - `DEEP_REASONING.md` — running log of core concepts and why they were chosen (source of truth for *why*).
 - `docs/adr/ADR-00N-*.md` — one decision each, written at the phase that closes it.
 
@@ -54,6 +55,32 @@ leviathan/
 ├── DEEP_REASONING.md
 └── SPEC.md
 ```
+
+### 0.5 Who each phase is for
+
+A milestone that serves no persona is a milestone that should not be built. Kept
+here so the question is answerable rather than assumed — `USER_PERSONAS.md` has
+the full narrative.
+
+| Persona | The moment they open Leviathan | Served by | Deliberately deferred |
+|---|---|---|---|
+| **Priya** — backend/API | One malformed record in a 300 MB dump | M2 tree + **find**, M3 error location, M4 JSONPath | — |
+| **Rahul** — data/ETL | Pre-load flight check on 500 MB–2 GB NDJSON | M1 NDJSON tier 1, M3 validate, M5 dedup, M6 export | Schema drift → v1.5 (2); 2 GB unmeasured, see R4 |
+| **Sofia** — QA | "Does this response conform, and where does it break" | M3 schema validation + jump-to-error | Folder-at-a-time batch → v1.5 (4) |
+| **Marcus** — SRE | Mid-incident, depth-20 state file | M2 **navigation verbs**, M6 subtree export | — |
+| **Aisha** — integration dev | Learning an unfamiliar payload's shape | (nothing in v1) | Shape/schema inference → v1.5 (2) |
+| **The hiring team** | Judging whether this is real systems engineering | M7 ADRs + benchmark table; every `DEEP_REASONING.md` entry | — |
+
+Two consequences that shape the phases below rather than sitting in a table:
+
+- **Find is not JSONPath.** Priya's first move on an unfamiliar 300 MB file is to
+  search for a string, not to write a path expression — she does not yet know
+  the shape. So a streamed full-text find lands in M2, ahead of the query engine,
+  and it must scan the **file**, not the indexed rows: tier 1 indexes where each
+  record starts, so searching what the UI has materialized would silently search
+  a truncated preview of each record and miss the rest.
+- **Aisha is unserved in v1.** That is a decision, not an oversight. The tree
+  shows her a shape one row at a time; a summary view is v1.5.
 
 **Layering rule (enforced in CI):** `leviathan-core` may not depend on `wasm-bindgen`, `js-sys`, `web-sys`, `tokio`, or `std::fs`. A `cargo tree` check in CI fails the build if it does. This is what keeps the core genuinely reusable rather than nominally reusable.
 
@@ -167,30 +194,42 @@ Scope:
 
 ---
 
-### M2 — Virtualized tree renderer — *L*
+### M2 — Virtualized tree, navigation, and the trust indicators — *L*
 
-**Goal:** the visible product. A tree over the index that stays at 60 fps regardless of file size.
+**Goal:** the visible product. A tree over the index that stays at 60 fps regardless of file size — and that a user can actually *get somewhere* in, and can watch not dying.
 
 Scope:
 - Load paths: drag-and-drop, file picker, directory picker, paste, and "open URL" (worker streams the response). File objects never cross into WASM whole.
 - Virtual list with DOM row recycling; row height fixed for v1 (variable-height is a v1.1 trap). Only visible rows + overscan exist in the DOM.
 - Expand/collapse driving tier-2 indexing; expansion state as a sparse structure, not a per-node flag array.
-- Path breadcrumb, copy-path, copy-value, jump-to-line/offset.
+- Path breadcrumb, copy-path, copy-value.
+- **Navigation verbs** (Marcus; also what M3's jump-to-error and M4's jump-to-result are built on): go-to-path, jump-to-byte/line, expand-to-depth, collapse-all, reveal-and-select an arbitrary node.
+- **Streamed find** (Priya): plain substring search over the *file*, run in the Worker against byte ranges, results streamed into the list as they are found and cancellable mid-scan. Matches resolve to the nearest indexed row so a hit is a place in the tree, not a byte number. Case-insensitive by default; keys and values both. Explicitly **not** a query language — that is M4.
 - Dark mode, keyboard navigation (arrows/Home/End/PageUp/PageDown), a11y roles for the tree.
 - Progress and cancel UI for indexing.
+- **Requirement 9 — visible memory headroom.** Status bar shows file size, bytes consumed, index size, and WASM heap in use. The numbers already exist (`Tier1::size`, `ExpansionCache::size`, `memory.buffer.byteLength`); this is a readout, not a mechanism.
+- **Requirement 10 — provably offline, loudly.** A permanent badge stating zero host permissions and zero network, linked to the manifest. It is trivially true; the point is that the user can see it without taking it on faith.
 
-**Exit criterion:** drag a 500 MB NDJSON fixture in; first rows painted **< 2 s**; scroll through 100 k rows with no frame **> 32 ms** (measured with the Performance panel, screenshots in the PR); expanding a 1 M-element array is instant; main thread shows **zero** long tasks > 50 ms during scroll.
+**Exit criterion:** drag a 500 MB NDJSON fixture in; first rows painted **< 2 s**; scroll through 100 k rows with no frame **> 32 ms** (measured with the Performance panel, screenshots in the PR); expanding a 1 M-element array is instant; main thread shows **zero** long tasks > 50 ms during scroll; a find for a string occurring once at ~90 % depth returns its first result while the scan is still running and never blocks the tree. Plus a screenshot at several nesting depths — C45 is the standing reminder that the fast path and the *correct* path are measured by different instruments.
 
 **ADR closed:** ADR-003 (UI rendering + bundle budget: ≤150 KB gz JS/CSS excluding `.wasm`).
 
-**Risk:** *R3 — auto-interception of `application/json` pages.* MV3 has no clean way to take over a JSON navigation without re-fetching the body. v1 ships the viewer-page flow (drop/picker/paste/URL) as primary; interception is investigated here and shipped only if it costs less than a day. It is explicitly **not** in the definition of done.
+**Risks:**
+- *R3 — auto-interception of `application/json` pages.* MV3 has no clean way to take over a JSON navigation without re-fetching the body. v1 ships the viewer-page flow (drop/picker/paste/URL) as primary; interception is investigated here and shipped only if it costs less than a day. It is explicitly **not** in the definition of done.
+- *R4 — the 2 GB claim.* Rahul's range runs to 2 GB and every fixture stops at 500 MB. The risk is not the read path, it is C29: a scalar-dense 2 GB file needs an index the wasm32 heap cannot hold. Generate a 2 GB fixture during this phase's measurement session. If it does not hold, the published claim stays 500 MB and the README says why — the number is not extrapolated.
 
 ---
 
-### M3 — Validation — *M*
+### M3 — Validation + dependability core — *M*
+
+Requirements 7 and 8 land here. This is the phase that decides whether Leviathan
+is a tool or a toy: every competitor's answer to a broken file is "it won't
+open", and ours has to be "here is what parsed, here is exactly where it broke,
+click to go there."
 
 Scope:
 - Well-formedness errors with line, column, and byte offset, plus a source excerpt with a caret — from the M1 lexer, no second parser.
+- **Jump-to-position** (requirement 8): every reported error resolves to a row in the tree, reusing M2's navigation verbs. An error location the user cannot navigate to is a log line, not a feature.
 - Error recovery: keep indexing past the first error where possible so a truncated 500 MB dump is still browsable, with error markers in the tree.
 - JSON Schema (draft 2020-12) validation, streaming against the index. Third-party crate vs. hand-rolled subset is decided here on binary-size grounds — a schema validator that doubles the `.wasm` fails the budget.
 - Validation panel: error list, click-to-navigate, error count in the status bar.
@@ -227,9 +266,10 @@ Scope:
 Scope:
 - JSON (pretty/minified), NDJSON, CSV (flat arrays of objects, with column discovery and a documented flattening rule for nested values), and "export current query result".
 - Streaming writes via `showSaveFilePicker` + `FileSystemWritableFileStream` — a 500 MB export must never be assembled in memory.
-- Export of a selected subtree, not just the whole document.
+- Export of a selected subtree, not just the whole document (Marcus).
+- **Round-trip fidelity** (requirement 11): what comes out re-parses to the same thing. Verified as a test, not asserted in a README.
 
-**Exit criterion:** export a 500 MB document to NDJSON with peak memory unchanged from idle +64 MB; round-trip (export → re-import → index) is byte-stable for the minified case.
+**Exit criterion:** export a 500 MB document to NDJSON with peak memory unchanged from idle +64 MB; round-trip (export → re-import → index) is byte-stable for the minified case, and the re-imported index is identical to the original's for every fixture in the corpus.
 
 ---
 
@@ -276,11 +316,15 @@ Scope:
 
 ```
 M0 skeleton ─▶ M1 lexer+index ─┬─▶ M2 tree ─┬─▶ M3 validate ─▶ M4 query ─▶ M5 dedup ─▶ M6 export ─▶ M7 ship
-   (S)            (XL)          │    (L)     │      (M)           (L)         (M)         (M)         (L)
-                                │            │
+   (S)            (XL)          │  +nav+find │   +dependability   (L)         (M)         (M)         (L)
+                                │    (L)     │      (M)
                        gate: memory      gate: 60fps
                        + throughput      + first paint <2s
 ```
+
+Requirements 9 and 10 ride M2 rather than forming a milestone of their own: a
+memory readout and an offline badge are hours of work each, and a phase gate
+inserted between "export works" and "ship" is a reason not to ship.
 
 M1 is the only phase that can invalidate the product thesis. Spend the effort there, benchmark before building any UI, and let the numbers — not optimism — decide whether the 500 MB claim survives into the README.
 
@@ -291,3 +335,6 @@ M1 is the only phase that can invalidate the product thesis. Spend the effort th
 3. **M2:** framework or vanilla. Default assumption: vanilla TS + hand-rolled recycling list; adopt Preact only if the panel code demonstrably suffers. (ADR-003)
 4. **M3:** JSON Schema crate vs. hand-rolled subset — decided on `.wasm` size delta.
 5. **M2/R3:** whether `application/json` interception is cheap enough to include. Default: no.
+6. **M3:** is an empty file *valid*? Conformance surfaced that one predicate answers two questions — `leviathan conformance` shows 185/188 on `n_` because empty input, whitespace-only input and a lone BOM all open rather than being refused (deliberately: C6). Opening and validating must diverge here. Decide at M3: `open` keeps accepting, `validate` reports "no JSON value" with an offset of 0.
+7. **M2/R4:** does a 2 GB fixture index within the wasm32 heap? Decides whether the published claim is 500 MB or 2 GB. Measure; do not extrapolate.
+8. **M2:** does streamed find need its own index (an offset ladder for "next match after byte X"), or is a re-scan from the current position fast enough? Default: re-scan — tier-1 indexing already runs at memory-bandwidth speed (C27), so a find is likely I/O-bound and an index for it would be a second thing to invalidate.

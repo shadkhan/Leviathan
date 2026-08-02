@@ -17,10 +17,11 @@
  * the store, and moves no DOM at all.
  */
 
-import { type Format, type WorkerEvent } from '../protocol/index.js';
+import { type FoundEvent, type Format, type WorkerEvent } from '../protocol/index.js';
 import { RowBlock, type Row } from '../protocol/rows.js';
 import { Engine, EngineError } from './engine.js';
 import { VirtualList } from './list.js';
+import { Search, describeSearch } from './search.js';
 import { BLOCK_ROWS, RowStore } from './store.js';
 import { Tree, type Branch, type Located } from './tree.js';
 
@@ -53,6 +54,12 @@ const indexing = el('indexing');
 const progressFill = el('progress-fill');
 const indexState = el('index-state');
 const cancel = el<HTMLButtonElement>('cancel');
+
+const findBar = el('find-bar');
+const findInput = el<HTMLInputElement>('find-input');
+const findStatus = el('find-status');
+const findPrev = el<HTMLButtonElement>('find-prev');
+const findNext = el<HTMLButtonElement>('find-next');
 
 const viewport = el('viewport');
 const canvas = el('canvas');
@@ -179,6 +186,9 @@ let selection: Selection | undefined;
 /** Whether tier-1 indexing is still running. */
 let busy = false;
 
+/** Find results and the position within them. See `search.ts`. */
+const search = new Search();
+
 // ------------------------------------------------------------------- rows
 
 interface Parts {
@@ -249,6 +259,17 @@ function paintRow(element: HTMLElement, flat: number): void {
     viewport.setAttribute('aria-activedescendant', element.id);
   }
 
+  // Only root rows can carry a match: a hit is a byte offset, and the table it
+  // is resolved against is tier 1 (`rows_of` in the core). A match inside a
+  // nested value therefore marks the record that contains it, which is the row
+  // the user is looking for anyway.
+  const mark = at.branch.container === null ? search.mark(at.index) : undefined;
+  if (mark) {
+    element.dataset['match'] = mark === 'current' ? 'current' : 'true';
+  } else {
+    delete element.dataset['match'];
+  }
+
   part.gutter.textContent = at.index.toLocaleString();
 
   if (!row) {
@@ -258,6 +279,7 @@ function paintRow(element: HTMLElement, flat: number): void {
     element.dataset['kind'] = 'pending';
     element.removeAttribute('aria-expanded');
     part.twisty.textContent = '';
+    part.twisty.removeAttribute('title');
     part.key.textContent = '';
     part.value.textContent = '…';
     part.note.textContent = '';
@@ -271,10 +293,14 @@ function paintRow(element: HTMLElement, flat: number): void {
   const open = row.expandable ? tree.branchOf(row.offset) : undefined;
   if (row.expandable) {
     element.setAttribute('aria-expanded', open ? 'true' : 'false');
-    part.twisty.textContent = open ? '▾' : '▸';
+    // U+2212 rather than a hyphen: a hyphen sits high and short next to a plus,
+    // and the pair has to read as one control at 15 px.
+    part.twisty.textContent = open ? '−' : '+';
+    part.twisty.title = open ? 'Collapse' : 'Expand';
   } else {
     element.removeAttribute('aria-expanded');
     part.twisty.textContent = '';
+    part.twisty.removeAttribute('title');
   }
 
   part.key.textContent = row.key === null ? '' : `${JSON.stringify(row.key)}:`;
@@ -672,6 +698,131 @@ viewport.addEventListener('keydown', (event) => {
   event.preventDefault();
 });
 
+// ------------------------------------------------------------------- find
+
+/** Throw away every result and stop the Worker scanning. */
+function resetSearch(): void {
+  search.reset();
+  renderFind();
+  list.refresh();
+}
+
+/** Start scanning for what is in the box, or clear if it is empty. */
+function runSearch(): void {
+  const needle = findInput.value;
+
+  if (needle.length === 0) {
+    resetSearch();
+    void engine.call('findStop', {}).catch(() => {
+      // Nothing to stop is the common case and not worth saying.
+    });
+    return;
+  }
+
+  search.begin();
+  renderFind();
+  list.refresh();
+  // Case-insensitive always, for now: it is what a find box is expected to do,
+  // and a toggle is a control to explain in a toolbar that has to stay legible.
+  engine.call('find', { needle, caseSensitive: false }).catch((thrown: unknown) => {
+    search.fail();
+    say('err', describe(thrown));
+    renderFind();
+  });
+}
+
+/** One instalment of results from the Worker. */
+function onFound(event: FoundEvent): void {
+  const first = search.size === 0;
+  if (!search.accept(event)) {
+    return; // A superseded search still posting. Not ours.
+  }
+
+  if (event.error) {
+    say('err', describe(new EngineError(event.error)));
+  }
+
+  // Land on the first result as soon as there is one, the way a browser's find
+  // does — waiting for a 500 MB scan to finish before moving is the behaviour
+  // that makes people think a search is broken.
+  if (first && search.size > 0) {
+    goToMatch(0);
+  } else {
+    renderFind();
+    list.refresh();
+  }
+}
+
+/** Select and reveal the `n`-th result, wrapping at both ends. */
+function goToMatch(n: number): void {
+  const row = search.goTo(n);
+  if (row === undefined) {
+    return;
+  }
+  select({ branch: tree.root, index: row });
+  renderFind();
+}
+
+function renderFind(): void {
+  findInput.dataset['scanning'] = search.scanning ? 'true' : 'false';
+  findPrev.disabled = search.size === 0;
+  findNext.disabled = search.size === 0;
+
+  findStatus.textContent = describeSearch(search, findInput.value);
+  if (findInput.value.length > 0 && search.matches === 0 && !search.scanning) {
+    findStatus.dataset['state'] = 'none';
+  } else {
+    delete findStatus.dataset['state'];
+  }
+}
+
+let findTimer: number | undefined;
+findInput.addEventListener('input', () => {
+  clearTimeout(findTimer);
+  // Long enough that typing a word is one scan rather than five, short enough
+  // that it feels like it reacted to the last keystroke.
+  findTimer = self.setTimeout(runSearch, 200);
+});
+
+findInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    clearTimeout(findTimer);
+    if (search.size === 0) {
+      runSearch();
+    } else {
+      goToMatch(search.at + (event.shiftKey ? -1 : 1));
+    }
+    return;
+  }
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    findInput.value = '';
+    resetSearch();
+    void engine.call('findStop', {}).catch(() => {
+      // Stopping a scan that has already finished is not a failure.
+    });
+    viewport.focus();
+  }
+});
+
+findNext.addEventListener('click', () => {
+  goToMatch(search.at + 1);
+});
+findPrev.addEventListener('click', () => {
+  goToMatch(search.at - 1);
+});
+
+// Ctrl/Cmd+F anywhere on the page, including from inside the tree — the whole
+// point is that it is reachable without leaving the keyboard.
+document.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f' && !findBar.hidden) {
+    event.preventDefault();
+    findInput.focus();
+    findInput.select();
+  }
+});
+
 // ------------------------------------------------------------------ files
 
 /** Hand a file to the engine and show its root. */
@@ -684,6 +835,8 @@ async function openFile(source: File): Promise<void> {
   store.clear();
   list.reset();
   list.setCount(0);
+  findInput.value = '';
+  resetSearch();
   renderCrumbs();
   renderSelectionInfo();
 
@@ -696,6 +849,7 @@ async function openFile(source: File): Promise<void> {
     empty.hidden = true;
     viewport.hidden = false;
     indexing.hidden = false;
+    findBar.hidden = false;
     viewport.focus();
     say('', '');
 
@@ -717,6 +871,11 @@ function onEvent(event: WorkerEvent): void {
   if (event.kind === 'fatal') {
     setStatus('failed', 'Engine failed to start');
     say('err', describe(new EngineError(event.error)));
+    return;
+  }
+
+  if (event.kind === 'found') {
+    onFound(event);
     return;
   }
 

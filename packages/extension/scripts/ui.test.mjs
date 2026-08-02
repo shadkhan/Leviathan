@@ -27,6 +27,7 @@ const bundled = await build({
     contents: `
       export { Tree } from './src/ui/tree.js';
       export { RowStore, BLOCK_ROWS } from './src/ui/store.js';
+      export { Search, describeSearch } from './src/ui/search.js';
     `,
     resolveDir: root,
     loader: 'ts',
@@ -40,7 +41,7 @@ const bundled = await build({
 });
 
 const source = bundled.outputFiles[0].text;
-const { Tree, RowStore, BLOCK_ROWS } = await import(
+const { Tree, RowStore, BLOCK_ROWS, Search, describeSearch } = await import(
   `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 );
 
@@ -368,6 +369,116 @@ await check('clearing discards answers to the file that was closed', async () =>
 
   assert.equal(store.rowAt(7, 0), undefined, 'nothing from the old file was kept');
   assert.equal(store.extentOf(7).count, 0);
+});
+
+/* ---------------------------------------------------------------- Search */
+
+/** One instalment as the Worker posts it. */
+const found = (search, rows, extra = {}) => ({
+  kind: 'found',
+  search,
+  rows: Float64Array.from(rows),
+  matches: extra.matches ?? rows.length,
+  pending: extra.pending ?? 0,
+  scanned: 0,
+  total: 0,
+  done: extra.done ?? false,
+  limited: extra.limited ?? false,
+});
+
+await check('results accumulate across instalments', async () => {
+  const search = new Search();
+  search.begin();
+
+  assert.equal(search.accept(found(1, [3, 9])), true);
+  assert.equal(search.accept(found(1, [14], { matches: 3, done: true })), true);
+
+  assert.equal(search.size, 3);
+  assert.equal(search.matches, 3);
+  assert.equal(search.scanning, false, 'the last instalment ended the scan');
+});
+
+await check('a superseded search is ignored, and a newer one takes over', async () => {
+  // The property typing depends on: every keystroke starts a scan, and the one
+  // it replaced keeps posting for a frame or two. Accepting those would splice
+  // one search's results into another's list.
+  const search = new Search();
+  search.begin();
+  search.accept(found(1, [1, 2, 3]));
+  assert.equal(search.size, 3);
+
+  search.begin(); // the next keystroke
+  assert.equal(search.accept(found(1, [4])), false, 'the old scan is not ours');
+  assert.equal(search.size, 0);
+
+  assert.equal(search.accept(found(2, [8])), true, 'the new one is');
+  assert.equal(search.size, 1);
+  assert.equal(search.row, undefined, 'and nothing has been jumped to yet');
+});
+
+await check('a row that matches twice is two results but one mark', async () => {
+  // "3 of 12" has to agree with pressing Enter twelve times, and a row can only
+  // be painted once.
+  const search = new Search();
+  search.begin();
+  search.accept(found(1, [5, 5, 9], { matches: 3, done: true }));
+
+  assert.equal(search.size, 3, 'three results');
+  assert.equal(search.mark(5), 'match');
+  assert.equal(search.mark(9), 'match');
+  assert.equal(search.mark(6), undefined);
+
+  assert.equal(search.goTo(0), 5);
+  assert.equal(search.mark(5), 'current');
+  assert.equal(search.goTo(1), 5, 'the second hit is in the same row');
+  assert.equal(search.goTo(2), 9);
+  assert.equal(search.mark(5), 'match', 'which is no longer the current one');
+});
+
+await check('stepping wraps at both ends', async () => {
+  const search = new Search();
+  search.begin();
+  search.accept(found(1, [2, 4, 6], { done: true }));
+
+  assert.equal(search.goTo(0), 2);
+  assert.equal(search.goTo(3), 2, 'past the last result comes back to the first');
+  assert.equal(search.goTo(-1), 6, 'and back from the first is the last');
+  assert.equal(search.at, 2);
+});
+
+await check('stepping an empty result set does nothing', async () => {
+  const search = new Search();
+  search.begin();
+  search.accept(found(1, [], { matches: 0, done: true }));
+
+  assert.equal(search.goTo(0), undefined);
+  assert.equal(search.goTo(-1), undefined);
+  assert.equal(search.at, -1);
+});
+
+await check('the status line never overstates what was found', async () => {
+  const search = new Search();
+  assert.equal(describeSearch(search, ''), '', 'an empty box says nothing');
+
+  search.begin();
+  assert.equal(describeSearch(search, 'x'), 'searching…');
+
+  search.accept(found(1, [], { matches: 0, done: true }));
+  assert.equal(describeSearch(search, 'x'), 'no matches');
+
+  // A capped scan has a floor, not a total, and must print the `+`.
+  const capped = new Search();
+  capped.begin();
+  capped.accept(found(2, [1, 2], { matches: 10_000, done: true, limited: true }));
+  capped.goTo(0);
+  assert.equal(describeSearch(capped, 'x'), '1 of 10,000+');
+
+  // Matches with no row must be visible, or the count disagrees with the list.
+  const partial = new Search();
+  partial.begin();
+  partial.accept(found(3, [1], { matches: 12, pending: 11, done: true }));
+  partial.goTo(0);
+  assert.equal(describeSearch(partial, 'x'), '1 of 12 · 11 unindexed');
 });
 
 console.log('\nleviathan viewer unit tests\n');

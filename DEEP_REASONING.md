@@ -955,9 +955,327 @@ row-related; treating a row's offset and its value's offset as interchangeable.
 
 ---
 
+## 2026-08-01 — The tree, as seen
+
+### C45 — A layout rule that cancels itself passes every test there is — **validated**
+
+The row indented itself by `depth × --indent` in its padding, and the row-number
+gutter carried `margin-left: calc(depth × --indent × -1)` to sit at the left
+edge regardless of depth. Read one line at a time, both are correct. Together
+they are a no-op: a negative margin on a flex item shortens that item's *outer*
+size, so it drags every following sibling left by the same amount. Indentation
+was exactly zero at every depth, and a nested tree rendered as a flat list.
+
+What makes it worth an entry is the shape of the blind spot rather than the bug.
+`Tree` computes `depth` and 13 tests assert it; `paintRow` writes it to
+`--depth` and the value is correct in the DOM; every engine number behind the
+row is right. The defect lives entirely in the arithmetic *between two CSS
+declarations in different rules*, which is the one layer of this product that
+has no test at any level — 239 Rust tests, 13 UI tests and a typechecker cannot
+see it, and neither can a reviewer reading either declaration on its own.
+
+The fix removes the cancellation rather than rebalancing it: the gutter is
+absolutely positioned, so padding is the only thing that decides where content
+starts and depth is depth. A rule that is correct because another rule undoes it
+is a rule that will be broken by the next person who touches either one.
+
+*Rules out:* negative margins as a layout tool anywhere in the row; treating the
+stylesheet as a place where correctness is obvious enough not to need checking.
+*Still owed:* this is the concrete argument for M2's browser measurement session
+carrying a screenshot, not just a frame-time trace. The exit criterion measures
+whether the tree is *fast*; nothing yet measures whether it is *right*.
+
+### C46 — A control is a pointer target before it is a glyph — **assumed**
+
+The expand control was a 14 px box holding a 10 px triangle. That is legible and
+it is not clickable: it sits below every platform's minimum comfortable target,
+on rows 22 px tall, in a tree where opening nodes is the primary verb.
+
+It is now an 18 px square with a 15 px `+` / `−`, boxed on hover so the target
+is visible before it is aimed at, and bare otherwise so a dense tree does not
+read as a grid of buttons. Rows are 24 px to hold it. The glyphs are `+` and
+U+2212, not `▸` and `▾`: a triangle encodes *state* (open/closed) while a plus
+encodes *what the click will do*, which is the more useful thing to show on a
+control the user is about to press.
+
+Indent guides came with it — one faint rule per level, drawn as a repeating
+gradient on a pseudo-element so nesting costs no DOM per level. At twelve deep
+in an NDJSON record, tracing a row back to its parent by eye is otherwise
+guesswork.
+
+*Validate at M2 by:* the same session that measures frame times, with a
+screenshot at several depths.
+
+---
+
+## 2026-08-02 — Find: the first question anyone asks a file
+
+### C47 — A search that can miss is worse than no search — **validated**
+
+Find could have been built in an afternoon by searching the rows the UI already
+holds. Every piece was there: the store has decoded blocks, the tree knows what
+is open, and a substring test over a few thousand cached rows is instant.
+
+It would also have been a lie. Tier 1 records where each record *starts* (C3),
+and a materialized row carries a **preview truncated to eighty characters**
+(C33). Searching those searches the first line of each record and reports "no
+matches" for a string that is unambiguously in the file. The user has no way to
+tell the difference between that and the string being absent — which makes it
+the worst class of defect this project can ship, because the answer is confident
+and wrong.
+
+So find reads the file. That costs a full scan, and the scan is affordable for
+the same reason tier 1 is: it is I/O-bound, not compare-bound. The matcher is
+deliberately naive — skip to a byte that could start a match, then verify —
+because a smarter algorithm would optimize the half of the work that is already
+free, and it would cost a dependency the core does not have (C9).
+
+The limits that follow are named rather than hidden. Matching is over **raw
+bytes**, like `grep`: a search for a newline does not match `\n` inside a
+string, because the file does not contain one there (C21, fifth appearance).
+Case folding is **ASCII only**, because Unicode folding is a table, and a table
+is a dependency and a `.wasm` regression for a case nobody has yet asked for.
+
+Measured, on the same 500 MB fixture and in the same run as its own ceiling:
+
+| Workload | Wall | Rate |
+|---|---:|---:|
+| `scan` — count newlines (the ceiling) | 408 ms | 1.2 GB/s |
+| **`find` — whole-file literal search** | **466 ms** | **1.1 GB/s** |
+| `lex` — tokenize | 1.74 s | 288 MB/s |
+
+Searching every byte of half a gigabyte costs **14 % more than the cheapest
+possible pass over those bytes**, and 3.7× less than lexing them. The scan is
+memory-bandwidth-bound, which is what justifies the naive matcher: there is
+nothing for a cleverer algorithm to win.
+
+The benchmark searches for a string that is deliberately **absent**, because a
+needle that hits on line one would measure how quickly the scan can stop rather
+than what a scan costs. The published figure is the worst case by construction.
+
+*Rules out:* searching the index, the row cache, or anything else that is a
+summary of the file rather than the file; a smarter matcher, until a measurement
+says the compare loop is the bottleneck.
+
+### C48 — A match that cannot be visited must still be counted — **validated**
+
+A find result is a byte offset; a user needs a row. `ChildTable::locate` is the
+join — a binary search, 21 comparisons over the 500 MB fixture's 1.77 M records.
+Two cases fall out of it that both wanted to be swept under the rug.
+
+**A byte before the first row belongs to no row.** A document's opening `[`
+genuinely precedes every record. Attributing it to row 0 would send the user to
+a record that does not contain what they searched for, so those matches resolve
+to nothing.
+
+**A match beyond the indexed frontier has no row *yet*.** If the scan outruns
+tier 1, `locate` still answers — with the last row it knows, which is a real row
+in the wrong place. So those matches are held and re-resolved once indexing
+catches up. But if indexing was *cancelled*, they will never resolve, and
+waiting for them would hang the search forever. The boundary therefore reports
+`done` from the scan's own state and carries a separate `pending` count, which
+the UI prints: "1,024 matches · 134 unindexed". The alternative — dropping them
+— would make a count of 1,024 accompany a list of 890, and a tool that cannot
+add up is a tool nobody trusts with a file they cannot check by hand.
+
+The same discipline governs superseded searches. Every keystroke starts a new
+scan, and the one it replaced is still posting results for a frame or two. The
+Worker stamps each batch with a search id and the UI discards anything older,
+rather than trying to cancel synchronously — a cancel that must complete before
+the next search can start is a keystroke that blocks on 500 MB of I/O.
+
+*Rules out:* silently dropping unresolvable matches; a synchronous cancel on the
+typing path.
+
+### C49 — A file-scale benchmark measures the page cache unless it says which one — **validated**
+
+Porting the `index` workload onto `Build` (C41) needed a before-and-after, so it
+was run seven times. The engine, the fixture and the build were identical every
+time:
+
+| Run | Wall | Rate |
+|---|---:|---:|
+| cold | 1.065 s | 469 MB/s |
+| partly warm | 902 ms · 639 ms | 554–782 MB/s |
+| warm | **345 · 346 · 353 · 371 ms** | **1.3–1.5 GB/s** |
+
+A **3× spread with no code difference.** The `observed` column meanwhile never
+moved: 1 772 686 records and a 14.2 MB index on every single run, which is
+exactly the division C25 drew — the count is the result, the wall time is a
+sample.
+
+The cause is not mysterious and that is the point: a 500 MB file either is or is
+not resident in the OS page cache, and on a desktop with browsers open it
+oscillates between the two. So a published figure of "1.4 GB/s" is true and
+misleading — it is the *warm* number, and the first thing a reviewer does on
+their own machine is run it cold.
+
+This is the fourth time this harness has been caught attributing to the engine
+something that belongs elsewhere (C14 clock resolution, C15 early exit, C23
+aborted work, and now the cache). The rule generalizes past all four: **before
+publishing a rate, name what else could have produced it.** Ranges in the README
+are therefore stated cold-to-warm rather than as a best-of, and the ceiling rows
+(`read`, `scan`) are what make the difference legible — they move with the cache
+too, so the *ratio* between the engine and its ceiling stays stable even when
+neither absolute number does.
+
+*Rules out:* a single headline figure for any workload that reads the whole
+file; comparing two runs of a file-scale workload without knowing the cache
+state of both.
+
+## 2026-08-02 — Conformance: proving the parser rather than asserting it
+
+### C50 — A conformance corpus that needs a download is a corpus that stops running — **validated**
+
+SPEC's M1 exit criterion asks for JSONTestSuite: every `y_` accepted, every `n_`
+rejected, `i_` decisions documented. The obvious implementation is a submodule
+or a vendored copy, and both have the same failure mode — the check becomes
+something that runs on a machine where the corpus happens to be present, which
+over a year means it runs on nobody's.
+
+So conformance is **two** things, deliberately:
+
+- **A committed corpus of ~110 cases** in JSONTestSuite's own naming convention,
+  written out in `crates/leviathan-core/tests/conformance.rs`. It runs under
+  `cargo test` on a clean clone with no network, no submodule, and nothing to
+  install. It is the one that will still be running in a year.
+- **A runner for the real corpus**, `leviathan conformance <dir>`, over the ~300
+  files someone else spent a long time assembling. Deliberate, occasional, and
+  it exits non-zero on any disagreement so CI can hold it.
+
+The corpus is not vendored because it is someone else's repository with its own
+licence and its own history, and a copy in this tree is a copy that goes stale.
+
+**Every case runs at three chunk sizes** — one byte, three bytes, whole — and
+the harness asserts the verdict is identical across all three before comparing
+it to the expected answer. That is the part worth stealing: a conformance suite
+that only ever feeds a parser the whole input tests a parser this project does
+not have. The chunk-invariance assertion is what makes the corpus a test of the
+*streaming* lexer rather than of a convenience wrapper around it.
+
+All 12 groups passed on the first run, which is a statement about C20 and C24
+having been right rather than about the corpus being easy — the same three-chunk
+discipline is what caught the surrogate-across-a-boundary and
+number-needs-a-flush cases when the lexer was written.
+
+The `i_` answers are the useful output. RFC 8259 declines to decide them, so
+each is a recorded decision rather than a result: huge exponents and 30-digit
+integers **accepted** (a token is a span, so range is not the lexer's business);
+lone surrogates **accepted** and replaced with U+FFFD at display time (C34, not
+a reason to refuse a file); a UTF-8 BOM **skipped** (strictly wrong, and every
+Windows export has one); invalid UTF-8 **rejected** everywhere, including
+outside strings, because row text is handed to JavaScript and a `String` that is
+not UTF-8 has nowhere to go.
+
+*Rules out:* a conformance check that depends on a network fetch to run at all;
+single-chunk-only conformance testing.
+
+### C51 — The invariant a fuzzer should check is not "did it crash" — **validated**
+
+M1 asks for 30 minutes of fuzzing with no panic. Taken literally that is a weak
+criterion for this codebase: the core is `#![forbid(unsafe_code)]` with a state
+machine that never indexes without bounds, so a panic was never the likely
+failure. A fuzzer that only watches for crashes would have run for thirty
+minutes and proved almost nothing.
+
+The failure this engine can actually have is **disagreement**. It is a resumable
+lexer, so the interesting question is whether the same bytes produce the same
+answer when the chunk boundary lands somewhere awkward — inside a `\uD83D`
+escape, between a number and the byte that terminates it, mid-BOM. So every
+input is run at three chunk sizes and the verdicts must match, and three further
+invariants are asserted along the way: token spans are ordered and inside the
+input, error positions are inside the input, and lines and columns are 1-based.
+A caret pointing past the end of the file is exactly the bug that makes M3's
+error locations worthless, and it would never surface as a crash.
+
+Two things about the corpus matter more than the case count:
+
+- **It mutates valid JSON three times out of four.** Uniformly random bytes are
+  rejected within a few bytes and only ever exercise the lexer's first branch.
+  Bit flips, byte deletions, truncations and duplicated spans reach the states a
+  parser actually has — a nearly-good escape, a number missing its exponent
+  digits, a string whose closing quote became a backslash. Measured: **10 % of
+  mutated inputs still parse**, which is the number that says the corpus is not
+  all garbage. A test asserts that ratio stays non-zero, because a mutation
+  operator that quietly starts destroying every input would leave the fuzzer
+  green and useless.
+- **It is reproducible from a seed.** The same seed fuzzes identically on any
+  machine, forever (C18 again), and a failure prints the seed, the case number,
+  and the offending bytes as hex *and* as text. A fuzzer whose failures cannot
+  be reproduced is a rumour generator.
+
+`cargo-fuzz` was the obvious tool and is unavailable: it needs libFuzzer and a
+nightly toolchain and does not support `x86_64-pc-windows-msvc`. The choice was
+between making an exit criterion conditional on a platform and writing 200 lines
+with the generator this repository already has. The second is also what lets a
+400 ms fuzz run sit in the ordinary test suite, so chunk invariance is checked
+on every `cargo test` rather than whenever someone remembers.
+
+The criterion, run: **1 969 106 501 cases in 30 minutes** (1.09 M/s, seed 1).
+1.48 billion mutations and 492 million random inputs; **200 191 239 accepted**
+(10.2 %) and 1.77 billion rejected. Every case lexed three times, so ~5.9 billion
+passes over the state machine. No panic, and no input produced a different
+verdict at a different chunk size.
+
+The 10.2 % acceptance rate is the number to watch on this run rather than the
+case count. A billion inputs that are all rejected in the first three bytes is a
+billion repetitions of one test.
+
+*Rules out:* a fuzz target that only catches panics; a robustness check that
+cannot run on the developer's own platform.
+
+---
+
 ## Log of revisions
 
 *(Append here as concepts are validated or revised. Format: date — concept id — what changed — the number that changed it.)*
+
+- **2026-08-02 — M1 exit criterion 4 — met.** "Zero crashes on the pathological
+  fixture set; 30 min of fuzzing with no panic": **1 969 106 501 cases**, no
+  panic, and — the stronger claim the criterion did not ask for — no chunk-size
+  disagreement in any of them. The pathological fixtures (100 k-deep nesting,
+  5 M-element array, 50 MB single string, invalid UTF-8, truncated) have been
+  green in `bench` since M1 landed.
+- **2026-08-02 — C50 — run against the real corpus, and it found something.**
+  318 JSONTestSuite cases: **95/95 `y_`**, **185/188 `n_`**, 35 `i_` answered
+  exactly as the committed corpus predicted. The three `n_` disagreements are one
+  decision — an empty file, a single space, and a lone BOM all *open*, reporting
+  format `empty`, because refusing a zero-byte file is the failure mode this
+  product replaces. What the corpus actually surfaced is that **one predicate is
+  currently answering two questions**: "can this be opened" and "is this valid
+  JSON" are not the same, and M3 owes the split. That is worth more than a green
+  score would have been.
+- **2026-08-02 — C50 — the exemption list is checked in both directions.** A
+  conformance gate with an allowlist is a gate that goes green by growing the
+  allowlist. So an entry that *stops* deviating also fails the run: a stale
+  exemption is a false claim about the engine, and nothing else in the suite
+  would ever notice it. Both halves have a test, and the stale-exemption test
+  was written by making the engine's answer change rather than by trusting the
+  branch.
+- **2026-08-02 — C41 — discharged, and the number survived.** The CLI's
+  hand-rolled indexing loop is gone; `bench index` now drives `Build`, so the
+  published figure describes the code the extension actually runs. C41 warned
+  the number would change because `Build` reads a 1 MB window and yields every
+  4 MB where the old loop streamed straight through. Warm runs: **345–371 ms**
+  against the old loop's **367 ms** — indistinguishable, in 120 yielding batches
+  instead of one pass. Yielding 120 times to stay cancellable costs nothing
+  measurable, which is the result that matters for the Worker.
+- **2026-08-02 — C47 — measured, and cheaper than assumed.** The argument for
+  scanning the file rather than the index was correctness, and the cost was
+  taken on faith. It is **466 ms for 500 MB (1.1 GB/s)**, within 14 % of the
+  newline-scan ceiling on the same file — so the honest option was also very
+  nearly the free one.
+- **2026-08-02 — C21 — fifth appearance.** "JSON forbids raw control characters
+  in strings" has now paid for line counting (C21), exact NDJSON record
+  boundaries (C27), the tier-1/tier-2 split (C26), the row budget (C33), and now
+  find's ability to match raw bytes without decoding. One property of the
+  grammar, five features.
+- **2026-08-02 — C45 — the lesson applied rather than noted.** C45 observed that
+  the untested layer is where the bug lives, about CSS. The find bookkeeping was
+  first written the same way — inside `main.ts`, wired to DOM nodes, where no
+  test can reach it — and was extracted to `ui/search.ts` before it was
+  believed. Six tests, all green on the first run; that proves nothing about the
+  code and everything about where the next change to it will be caught.
 
 - **2026-08-01 — C3 — fully discharged.** Two-tier lazy indexing has both tiers.
   Tier 2 expands the worst container in the corpus — 5 000 000 children — in

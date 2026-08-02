@@ -17,8 +17,10 @@
 
 mod bench;
 mod cli;
+mod conformance;
 mod file_source;
 mod fixtures;
+mod fuzz;
 mod sys;
 
 use std::io::Read;
@@ -41,7 +43,14 @@ COMMANDS:
     fixtures <KIND>         Generate a test fixture
     fixtures list           List the fixture kinds
     bench [FILE...]         Benchmark against fixtures
+    conformance [DIR]       Run a JSONTestSuite corpus (default: fixtures/generated/JSONTestSuite)
+    fuzz                    Fuzz the lexer and grammar walk for panics and disagreements
     help                    Print this message
+
+FUZZ OPTIONS:
+    --seconds <N>           How long to run. Default 10
+    --seed <N>              PRNG seed; the same seed always fuzzes identically. Default 1
+    --cases <N>             Stop after this many cases, whichever comes first
 
 FIXTURES OPTIONS:
     --size <SIZE>           Target size (500MB, 1GiB, 1_000_000). Default 50MB
@@ -102,8 +111,45 @@ fn run(command: &str, rest: &[String]) -> Result<String, String> {
         }
         "fixtures" => fixtures_command(rest),
         "bench" => bench_command(rest),
+        "conformance" => conformance_command(rest),
+        "fuzz" => fuzz_command(rest),
         "help" | "--help" | "-h" => Ok(USAGE.to_string()),
         other => Err(format!("unknown command: {other}\n\n{USAGE}")),
+    }
+}
+
+/// Fuzz the lexer and the grammar walk.
+///
+/// Fails — and so exits non-zero — on the first disagreement, printing the seed
+/// and the offending bytes, because a fuzz failure nobody can reproduce is not
+/// a bug report.
+fn fuzz_command(rest: &[String]) -> Result<String, String> {
+    let args = Args::parse(rest)?;
+    args.reject_unknown(&["seconds", "seed", "cases"])?;
+
+    let seconds = args.count("seconds", 10)?;
+    let seed = args.count("seed", 1)?;
+    let cases = args.count("cases", u64::MAX)?;
+
+    fuzz::run(seed, std::time::Duration::from_secs(seconds), cases)
+}
+
+/// Run the external conformance corpus.
+///
+/// Returns an error — and so a non-zero exit — when any case disagrees, so this
+/// is usable as a CI gate rather than as something a human has to read.
+fn conformance_command(rest: &[String]) -> Result<String, String> {
+    let args = Args::parse(rest)?;
+    let root = args.positional(0).map_or_else(
+        || PathBuf::from("fixtures/generated/JSONTestSuite"),
+        PathBuf::from,
+    );
+
+    let (report, passed) = conformance::run(&root).map_err(|e| e.to_string())?;
+    if passed {
+        Ok(report)
+    } else {
+        Err(format!("{report}\nconformance failed"))
     }
 }
 

@@ -23,6 +23,27 @@
       <button type="button" id="pick">Open file…</button>
       <input type="file" id="file" accept=".json,.ndjson,.jsonl,application/json" hidden />
 
+      <!--
+        Find. Deliberately a plain input and not a query bar: this searches the
+        file's bytes for a literal string, which is the first thing anyone does
+        to a file whose shape they do not know. JSONPath is M4 and is a
+        different tool for a different question.
+      -->
+      <div class="find" id="find-bar" hidden>
+        <input
+          type="search"
+          id="find-input"
+          placeholder="Find in file…"
+          aria-label="Find text in file"
+          title="Literal text, case-insensitive. Searches the file itself, so matches are shown on the row that contains them."
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <span class="find-status" id="find-status" role="status" aria-live="polite"></span>
+        <button type="button" id="find-prev" title="Previous match — Shift+Enter" disabled>↑</button>
+        <button type="button" id="find-next" title="Next match — Enter" disabled>↓</button>
+      </div>
+
       <nav class="crumbs" id="crumbs" aria-label="Path to the selected row"></nav>
 
       <div class="indexing" id="indexing" hidden>
@@ -68,6 +89,28 @@
         <span>…or paste JSON</span>
         <textarea id="paste" rows="3" spellcheck="false" placeholder='{"leviathan":true}'></textarea>
       </label>
+
+      <!--
+        The tree is fully keyboard-driven already; without this nobody finds out.
+        Listed here rather than in a help panel because the empty state is the
+        one screen every user sees before they need any of it.
+      -->
+      <dl class="legend">
+        <dt><kbd>↑</kbd><kbd>↓</kbd></dt>
+        <dd>move</dd>
+        <dt><kbd>→</kbd><kbd>←</kbd></dt>
+        <dd>expand / collapse</dd>
+        <dt><kbd>Enter</kbd></dt>
+        <dd>toggle</dd>
+        <dt><kbd>Home</kbd><kbd>End</kbd></dt>
+        <dd>first / last row</dd>
+        <dt><kbd>Ctrl</kbd><kbd>F</kbd></dt>
+        <dd>find in file</dd>
+        <dt><kbd>Ctrl</kbd><kbd>C</kbd></dt>
+        <dd>copy value</dd>
+        <dt><kbd>Ctrl</kbd><kbd>⇧</kbd><kbd>C</kbd></dt>
+        <dd>copy path</dd>
+      </dl>
     </section>
 
     <footer class="bar">

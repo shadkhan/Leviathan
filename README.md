@@ -170,6 +170,9 @@ Individually:
 | Command | Proves |
 |---|---|
 | `cargo test --workspace` | Core logic: format detection, byte ranges, CLI arguments |
+| `cargo test -p leviathan-core --test conformance` | RFC 8259 accept/reject over a committed corpus, every case at three chunk sizes |
+| `leviathan conformance [DIR]` | The full [JSONTestSuite](https://github.com/nst/JSONTestSuite) corpus; non-zero exit on any disagreement |
+| `leviathan fuzz --seconds N` | Mutation fuzzing for panics and chunk-boundary disagreements; reproducible from its seed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | No lint warnings anywhere |
 | `cargo fmt --all --check` | Formatting |
 | `bash scripts/check-layering.sh` | The core has no wasm/IO dependency and still builds for `wasm32` |
@@ -177,8 +180,75 @@ Individually:
 | `pnpm typecheck` | Both TS projects — UI (`lib: DOM`) and Worker (`lib: WebWorker`) |
 | `pnpm build` | Bundles, and enforces the 150 KB gz budget |
 
-Landing with M1: JSONTestSuite conformance, `cargo-fuzz` on the lexer, criterion
-benchmarks, and Playwright end-to-end tests.
+Not `cargo-fuzz`: it needs libFuzzer and a nightly toolchain and does not support
+`x86_64-pc-windows-msvc`, so rather than make an exit criterion
+platform-conditional the fuzzer is written the way the fixtures are — a seeded
+xorshift, no dependencies, and the same sequence on any machine. It mutates valid
+JSON (bit flips, deletions, truncations, duplicated spans) rather than only
+generating noise, because uniformly random bytes are rejected within a few bytes
+and exercise almost nothing.
+
+Still to land: criterion benchmarks and Playwright end-to-end tests.
+
+## Conformance
+
+[JSONTestSuite](https://github.com/nst/JSONTestSuite), 318 cases, run by
+`leviathan conformance`:
+
+| Class | Meaning | Result |
+|---|---|---|
+| `y_` | must be accepted | **95 / 95** ✅ |
+| `n_` | must be rejected | **185 / 188** — 3 documented deviations, below |
+| `i_` | implementation-defined | 22 accepted, 13 rejected — every answer listed by the command |
+
+The three deviations are one decision: **an empty file opens.** RFC 8259 requires
+a JSON text to contain a value, so `` (empty), `" "` (a space) and a lone UTF-8
+BOM are all invalid JSON — and Leviathan opens them anyway, reporting the format
+as `empty` rather than refusing. Refusing to open a zero-byte file (a truncated
+export, an interrupted download) is exactly the "it won't open" failure this
+project exists to replace. The distinction being glossed over is real and belongs
+to M3: *opening* an empty file should succeed, *validating* one should report
+"no JSON value".
+
+Deviations are declared in a table in the source and checked **both ways** — an
+undocumented disagreement fails the run, and so does an exemption that no longer
+applies, because a stale exemption is a false claim about the engine that nothing
+else would catch.
+
+A committed corpus of ~110 cases runs under plain `cargo test` with no network
+and no submodule, **each case at three chunk sizes** (1 byte, 3 bytes, whole),
+because a parser that is only correct when the input arrives in one piece is not
+a streaming parser.
+
+## Robustness
+
+`leviathan fuzz --seconds 1800`, seed 1:
+
+| | |
+|---|---:|
+| Cases | **1,969,106,501** (1.09 M/s) |
+| — mutations of valid JSON | 1,476,843,412 |
+| — random bytes | 492,263,089 |
+| Still parsed as valid | 200,191,239 (10.2 %) |
+| Panics | **0** |
+| Chunk-size disagreements | **0** |
+
+The invariant being checked is not "did it crash". The core is
+`#![forbid(unsafe_code)]` with a state machine that never indexes unchecked, so a
+panic was never the likely failure — what a *resumable* lexer can silently get
+wrong is giving different answers depending on where the chunk boundary falls.
+So every input runs at three chunk sizes and the verdicts must agree, while token
+spans are checked to be ordered and inside the input and error positions to be
+inside it with 1-based lines and columns. A caret pointing past end-of-file is
+what would make M3's error locations worthless, and it would never show up as a
+crash.
+
+Three quarters of the corpus is mutated valid JSON — bit flips, deletions,
+truncations, duplicated spans — because uniformly random bytes are rejected
+within a few bytes and only ever exercise the first branch. The 10.2 % that still
+parse is the figure that says the corpus is not all garbage, and a test asserts
+it stays non-zero. Every run is reproducible from its seed, and a failure prints
+the seed, the case number, and the offending bytes.
 
 ## Benchmarks
 
@@ -188,12 +258,13 @@ been built, and no row is ever filled from an estimate.
 
 | Fixture | Metric | Target | Naive `JSON.parse` | Measured |
 |---|---|---|---|---|
-| 500 MB NDJSON | Tier-1 index build | — | ✗ crashes | **0.39–0.95 s** |
+| 500 MB NDJSON | Tier-1 index build | — | ✗ crashes | **0.35 s** warm · **1.07 s** cold |
 | 500 MB NDJSON | Index size | < 40 MB | n/a | **14.2 MB** (2.8 %) ✅ |
 | 500 MB NDJSON | Peak memory, indexed | < 400 MB | ✗ crashes | **22 MB** ✅ |
 | 500 MB NDJSON | Lex throughput (native) | ≥ 200 MB/s | — | **248–327 MB/s** ✅ |
 | 500 MB NDJSON | Parse + validate | — | ✗ crashes | **218 MB/s** |
 | 500 MB NDJSON | Tokens/s (native) | — | — | **54–71 M/s** |
+| 500 MB NDJSON | Whole-file find (native) | — | ✗ crashes | **466 ms** (1.1 GB/s) ✅ |
 | **5 M-element array** | **Random row access** | **< 20 ms** | ✗ crashes | **65–119 µs** ✅ |
 | 500 MB NDJSON | Random row access | < 20 ms | ✗ crashes | **0.74–1.09 ms** ✅ |
 | 500 MB NDJSON | First rows painted | < 2 s | ✗ never | — |
@@ -201,9 +272,14 @@ been built, and no row is ever filled from an estimate.
 | 500 MB NDJSON | First query results | < 500 ms | ✗ crashes | — |
 
 *Machine: 8 × x86_64, Windows, `bench-native` profile. Figures are ranges over
-repeated runs, not best-of — spread on a desktop OS is ±15 %. What is exact is
-the `observed` column: the same fixture always yields 108,133,846 tokens and
-1,772,686 records, on every run and at every chunk size, and that is the figure a
+repeated runs, not best-of. Two different spreads are folded into them: ±15 % of
+ordinary scheduling noise, and — for any workload that reads the whole file —
+up to **3×** depending on whether the fixture is resident in the OS page cache.
+Seven identical runs of `index` spanned 345 ms to 1.07 s for that reason alone,
+so whole-file rows are quoted cold-to-warm rather than as a single number
+(`DEEP_REASONING.md` C49). What is exact is the `observed` column: the same
+fixture always yields 108,133,846 tokens and 1,772,686 records, on every run, at
+every chunk size, and in every batch configuration — that is the figure a
 regression would actually surface in.*
 
 Three results worth reading closely:
@@ -221,11 +297,13 @@ file, because building the index just read it.)
 **Opening a file is six times cheaper than parsing it.** Tier-1 indexing of
 NDJSON scans for newlines and never parses — which is exact rather than
 heuristic, because JSON forbids raw control characters in strings, so a newline
-can never occur inside a value. Against ceilings on the same file (streaming and
-touching nothing: 466 MB/s; counting newlines: 1.2 GB/s), indexing runs at
-1.3 GB/s — *at* the memory-bandwidth ceiling — while a full parse-and-validate
-runs at 218 MB/s. A 500 MB log file is therefore browsable in under half a
-second, before any of it has been validated.
+can never occur inside a value. What matters is the ratio to the ceilings
+measured on the same file in the same run, since all three move together with
+the page cache (C49): counting newlines — the least work anything can do while
+touching every byte — runs at 1.2 GB/s, and indexing runs at 1.4 GB/s, which is
+to say *at* the ceiling, while a full parse-and-validate manages 216 MB/s. A
+500 MB log file is therefore browsable in a third of a second, before any of it
+has been validated.
 
 **The index-size result is shape-dependent, and one shape misses.** 8 bytes per
 child is 2.8 % of a record-shaped 500 MB file. For a flat array of small scalars
@@ -282,7 +360,7 @@ This repository is written to be read. The reasoning is checked in, not implied:
 | [`SPEC.md`](SPEC.md) | The phased build plan, with exit criteria per milestone |
 | [`DEEP_REASONING.md`](DEEP_REASONING.md) | Running log of core concepts — each with what it rules out and how it was validated |
 | [`USER_MANUAL.md`](USER_MANUAL.md) | Installing, using, and testing |
-| `docs/adr/` | One architectural decision each, written at the phase that closes it |
+| [`docs/adr/`](docs/adr/) | One architectural decision each, with the rejected alternatives and what it cost. Four written; [ADR-003](docs/adr/) waits on M2's measurement |
 
 ## License
 

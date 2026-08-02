@@ -33,9 +33,19 @@
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
 
+  --guide: #30363d;
+
   --radius: 6px;
-  --row-h: 22px;
-  --indent: 14px;
+  --row-h: 24px;
+  --indent: 16px;
+
+  /* Width of the row-number gutter. Wide enough for "1,772,686" — the record
+     count of the 500 MB fixture — because a clipped index is worse than none. */
+  --gutter-w: 11ch;
+
+  /* The expand/collapse control. A pointer target, so it is sized as one:
+     18 px is the smallest square that is comfortable to hit without aiming. */
+  --twisty: 18px;
 }
 
 @media (prefers-color-scheme: light) {
@@ -51,6 +61,7 @@
     --warn: #9a6700;
     --err: #cf222e;
     --select: #0969da22;
+    --guide: #d8dee4;
   }
 }
 
@@ -214,6 +225,64 @@ footer.bar {
   white-space: nowrap;
 }
 
+/* ------------------------------------------------------------------ find */
+
+.find {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.find[hidden] {
+  display: none;
+}
+
+.find input {
+  width: 22ch;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+/* A search scanning a 500 MB file is a running process, and the input is where
+   the user is looking — so that is where it says so. */
+.find input[data-scanning="true"] {
+  border-color: var(--accent);
+}
+
+.find-status {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  min-width: 9ch;
+  text-align: right;
+}
+
+.find-status[data-state="none"] {
+  color: var(--warn);
+}
+
+.find button {
+  padding: 1px 7px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* A row containing a search hit. Marked rather than highlighted inline: a match
+   is at a byte offset in the file, and the row's preview is decoded and
+   truncated text (C33) — the two do not share a coordinate system, so
+   underlining "the matched characters" would be a guess. The row is exact. */
+.tree-row[data-match="true"] {
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+}
+
+.tree-row[data-match="current"] {
+  background: color-mix(in srgb, var(--warn) 34%, transparent);
+  box-shadow: inset 2px 0 0 var(--warn);
+}
+
 .crumbs {
   display: flex;
   align-items: baseline;
@@ -275,6 +344,16 @@ footer.bar {
   width: 100%;
 }
 
+/*
+ * The gutter is taken out of flow rather than indented and pulled back.
+ *
+ * It used to be a flex item carrying `margin-left: calc(depth * -indent)` to
+ * cancel the row's own indent padding — and it cancelled it for the whole row,
+ * because a negative margin on a flex item shortens its outer size and drags
+ * every following sibling left with it. Indentation was therefore exactly zero
+ * at every depth. Positioning the gutter absolutely means the padding is the
+ * only thing deciding where content starts, so depth is depth.
+ */
 .tree-row {
   position: absolute;
   top: 0;
@@ -285,48 +364,103 @@ footer.bar {
   align-items: center;
   gap: 6px;
   padding-right: 12px;
-  padding-left: calc(var(--depth, 0) * var(--indent) + 6px);
+  padding-left: calc(var(--gutter-w) + var(--depth, 0) * var(--indent) + 6px);
   white-space: pre;
   contain: layout paint;
   cursor: default;
+}
+
+/* One faint rule per level of nesting, so a row twelve deep can be traced back
+   to its parent by eye. Drawn as a repeating gradient on a pseudo-element:
+   no extra DOM per level, which matters when every row is repainted on scroll. */
+.tree-row::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--gutter-w);
+  width: calc(var(--depth, 0) * var(--indent));
+  background-image: repeating-linear-gradient(
+    to right,
+    var(--guide) 0 1px,
+    transparent 1px var(--indent)
+  );
+  opacity: 0.65;
+  pointer-events: none;
 }
 
 .tree-row:hover {
   background: var(--bg-raised);
 }
 
+/* A selected row keeps an accent edge as well as a tint: the tint alone is easy
+   to lose against the hover state, and the tree is often read without focus. */
 .tree-row[aria-selected="true"] {
   background: var(--select);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* Expandable rows advertise it — the whole row toggles on double-click, so a
+   text cursor over one is a lie about what clicking does. */
+.tree-row[aria-expanded] {
+  cursor: pointer;
 }
 
 .tree-row .gutter {
-  flex: none;
-  min-width: 7ch;
-  margin-left: calc(var(--depth, 0) * var(--indent) * -1);
-  padding-right: 8px;
-  text-align: right;
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: var(--gutter-w);
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 10px;
   color: var(--text-dim);
-  opacity: 0.55;
-  font-size: 12px;
+  opacity: 0.5;
+  font-size: 11px;
+  /* Clicks land on the row, not on a number that does nothing. */
+  pointer-events: none;
 }
 
 .tree-row .twisty {
   flex: none;
-  width: 14px;
-  height: 14px;
+  width: var(--twisty);
+  height: var(--twisty);
   padding: 0;
-  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 4px;
   background: none;
   color: var(--text-dim);
-  font-size: 10px;
-  line-height: 14px;
-  text-align: center;
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
   cursor: pointer;
   visibility: hidden;
 }
 
 .tree-row[aria-expanded] .twisty {
   visibility: visible;
+}
+
+/* The control draws itself as a box once the row is under the pointer or
+   selected, and stays a bare glyph otherwise — an always-boxed control on every
+   row of a dense tree reads as noise rather than as an affordance. */
+.tree-row:hover .twisty,
+.tree-row[aria-selected="true"] .twisty {
+  border-color: var(--border);
+  background: var(--bg-sunken);
+  color: var(--text);
+}
+
+.tree-row .twisty:hover {
+  border-color: var(--accent);
+  background: var(--bg-sunken);
+  color: var(--accent);
 }
 
 .tree-row[aria-expanded="true"] .twisty {
@@ -443,6 +577,41 @@ footer.bar {
 .field > span {
   font-size: 12px;
   color: var(--text-dim);
+}
+
+/* ------------------------------------------------------------ key legend */
+
+.legend {
+  display: grid;
+  grid-template-columns: auto 1fr auto 1fr;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.legend dt {
+  display: flex;
+  gap: 3px;
+  justify-content: flex-end;
+}
+
+.legend dd {
+  margin: 0;
+}
+
+kbd {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg-raised);
+  color: var(--text);
+  white-space: nowrap;
 }
 
 /* --------------------------------------------------------------- widgets */

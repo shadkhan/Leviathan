@@ -98,6 +98,16 @@ let reader: BlobReader | undefined;
 /** Set by `cancel`, read by the indexing loop between batches. */
 let cancelled = false;
 
+/**
+ * Which search is current.
+ *
+ * Bumped by every `find` and every `findStop`, so a scan loop can tell whether
+ * it is still the one anyone is waiting for. Typing in the find box starts a new
+ * search every keystroke, and the previous one has to notice and stop rather
+ * than keep posting results into a list that has moved on.
+ */
+let search = 0;
+
 const DECODER = new TextDecoder();
 
 function requireOpen(): Document {
@@ -196,11 +206,87 @@ const handlers: Handlers = {
     return {};
   },
 
+  find: ({ needle, caseSensitive }) => {
+    const document = requireOpen();
+    document.findStart(needle, caseSensitive, undefined);
+    // Same shape as `open`: the answer is "started", and the results arrive as
+    // events. Awaiting the scan would hold the response for as long as it takes
+    // to read the file, which on the file this product exists for is the whole
+    // point of not doing it that way.
+    void searchToEnd(document, ++search);
+    return {};
+  },
+
+  findStop: () => {
+    search++;
+    open?.findStop();
+    return {};
+  },
+
   close: () => {
     closeCurrent();
     return {};
   },
 };
+
+/**
+ * Scan the file for the current needle, posting results as they are found.
+ *
+ * Structured exactly like {@link indexToEnd}, and for the same reason: a scan of
+ * a 500 MB file is seconds of work, and the alternative to yielding between
+ * batches is a Worker that stops answering — including stopping answering the
+ * keystroke that would have replaced this search with a better one.
+ */
+async function searchToEnd(document: Document, id: number): Promise<void> {
+  for (;;) {
+    if (document !== open || id !== search) {
+      return; // Superseded, stopped, or the file was closed. Say nothing.
+    }
+
+    let done: boolean;
+    try {
+      const step = document.findStep();
+      try {
+        done = step.done;
+        emit({
+          kind: 'found',
+          search: id,
+          rows: step.rows,
+          matches: step.matches,
+          pending: step.pending,
+          scanned: step.scanned,
+          total: document.size,
+          done,
+          limited: step.limited,
+        });
+      } finally {
+        step.free();
+      }
+    } catch (thrown) {
+      emit({
+        kind: 'found',
+        search: id,
+        rows: new Float64Array(0),
+        matches: 0,
+        pending: 0,
+        scanned: 0,
+        total: document.size,
+        done: true,
+        limited: false,
+        error: toProtocolError(thrown, 'Search stopped: the file could not be read.'),
+      });
+      return;
+    }
+
+    if (done) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
+}
 
 /**
  * Index the whole file, reporting as it goes.
@@ -273,6 +359,10 @@ function halted(document: Document, why: 'cancelled' | 'error'): ProgressEvent {
 
 function closeCurrent(): void {
   cancelled = true;
+  // Any scan in flight belongs to a file that is about to be freed. Bumping the
+  // id is what makes its next iteration return instead of calling into a
+  // `Document` that no longer exists.
+  search++;
   reader = undefined;
   open?.free();
   // Cleared before the loop can observe it: the loop's first act after a yield

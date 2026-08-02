@@ -70,6 +70,7 @@
 
 mod build;
 mod expand;
+mod find;
 mod format;
 mod index;
 mod lexer;
@@ -79,6 +80,7 @@ mod structure;
 
 pub use build::{Build, BuildOptions, Built};
 pub use expand::{DEFAULT_EXPANSION_BUDGET, ExpandOptions, Expansion, ExpansionCache, Stopped};
+pub use find::{Find, FindOptions, FindStop, rows_of};
 pub use format::{Format, sniff_format};
 pub use index::{ChildTable, RecordScanner, RootCollector, Tier1};
 pub use lexer::{LexError, LexErrorKind, Lexer, Position, Token, TokenKind, Tokens};

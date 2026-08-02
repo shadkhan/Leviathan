@@ -32,7 +32,7 @@
  * `dist/` after a rebuild is the single most likely cause of a confusing bug in
  * this project, so it fails loudly at boot instead of subtly at use.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** Input shapes the core can index. Mirrors `leviathan_core::Format`. */
 export type Format = 'single-document' | 'ndjson' | 'empty' | 'unknown';
@@ -160,6 +160,27 @@ export interface Calls {
    */
   forget: { params: { offset: number }; result: Record<string, never> };
 
+  /**
+   * Search the file's bytes for a literal string.
+   *
+   * Starts a scan and returns immediately; results arrive as `found` events
+   * (see {@link WorkerEvent}) until one reports `done`. A scan replaces any
+   * scan already running — typing another character is a new search, and the
+   * old one's remaining work is worthless.
+   *
+   * The scan reads the **file**, not the index. Searching materialized rows
+   * would search a truncated preview of each record (`DEEP_REASONING.md` C33)
+   * and miss matches that are genuinely there, which is worse than having no
+   * search at all because the user believes the answer.
+   */
+  find: {
+    params: { needle: string; caseSensitive: boolean };
+    result: Record<string, never>;
+  };
+
+  /** Abandon the search in progress. Idempotent. */
+  findStop: { params: Record<string, never>; result: Record<string, never> };
+
   /** Close the current file and release every index built over it. */
   close: { params: Record<string, never>; result: Record<string, never> };
 }
@@ -217,10 +238,40 @@ export type WorkerEvent =
       stopped?: 'malformed' | 'cancelled' | 'error';
       /** Present when `stopped` is `'error'`. */
       error?: ProtocolError;
+    }
+  | {
+      kind: 'found';
+      /** Which search these results belong to. Answers to a superseded search
+       * are discarded rather than merged into the current one's list. */
+      search: number;
+      /** Row indices discovered by this step only — the UI appends. Sending
+       * the whole growing list every few milliseconds is the allocation this
+       * design exists to avoid, one layer up from C43. */
+      rows: Float64Array;
+      /** Matches so far, including any not yet resolvable to a row. */
+      matches: number;
+      /** Matches lying beyond the indexed region, which have no row to go to.
+       * Zero unless indexing was cancelled — reported rather than dropped, so
+       * a count of 12 never accompanies a list of 9. */
+      pending: number;
+      /** Bytes scanned so far. */
+      scanned: number;
+      /** Bytes to scan in total. */
+      total: number;
+      /** Whether the scan has stopped. */
+      done: boolean;
+      /** Whether it stopped at the match cap rather than the end of the file —
+       * the difference between "1,024 matches" and "10,000+ matches". */
+      limited: boolean;
+      /** Present if the scan failed; the matches found before it still stand. */
+      error?: ProtocolError;
     };
 
 /** The indexing report, named so the Worker can build one before posting it. */
 export type ProgressEvent = Extract<WorkerEvent, { kind: 'progress' }>;
+
+/** One instalment of search results. */
+export type FoundEvent = Extract<WorkerEvent, { kind: 'found' }>;
 
 /** Anything the Worker may post to the UI. */
 export type FromWorker = ResponseEnvelope | WorkerEvent;

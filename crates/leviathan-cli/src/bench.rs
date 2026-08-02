@@ -25,10 +25,17 @@
 //! - `rows` — fetch a slice of fifty rows from deep inside the index, going back
 //!   to the file for every field. The other half of the same bargain: an index
 //!   that stores almost nothing is only a good trade if this is cheap.
+//! - `expand` — tier-2 indexing of the document's root, the largest container a
+//!   file has, so the worst case rather than a flattering one.
+//! - `find` — scan the whole file for a literal string that is deliberately
+//!   *absent*, so every byte is read. A needle that hit early would measure how
+//!   fast the scan can stop, which is a property of the fixture.
 //!
 //! `index` is the only workload whose *path* depends on the file: NDJSON scans
 //! for newlines and never parses, a single document is walked. The two are
-//! nearly an order of magnitude apart, and that gap is the product thesis.
+//! nearly an order of magnitude apart, and that gap is the product thesis. It
+//! drives [`leviathan_core::Build`] — the same loop the Worker runs — rather
+//! than a copy of it, so this row measures what ships (DEEP_REASONING C41).
 //!
 //! The ceilings are not filler. "300 MB/s" says nothing on its own; "300 MB/s
 //! against a 960 MB/s memory-bandwidth ceiling" says there is roughly 3× of
@@ -37,12 +44,21 @@
 //!
 //! ## On reading these numbers
 //!
-//! Run-to-run spread on an ordinary desktop OS is ±15 %, so a single run is a
-//! sample and not a result. Two things guard against reading too much into one:
-//! the `observed` column is exact and deterministic (the same fixture always
-//! lexes to the same token count, so a changed count is a bug and not noise),
-//! and published figures are stated as ranges over repeated runs. Cherry-picking
-//! the fastest of five is how benchmarks stop meaning anything.
+//! A single run is a sample, not a result, and there are two separate reasons
+//! why. Ordinary scheduling noise is ±15 %. Far larger, for any workload that
+//! reads the whole file, is whether the fixture is resident in the OS page
+//! cache: seven identical `index` runs spanned **345 ms to 1.07 s**, a 3×
+//! spread with no code difference (DEEP_REASONING C49). This harness cannot
+//! control that, so it does not pretend to — figures are published cold-to-warm,
+//! and the ceiling rows exist partly so the *ratio* between the engine and the
+//! fastest possible pass stays meaningful when neither absolute number does.
+//!
+//! What guards against reading too much into one run is the `observed` column,
+//! which is exact and deterministic: the same fixture always lexes to the same
+//! token count and indexes to the same record count, at every chunk size and
+//! every batch size. A changed count is a bug; a changed wall time usually is
+//! not. Cherry-picking the fastest of five is how benchmarks stop meaning
+//! anything.
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -119,8 +135,8 @@ impl Run {
 /// and reading them top to bottom says what fraction of the possible the engine
 /// achieved. A bare MB/s says nothing; "62 % of memory bandwidth" says whether
 /// there is headroom left worth chasing.
-pub const WORKLOADS: [&str; 8] = [
-    "read", "scan", "sniff", "lex", "walk", "index", "rows", "expand",
+pub const WORKLOADS: [&str; 9] = [
+    "read", "scan", "sniff", "lex", "walk", "index", "rows", "expand", "find",
 ];
 
 /// Run every workload in `workloads` against `path`.
@@ -154,6 +170,7 @@ pub fn run_file(path: &Path, workloads: &[&'static str], chunk: usize) -> io::Re
             "index" => index(&name, path, chunk)?,
             "rows" => rows(&name, path, chunk)?,
             "expand" => expand(&name, path)?,
+            "find" => find(&name, path, chunk)?,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -376,76 +393,64 @@ fn close_out(
 /// which is the M1 exit criterion nobody can argue with.
 fn index(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
     let format = sniff_prefix(path)?;
+    let mut source = crate::file_source::FileSource::open(path)?;
+    let options = leviathan_core::BuildOptions {
+        window: u32::try_from(chunk.max(64)).unwrap_or(u32::MAX),
+        ..leviathan_core::BuildOptions::default()
+    };
 
-    match format {
-        leviathan_core::Format::Ndjson => {
-            let mut scanner = leviathan_core::RecordScanner::new();
-            let mut run = measure(name, "index", path, chunk, |buf, state| {
-                scanner.feed(buf);
-                *state = scanner.records() as u64;
-                Flow::Continue
-            })?;
-            let table = scanner.finish();
-            run.observed = format!(
-                "{} records, {} index ({})",
-                table.len(),
-                human_bytes(table.heap_bytes() as u64),
-                share_of(table.heap_bytes() as u64, run.bytes),
-            );
-            Ok(run)
+    let mut build = leviathan_core::Build::new(format);
+    let mut batches = 0u32;
+
+    let began = Instant::now();
+    let stopped = loop {
+        let reason = build
+            .advance(&mut source, &options)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        batches += 1;
+        if !reason.resumable() {
+            break reason;
         }
-        _ => {
-            let mut lexer = leviathan_core::Lexer::new();
-            let mut structure = leviathan_core::Structure::new(leviathan_core::Documents::One);
-            let mut collector = leviathan_core::RootCollector::new();
-            let mut failure = None;
+    };
+    let wall = began.elapsed();
 
-            let mut run = measure(name, "index", path, chunk, |buf, state| {
-                for token in lexer.feed(buf) {
-                    let outcome = token
-                        .map_err(|e| e.to_string())
-                        .and_then(|t| structure.push(t).map_err(|e| e.to_string()));
-                    match outcome {
-                        Ok(Some(event)) => collector.observe(event),
-                        Ok(None) => {}
-                        Err(text) => {
-                            failure = Some(text);
-                            break;
-                        }
-                    }
-                }
-                *state = collector.rooted().into();
-                if failure.is_some() {
-                    Flow::Stop
-                } else {
-                    Flow::Continue
-                }
-            })?;
+    let malformed = stopped == leviathan_core::Built::Malformed;
+    let bytes = build.consumed();
+    let rows = build.rows();
+    let heap = build.heap_bytes();
 
-            if failure.is_none() {
-                match close_out(&mut lexer, &mut structure) {
-                    Ok(Some(event)) => collector.observe(event),
-                    Ok(None) => {}
-                    Err(text) => failure = Some(text),
-                }
-            }
-
-            if let Some(text) = failure {
-                run.bytes = lexer.offset();
-                run.metric = Metric::Aborted;
-                run.observed = format!("index abandoned: {text}");
+    Ok(Run {
+        fixture: name.to_string(),
+        workload: "index",
+        bytes,
+        // A build that stopped at a syntax error indexed everything up to it and
+        // that index is real (C6) — but its wall time bought only `consumed`
+        // bytes, so it is billed as an abort rather than as a whole-file rate
+        // (C23).
+        metric: if malformed {
+            Metric::Aborted
+        } else {
+            Metric::Throughput
+        },
+        wall,
+        reps: 1,
+        peak_rss: sys::peak_rss(),
+        observed: format!(
+            "{rows} {noun}, {index} index ({share}), {batches} batch(es){note}",
+            noun = if format == leviathan_core::Format::Ndjson {
+                "records"
             } else {
-                let table = collector.finish();
-                run.observed = format!(
-                    "{} root children, {} index ({})",
-                    table.len(),
-                    human_bytes(table.heap_bytes() as u64),
-                    share_of(table.heap_bytes() as u64, run.bytes),
-                );
-            }
-            Ok(run)
-        }
-    }
+                "root children"
+            },
+            index = human_bytes(heap as u64),
+            share = share_of(heap as u64, bytes),
+            note = if malformed {
+                ", stopped: malformed"
+            } else {
+                ""
+            },
+        ),
+    })
 }
 
 /// How many rows a screen of virtual scrolling asks for at once.
@@ -592,6 +597,58 @@ fn expand(name: &str, path: &Path) -> io::Result<Run> {
                 other => format!("stopped: {other:?}"),
             }
         ),
+    })
+}
+
+/// The needle the `find` workload searches for.
+///
+/// Deliberately a string that is **not** in any fixture. A search that finds
+/// nothing reads every byte of the file, which is the worst case and the only
+/// one whose cost is a property of the engine rather than of where the fixture
+/// generator happened to put a match. A needle that hits on line one would
+/// measure how quickly the scan can stop.
+const NEEDLE: &str = "leviathan-does-not-occur-here";
+
+/// Scan the whole file for a literal string — what the find box does.
+///
+/// A throughput, and one of the few workloads where that unit is unambiguous:
+/// every byte is read and compared, so cost scales with the file exactly. The
+/// interesting number is not the absolute rate but the ratio to `scan`, the
+/// memory-bandwidth ceiling measured on the same file: find does strictly more
+/// work per byte than counting newlines, and how much more is the question.
+fn find(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
+    let mut source = crate::file_source::FileSource::open(path)?;
+    let options = leviathan_core::FindOptions {
+        window: u32::try_from(chunk.max(64)).unwrap_or(u32::MAX),
+        budget: 8 * 1024 * 1024,
+        // Uncapped in the benchmark: the cap exists to protect a UI from a
+        // hundred million results, and letting it stop the scan early here
+        // would bill a partial read as a whole-file rate (C23).
+        limit: usize::MAX,
+    };
+
+    let mut search = leviathan_core::Find::new(NEEDLE, true);
+    let mut batches = 0u32;
+
+    let began = Instant::now();
+    while search.stopped().is_none() {
+        search
+            .advance(&mut source, &options)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        batches += 1;
+    }
+    let wall = began.elapsed();
+
+    let matches = search.matches().len();
+    Ok(Run {
+        fixture: name.to_string(),
+        workload: "find",
+        bytes: search.scanned(),
+        metric: Metric::Throughput,
+        wall,
+        reps: 1,
+        peak_rss: sys::peak_rss(),
+        observed: format!("{matches} matches, {batches} batch(es)"),
     })
 }
 
@@ -1331,6 +1388,21 @@ mod tests {
         }
         // And the report renders rather than panicking on the em dash path.
         assert!(report(&runs, &Machine::detect()).contains("read"));
+    }
+
+    #[test]
+    fn find_reads_the_whole_file_when_the_needle_is_absent() {
+        // The property that makes the number meaningful: a miss is a full scan,
+        // so `bytes` must equal the file and the rate must be a whole-file rate.
+        let (_dir, path) = fixture(b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n");
+        let runs = run_file(&path, &["find"], DEFAULT_CHUNK).unwrap();
+
+        assert_eq!(runs[0].bytes, 24, "every byte was scanned");
+        assert!(runs[0].observed.starts_with("0 matches"));
+        assert!(
+            runs[0].throughput().is_some(),
+            "a completed scan has a rate"
+        );
     }
 
     #[test]

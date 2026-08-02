@@ -117,6 +117,25 @@ impl ChildTable {
         &self.offsets[start..end]
     }
 
+    /// Which child contains byte `offset`, if any.
+    ///
+    /// The join between where the engine thinks (byte offsets) and where the
+    /// user thinks (rows): a find match, a validation error, or a jump-to-offset
+    /// all arrive as a byte and have to become a row before anyone can be sent
+    /// there. Offsets are ascending by construction, so this is a binary search
+    /// — a 500 MB file's 1.77 M records are 21 comparisons, not a scan.
+    ///
+    /// A byte before the first child belongs to no child. That is not an edge
+    /// case to smooth over: a document's opening `[` genuinely precedes every
+    /// row, and answering "row 0" would send the user somewhere the byte is not.
+    #[must_use]
+    pub fn locate(&self, offset: u64) -> Option<usize> {
+        match self.offsets.partition_point(|&start| start <= offset) {
+            0 => None,
+            n => Some(n - 1),
+        }
+    }
+
     /// Bytes of heap this table occupies.
     ///
     /// Reported rather than estimated, because "index size < 40 MB" is an exit
@@ -567,6 +586,37 @@ mod tests {
         let table = collect_root(&source);
         assert_eq!(table.len(), 10_000);
         assert_eq!(table.range(9_000, 3), [18_001, 18_003, 18_005]);
+    }
+
+    #[test]
+    fn a_byte_offset_resolves_to_the_row_that_contains_it() {
+        // Records at 0, 8, 16, each 8 bytes long.
+        let table = scan_records(b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n", 64);
+
+        assert_eq!(table.locate(0), Some(0), "the first byte of a row");
+        assert_eq!(table.locate(5), Some(0), "inside a row");
+        assert_eq!(
+            table.locate(8),
+            Some(1),
+            "a boundary belongs to the row it starts"
+        );
+        assert_eq!(table.locate(15), Some(1));
+        assert_eq!(table.locate(16), Some(2));
+        assert_eq!(
+            table.locate(9_999),
+            Some(2),
+            "past the end is the last row, which is where the file ends"
+        );
+    }
+
+    #[test]
+    fn a_byte_before_every_row_belongs_to_no_row() {
+        let table = scan_records(b"\n\n {\"a\":1}\n", 64);
+        assert_eq!(table.child(0), Some(3));
+        assert_eq!(table.locate(0), None);
+        assert_eq!(table.locate(2), None);
+        assert_eq!(table.locate(3), Some(0));
+        assert_eq!(ChildTable::new(None).locate(0), None, "an empty table");
     }
 
     #[test]
