@@ -99,6 +99,18 @@ export class RowBlock {
    * walking rows 0..n. */
   #stringStarts: Uint32Array | undefined;
 
+  /**
+   * Rows already decoded, kept because a scrolling list paints the same row on
+   * consecutive frames.
+   *
+   * Decoding allocates an object and two strings. At sixty frames a second over
+   * fifty visible rows that is thousands of short-lived allocations per second
+   * — a garbage-collection profile rather than a slow-function one, which is
+   * exactly the shape of the frame-time tail measured at M2 (C53). A row is
+   * immutable once decoded, so this is a cache with no invalidation.
+   */
+  #decoded: (Row | undefined)[] | undefined;
+
   constructor(buffer: ArrayBuffer) {
     this.#bytes = new Uint8Array(buffer);
     this.#view = new DataView(buffer);
@@ -129,12 +141,24 @@ export class RowBlock {
     return this.#count;
   }
 
-  /** Decode row `index`, including its strings. */
+  /** Decode row `index`, including its strings. Cached after the first call. */
   row(index: number): Row {
     if (index < 0 || index >= this.#count) {
       throw new RangeError(`Row ${index} is outside a block of ${this.#count}.`);
     }
 
+    const cache = (this.#decoded ??= new Array<Row | undefined>(this.#count));
+    const hit = cache[index];
+    if (hit) {
+      return hit;
+    }
+
+    const decoded = this.#decode(index);
+    cache[index] = decoded;
+    return decoded;
+  }
+
+  #decode(index: number): Row {
     const at = HEADER_BYTES + index * ROW_BYTES;
     const view = this.#view;
     const flags = view.getUint8(at + 33);

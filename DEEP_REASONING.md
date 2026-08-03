@@ -1224,6 +1224,103 @@ billion repetitions of one test.
 *Rules out:* a fuzz target that only catches panics; a robustness check that
 cannot run on the developer's own platform.
 
+## 2026-08-03 — M2 measured: three criteria met, one missed
+
+### C52 — The instrument lied twice before it measured anything — **validated**
+
+The M2 measurement script's first run reported a **0.9 ms first paint** and
+**454 546 MB/s** — nearly half a terabyte per second. Both were the same error:
+a file was already open, so the previous file's rows were still in the DOM and
+the progress bar still read `done`. The script measured a state that was true
+before the drop.
+
+That is the fifth time this project has divided by work that never happened —
+C14 (clock resolution), C15 (early exit), C23 (aborted run), C49 (page cache),
+and now stale UI state. The rule was already written down in C49: *before
+publishing a rate, name what else could have produced it.* It had simply never
+been applied to the browser-side instrument, which was new.
+
+The fix is the one the rule implies: the script now waits for the viewer to
+leave its terminal state before starting any clock, and **refuses to print an
+implausible result** — sub-5 ms first paint, over 10 000 MB/s, or a row count
+under a thousand produce `MEASUREMENT REJECTED` with the reason. An instrument
+that cannot fail loudly is an instrument that fails quietly.
+
+A third error was subtler and made the first frame-time figure meaningless: the
+scroll distance was derived from the canvas height, and the canvas is *capped*
+at 8 M px with a scaled scrollbar (C4's list). So "40 rows per frame" was really
+~790, and "100 000 rows" was the entire 1.77 M-row file. The row count now comes
+from the status bar, which is the only place the *real* number appears.
+
+**Chasing the reset condition found a real bug.** `VirtualList.reset()` removed
+its active rows but only emptied the `#pool` array — and a recycled row is
+deliberately left in the DOM, parked off-screen, because re-appending is the
+expensive half of what a recycling list avoids. So every file opened orphaned
+the whole pool into the canvas permanently. Invisible, unbounded, and found only
+because an instrument asked the DOM a question the renderer had never been asked
+before.
+
+### C53 — 60 fps at the median, and a tail that misses — **validated**
+
+The measurement, on the 500 MB fixture, scrolling 100 000 rows:
+
+| Criterion | Target | Measured | |
+|---|---|---:|---|
+| First rows painted | < 2 s | **124–143 ms** | ✅ |
+| Long tasks > 50 ms | 0 | **0** | ✅ |
+| Longest frame | < 32 ms | **35.5 ms** | ❌ (2 frames of 2 500) |
+| Index throughput (WASM) | ≥ 100 MB/s | **74–140 MB/s** | ❌ marginal |
+
+**First paint is 14× inside its budget** because tier 1 does not have to finish
+before anything can be shown (C27) — the tree is browsable a tenth of a second
+in, while indexing runs for another five.
+
+The frame result took four measured rounds, and the sequence is the point:
+
+| | p95 | over 32 ms | long tasks |
+|---|---:|---:|---:|
+| as built | 23.3 ms | 17 | 0 |
+| \+ memoized row decode, no `toLocaleString`, skip unchanged DOM writes | 17.7 ms | 10 | **3** |
+| \+ `MAX_BLOCKS` 256 → 64 | **16.9 ms** | **2** | **0** |
+
+Zero long tasks beside a 58.9 ms frame said the outliers were not one slow
+function — nothing blocked the thread for 50 ms. That pointed at allocation, and
+it was right: removing per-frame allocation took p95 from 23.3 ms to 16.9 ms,
+which is the median. 95 % of frames are at 60 fps.
+
+The middle row is the lesson. Caching decoded rows removed the garbage but
+**retained** it instead, and that run was the first ever to record long tasks —
+a 284 ms pause where there had been none. Trading many small collections for one
+big one is not an optimisation. Bounding the cache recovered both.
+
+### C54 — The browser's file read costs per byte, not per call — **validated, and a hypothesis rejected**
+
+WASM index throughput straddles its criterion: **74, 89, 96, 108, 140 MB/s**
+across five runs, against ≥ 100 MB/s. Publishing the 140 would have been
+cherry-picking; the honest statement is that half the runs miss.
+
+To attribute it rather than guess, the same `.wasm` was run against the same
+fixture in Node, where a read is a `readSync` into a reused buffer: **470–542
+MB/s**. Same engine, same 1 MB windows, five times the speed. So wasm32 is not
+the limit — the host's read path is.
+
+The obvious remedy was fewer, larger reads, since a browser read is a
+`blob.slice()` plus a `FileReaderSync` that allocates a fresh `ArrayBuffer`.
+Raising the window from 1 MB to 4 MB cut 479 reads to 120 and moved the
+throughput **not at all** (96 MB/s, inside the existing spread). The cost
+therefore scales with bytes, not with calls, and the change was reverted rather
+than kept — a constant whose comment claims an effect it does not have is worse
+than no change at all.
+
+What that leaves is a real ceiling in the browser's file API, not something the
+engine can optimise around, and the criterion needs revising against evidence
+rather than the engine being blamed for it. Worth noting what it does *not*
+cost: first paint is unaffected, because browsability never waited for indexing.
+
+*Rules out:* declaring M2 done on the strength of a median; treating "no long
+tasks" as equivalent to "no dropped frames"; keeping an optimisation that its
+own measurement does not support.
+
 ---
 
 ## Log of revisions
@@ -1251,6 +1348,18 @@ cannot run on the developer's own platform.
   disagreement in any of them. The pathological fixtures (100 k-deep nesting,
   5 M-element array, 50 MB single string, invalid UTF-8, truncated) have been
   green in `bench` since M1 landed.
+- **2026-08-03 — C19 — the limit became a bug, so it got fixed.** "An unindented
+  top-level array is indistinguishable from NDJSON" was recorded as an
+  acceptable limit on the argument that every mainstream pretty-printer indents.
+  A real file did not, and the viewer showed a phantom `array` row, the elements
+  as its siblings, and an `invalid` row for the closing `]` — 4 rows for a
+  2-element array. The rule that settles it is narrow and exact: **a line
+  holding only `[` or `{` cannot be an NDJSON record, because a record is a
+  *complete* value.** It costs one scan of the first line and leaves
+  `[1,2]\n[3,4]\n` correctly detected, because there every line does close.
+  What remains is an array whose first element shares the opening line — no
+  printer emits it, and settling it would mean parsing, which is the one thing
+  the sniffer exists to avoid (C8).
 - **2026-08-02 — C50 — run against the real corpus, and it found something.**
   318 JSONTestSuite cases: **95/95 `y_`**, **185/188 `n_`**, 35 `i_` answered
   exactly as the committed corpus predicted. The three `n_` disagreements are one

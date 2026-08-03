@@ -58,6 +58,26 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const now = () => performance.now();
 
+  /**
+   * Whether the page was ever hidden or unfocused while measuring.
+   *
+   * `requestAnimationFrame` stops firing for a background tab, so the next
+   * delta after returning is the length of the absence, not the length of a
+   * frame. A run that reported a 25 s "longest frame" alongside **zero** long
+   * tasks was measuring exactly this: the thread was not busy, it was not being
+   * scheduled. A frame time is only a frame time while the compositor is
+   * actually asked for frames.
+   */
+  let interrupted = false;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      interrupted = true;
+    }
+  });
+  // Deliberately *not* `window.blur`: focusing DevTools blurs the page window,
+  // and you have to focus DevTools to start this. A visible-but-unfocused page
+  // still gets frames, so blur is not the signal — being hidden is.
+
   /** Long tasks are collected for the whole session and sliced per phase. */
   const longTasks = [];
   let observer;
@@ -91,15 +111,28 @@
   const indexed = () => progressFill.dataset.state === 'done';
   const stopped = () => progressFill.dataset.state === 'stopped';
 
-  /** Rows the list currently believes exist, derived from its own geometry. */
+  /**
+   * How many rows the tree actually holds, read from the status bar.
+   *
+   * *Not* derived from the canvas: above ~8 M px the list caps its height and
+   * scales the scrollbar, so canvas ÷ row-height counts scaled units and
+   * undercounts a 1.7 M-row file by twenty times. Deriving the scroll distance
+   * from that made the first run cover the whole file at ~790 rows per frame
+   * while believing it was doing 40.
+   */
+  function totalRows() {
+    const text = indexState.textContent ?? '';
+    const match = /([\d,]+)\s+rows/.exec(text);
+    return match ? Number(match[1].replace(/,/g, '')) : 0;
+  }
+
   function rowGeometry() {
     const rowHeight =
       Number.parseFloat(
         getComputedStyle(document.documentElement).getPropertyValue('--row-h'),
       ) || 24;
-    const canvasPx = canvas.getBoundingClientRect().height;
     const scrollable = viewport.scrollHeight - viewport.clientHeight;
-    return { rowHeight, canvasPx, scrollable };
+    return { rowHeight, scrollable };
   }
 
   /**
@@ -110,10 +143,10 @@
    * nothing about the hundredth.
    */
   async function scrollTest(rows) {
-    const { rowHeight, scrollable } = rowGeometry();
-    const totalRows = Math.max(1, Math.round((scrollable + viewport.clientHeight) / rowHeight));
-    // Above the canvas cap one pixel is worth several rows; below it, one row.
-    const pxPerRow = scrollable / Math.max(1, totalRows);
+    const { scrollable } = rowGeometry();
+    const total = Math.max(1, totalRows());
+    // Pixels per *real* row, which above the canvas cap is a fraction of one.
+    const pxPerRow = scrollable / total;
     const rowsPerFrame = 40;
 
     viewport.scrollTop = 0;
@@ -141,7 +174,7 @@
     const to = now();
     // The first delta is the gap before the loop started, not a rendered frame.
     const samples = frames.slice(1);
-    return { samples, from, to, travelled, totalRows };
+    return { samples, from, to, travelled, total };
   }
 
   const ms = (n) => `${n.toFixed(1)} ms`;
@@ -153,6 +186,20 @@
   async function run(file) {
     const t0 = now();
     console.log(`measuring: ${file.name}, ${(file.size / 1e6).toFixed(1)} MB`);
+
+    // The viewer clears the tree and the progress bar synchronously when it
+    // takes a file. Until that has happened, every signal below still describes
+    // the *previous* file — which is how the first run of this script reported
+    // a 0.9 ms first paint and 454,546 MB/s. Waiting for the reset costs a
+    // frame or two and is the difference between measuring and inventing.
+    // Progress leaving its terminal state is the signal, not an empty canvas:
+    // a recycled row is parked off-screen rather than removed, so counting DOM
+    // rows asks a question the renderer never promised to answer.
+    await until(
+      () => !indexed() && !stopped(),
+      10_000,
+      'the viewer to start on the new file (reload the tab and retry)',
+    );
 
     const tPaint = await until(painted, 60_000, 'the first painted row');
     console.log(`first painted row: ${ms(tPaint - t0)}`);
@@ -177,6 +224,45 @@
     const tasks = tasksBetween(scroll.from, scroll.to);
     const loadTasks = tasksBetween(t0, tIndexed);
 
+    // A number that cannot be true must not be printed as though it were. Every
+    // previous version of this project's harness has had to learn this once
+    // (DEEP_REASONING C14, C15, C23, C49); this is the instrument applying it
+    // to itself.
+    const implausible = [];
+    if (interrupted) {
+      implausible.push(
+        'the tab lost focus or was hidden — rAF stops firing, so the gap on return' +
+          ' is recorded as a frame. Keep this tab focused for the whole run (~70 s).',
+      );
+    }
+    // A gap with no long task under it is the thread not being scheduled, not
+    // the thread being slow. Caught even when no visibility event fired — a
+    // sleeping machine reports neither.
+    const unscheduled = scroll.samples.filter(
+      (d) => d > 1000 && !tasks.some((t) => t > d / 2),
+    );
+    if (unscheduled.length > 0) {
+      implausible.push(
+        `${unscheduled.length} frame gap(s) over 1 s with no long task beneath them` +
+          ` (worst ${ms(Math.max(...unscheduled))}) — the page was not being rendered`,
+      );
+    }
+    if (tPaint - t0 < 5) {
+      implausible.push('first paint under 5 ms — the tree was probably not cleared');
+    }
+    if (throughput > 10_000) {
+      implausible.push(`${throughput.toFixed(0)} MB/s — faster than any disk or memcpy`);
+    }
+    if (scroll.total < 1000) {
+      implausible.push(`only ${scroll.total} rows seen — the row count was not read`);
+    }
+    if (implausible.length > 0) {
+      console.error('\nMEASUREMENT REJECTED:');
+      for (const why of implausible) console.error(`  · ${why}`);
+      console.error('Reload the viewer tab, re-paste this script, and drop the file again.\n');
+      return 'measurement rejected';
+    }
+
     const verdict = (ok) => (ok ? '✅' : '❌');
     const table = [
       '| Criterion | Target | Measured | |',
@@ -187,7 +273,7 @@
       `| Long tasks > 50 ms, scrolling | 0 | **${tasks.filter((d) => d > 50).length}** | ${verdict(tasks.filter((d) => d > 50).length === 0)} |`,
       '',
       `Frames sampled: ${scroll.samples.length} · median ${ms(pct(scroll.samples, 0.5))} · p95 ${ms(pct(scroll.samples, 0.95))} · over 32 ms: ${over32}`,
-      `Rows traversed: ${scroll.travelled.toLocaleString()} of ${scroll.totalRows.toLocaleString()}`,
+      `Rows traversed: ${scroll.travelled.toLocaleString()} of ${scroll.total.toLocaleString()} · ${(scroll.travelled / (scroll.to - scroll.from) * 1000).toFixed(0)} rows/s`,
       `Long tasks during load: ${loadTasks.filter((d) => d > 50).length}` +
         (loadTasks.length ? ` (worst ${ms(Math.max(...loadTasks))})` : ''),
       `File: ${file.name}, ${(file.size / 1e6).toFixed(1)} MB · row height ${rowGeometry().rowHeight}px`,

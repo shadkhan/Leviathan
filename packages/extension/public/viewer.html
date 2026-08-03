@@ -131,6 +131,29 @@
         <button type="button" id="copy-value" disabled>Copy value</button>
       </div>
       <output class="result" id="notice" aria-live="polite"></output>
+
+      <!--
+        Requirement 9: bounded memory, visibly. Someone handing a viewer a
+        gigabyte wants to watch it stay bounded, not be assured that it does.
+      -->
+      <span class="usage" id="usage" hidden></span>
+
+      <!--
+        Requirement 10: provably offline. The manifest requests zero permissions
+        and zero host permissions, and there is no network code in the bundle —
+        so this is checkable rather than promised, and the badge links to the
+        manifest so it can be checked.
+      -->
+      <a
+        class="offline"
+        id="offline"
+        href="manifest.json"
+        target="_blank"
+        rel="noopener"
+        title="Zero permissions, zero host permissions, no network code. The .wasm is bundled — MV3 forbids remote code. Click to read the manifest."
+        >⦸ offline</a
+      >
+
       <span id="engine-version">engine —</span>
     </footer>
 

@@ -113,9 +113,21 @@ export class VirtualList {
     this.#schedule();
   }
 
-  /** Drop every row element. Used when the whole model changed underneath. */
+  /**
+   * Drop every row element. Used when the whole model changed underneath.
+   *
+   * Both sets, not just the active one: {@link #recycle} deliberately leaves a
+   * recycled row *in the DOM*, parked off-screen, because removing and
+   * re-appending is the expensive half of what a recycling list avoids. Emptying
+   * `#pool` without removing those elements therefore dropped the references and
+   * left the nodes in the canvas — invisible, unreachable, and one more of them
+   * per row on every file opened.
+   */
   reset(): void {
     for (const element of this.#active.values()) {
+      element.remove();
+    }
+    for (const element of this.#pool) {
       element.remove();
     }
     this.#active.clear();

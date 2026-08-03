@@ -39,11 +39,18 @@ export const BLOCK_ROWS = 128;
 /**
  * How many blocks stay resident.
  *
- * 256 blocks is ~32 000 rows — far more than anyone scrolls back through, and
- * a few megabytes at most, since a block holds only the short strings needed to
- * paint (previews are truncated by the engine, C33).
+ * Was 256 (~32 000 rows). Lowered once decoded rows began being cached inside
+ * each block: that removed most of the per-frame allocation — p95 frame time
+ * fell from 23.3 ms to 17.7 ms — but it turned a stream of short-lived objects
+ * into *retained* heap, and the first run with it recorded three long tasks and
+ * a 284 ms frame where there had been none. Trading minor collections for
+ * occasional major ones is not an improvement.
+ *
+ * 64 blocks is 8 192 rows — still two orders of magnitude more than a screen,
+ * and still far more than anyone scrolls back through before the engine can
+ * refetch in about a millisecond (C32).
  */
-const MAX_BLOCKS = 256;
+const MAX_BLOCKS = 64;
 
 /** What the store tells the page when the world changed underneath it. */
 export interface StoreEvents {

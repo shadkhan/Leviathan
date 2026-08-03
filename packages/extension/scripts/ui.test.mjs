@@ -28,6 +28,7 @@ const bundled = await build({
       export { Tree } from './src/ui/tree.js';
       export { RowStore, BLOCK_ROWS } from './src/ui/store.js';
       export { Search, describeSearch } from './src/ui/search.js';
+      export { RowBlock } from './src/protocol/rows.js';
     `,
     resolveDir: root,
     loader: 'ts',
@@ -41,7 +42,7 @@ const bundled = await build({
 });
 
 const source = bundled.outputFiles[0].text;
-const { Tree, RowStore, BLOCK_ROWS, Search, describeSearch } = await import(
+const { Tree, RowStore, BLOCK_ROWS, Search, describeSearch, RowBlock } = await import(
   `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 );
 
@@ -454,6 +455,21 @@ await check('stepping an empty result set does nothing', async () => {
   assert.equal(search.goTo(0), undefined);
   assert.equal(search.goTo(-1), undefined);
   assert.equal(search.at, -1);
+});
+
+await check('a decoded row is cached, and the cache is the same row', async () => {
+  // Painting repeats: a scrolling list asks for the same row on consecutive
+  // frames, and decoding allocates an object and two strings each time. The
+  // cache must be transparent — same values, and cheap enough to be worth it.
+  const block = new RowBlock(pack([{ offset: 40, key: 'k', preview: 'v' }]));
+
+  const first = block.row(0);
+  const second = block.row(0);
+
+  assert.equal(first, second, 'the same object comes back');
+  assert.equal(second.key, 'k');
+  assert.equal(second.preview, 'v');
+  assert.equal(second.offset, 40);
 });
 
 await check('the filtered view is distinct rows, ascending', async () => {

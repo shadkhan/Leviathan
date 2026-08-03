@@ -41,6 +41,7 @@ import {
   type Params,
   type ProgressEvent,
   type RequestEnvelope,
+  type Usage,
   type Result,
   type WorkerEvent,
 } from '../protocol/index.js';
@@ -94,6 +95,17 @@ let open: Document | undefined;
  * fetched by offset rather than re-derived.
  */
 let reader: BlobReader | undefined;
+
+/** The WASM instance, held for its linear memory. */
+let instance: Awaited<ReturnType<typeof init>> | undefined;
+
+/** What the engine occupies right now. */
+function usage(document: Document | undefined): Usage {
+  return {
+    index: document?.heapBytes ?? 0,
+    heap: instance?.memory.buffer.byteLength ?? 0,
+  };
+}
 
 /** Set by `cancel`, read by the indexing loop between batches. */
 let cancelled = false;
@@ -170,7 +182,12 @@ const handlers: Handlers = {
   expand: ({ offset }) => {
     const step = requireOpen().expandStep(offset);
     try {
-      return { children: step.children, done: step.done, complete: step.complete };
+      return {
+        children: step.children,
+        done: step.done,
+        complete: step.complete,
+        usage: usage(open),
+      };
     } finally {
       // A wasm-bindgen struct is a pointer into linear memory with a JS wrapper
       // around it. Freeing it is not optional bookkeeping — left to the
@@ -330,6 +347,7 @@ async function indexToEnd(document: Document): Promise<void> {
         rows: step.rows,
         done,
         ...(step.malformed ? { stopped: 'malformed' as const } : {}),
+        usage: usage(document),
       });
     } finally {
       step.free();
@@ -354,6 +372,7 @@ function halted(document: Document, why: 'cancelled' | 'error'): ProgressEvent {
     rows: document.rowCount(null),
     done: true,
     stopped: why,
+    usage: usage(document),
   };
 }
 
@@ -426,7 +445,10 @@ function answer(request: RequestEnvelope): void {
 }
 
 async function start(): Promise<void> {
-  await init({ module_or_path: WASM_URL });
+  // The instance is kept for its `memory`: requirement 9 asks for the engine's
+  // real footprint, and linear memory is it — the number the browser actually
+  // reserved, not an estimate of what is in it.
+  instance = await init({ module_or_path: WASM_URL });
 
   // The row buffer is read by byte offset on the far side, so a layout skew
   // between the `.wasm` and the bundle is not a type error — it is silently

@@ -164,6 +164,17 @@ pub fn sniff_format(prefix: &[u8]) -> Format {
         return Format::Unknown;
     }
 
+    // A pretty-printed container opens on a line of its own, and that line is
+    // not a record: an NDJSON record is a *complete* value, and `[` is not one.
+    // Without this, `[\n{"a":1},\n{"b":2}\n]` — an ordinary array printed with
+    // its elements unindented — is read as NDJSON, and the tree then shows a
+    // phantom row for the `[`, the elements as siblings of it, and an `invalid`
+    // row for the closing `]`. C19 recorded this as a known limit; it turned up
+    // in real files, which is the difference between a limit and a bug.
+    if opens_a_container(&bytes[start..]) {
+        return Format::SingleDocument;
+    }
+
     let mut value_starting_lines = 0usize;
     for line in bytes.split(|b| *b == b'\n') {
         // A line that begins a value at column 0 (no leading indentation).
@@ -178,9 +189,62 @@ pub fn sniff_format(prefix: &[u8]) -> Format {
     Format::SingleDocument
 }
 
+/// Whether the first line is a bare `[` or `{` and nothing else.
+///
+/// Deliberately narrow. It does not try to decide whether *any* line completes
+/// its value — that is parsing, and the sniffer's job is to answer instantly
+/// from a prefix (C8). It rules out only the one shape that cannot possibly be
+/// a record, which is the shape every pretty-printer produces.
+fn opens_a_container(bytes: &[u8]) -> bool {
+    let mut iter = bytes.iter();
+    if !matches!(iter.next(), Some(b'[' | b'{')) {
+        return false;
+    }
+    // Nothing but whitespace may follow on that line.
+    for &byte in iter {
+        if byte == b'\n' {
+            return true;
+        }
+        if !is_ws(byte) {
+            return false;
+        }
+    }
+    // The prefix ended without a newline: a lone `[` is still not a record.
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_array_printed_with_unindented_elements_is_a_document() {
+        // The bug C19 predicted and a real file produced: elements at column 0
+        // look exactly like NDJSON records, and the `[` on its own line is the
+        // only thing that says otherwise.
+        assert_eq!(
+            sniff_format(b"[\n{\"a\":1},\n{\"b\":2}\n]"),
+            Format::SingleDocument
+        );
+        assert_eq!(
+            sniff_format(b"{\n\"a\":1,\n\"b\":2\n}"),
+            Format::SingleDocument,
+            "and the same shape for an object"
+        );
+        assert_eq!(
+            sniff_format(b"[\r\n{\"a\":1},\r\n{\"b\":2}\r\n]"),
+            Format::SingleDocument,
+            "CRLF too — the \\r is whitespace after the bracket"
+        );
+    }
+
+    #[test]
+    fn ndjson_whose_records_are_arrays_is_still_ndjson() {
+        // The case the narrow rule must not break: every line here *is* a
+        // complete value, so this really is a stream.
+        assert_eq!(sniff_format(b"[1,2]\n[3,4]\n"), Format::Ndjson);
+        assert_eq!(sniff_format(b"{\"a\":1}\n{\"a\":2}\n"), Format::Ndjson);
+    }
 
     #[test]
     fn empty_and_whitespace() {
@@ -289,31 +353,39 @@ mod tests {
     }
 
     #[test]
-    fn known_limit_an_unindented_array_is_indistinguishable_from_ndjson() {
-        // Recorded, not hidden. A top-level array whose elements begin at
-        // column 0 produces exactly the byte pattern this heuristic uses to
-        // recognise NDJSON, so a prefix window genuinely cannot tell them
-        // apart — the difference is a single `[` and a trailing `]` that may be
-        // 500 MB away.
+    fn known_limit_an_array_sharing_its_first_line_reads_as_ndjson() {
+        // What is left of C19 after `opens_a_container` closed the common case.
         //
-        // Why this is acceptable for now:
-        //  - Every mainstream pretty-printer indents array elements, so real
-        //    files hit `pretty_printed_document_is_not_ndjson` instead.
-        //  - The consequence is a wrong tier-1 index choice, not a wrong parse.
-        //  - M1's streaming lexer answers it exactly: it knows when it has
-        //    closed a top-level value, so it can say whether another follows.
-        //    Until then the UI offers a manual override.
-        let unindented = b"[\n{\"a\":1},\n{\"a\":2}\n]";
-        assert_eq!(sniff_format(unindented), Format::Ndjson);
+        // A bracket alone on a line cannot be a record, so the shape every
+        // pretty-printer emits is now read correctly. What a prefix window
+        // still cannot settle is an array whose first element shares the
+        // opening line: `[{"a":1},` *starts* a value, the next line starts
+        // another, and the only proof otherwise is a `]` that may be 500 MB
+        // away.
+        //
+        // Left as a limit rather than chased:
+        //  - No mainstream printer emits it; it comes from hand-editing.
+        //  - The consequence is a wrong tier-1 index choice, not a wrong parse,
+        //    and every row still renders.
+        //  - Settling it means parsing, and the sniffer exists to answer before
+        //    parsing has begun (C8).
+        assert_eq!(sniff_format(b"[{\"a\":1},\n{\"a\":2}\n]"), Format::Ndjson);
 
-        // The indented form — what real tools emit — is read correctly.
-        let indented = b"[\n  {\"a\":1},\n  {\"a\":2}\n]";
-        assert_eq!(sniff_format(indented), Format::SingleDocument);
-
-        // As is the minified form.
+        // Every shape that real tools produce is now read correctly.
+        assert_eq!(
+            sniff_format(b"[\n{\"a\":1},\n{\"a\":2}\n]"),
+            Format::SingleDocument,
+            "unindented elements — the case that was wrong"
+        );
+        assert_eq!(
+            sniff_format(b"[\n  {\"a\":1},\n  {\"a\":2}\n]"),
+            Format::SingleDocument,
+            "indented"
+        );
         assert_eq!(
             sniff_format(b"[{\"a\":1},{\"a\":2}]"),
-            Format::SingleDocument
+            Format::SingleDocument,
+            "minified"
         );
     }
 

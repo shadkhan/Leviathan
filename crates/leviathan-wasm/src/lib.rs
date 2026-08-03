@@ -361,6 +361,17 @@ impl Document {
             build: Build::new(format),
             cache: ExpansionCache::default(),
             row_options: RowOptions::default(),
+            // The core's default window, deliberately. A 4 MB window was tried
+            // on the theory that the browser's cost is per *read* — the same
+            // `.wasm` indexes the 500 MB fixture at 470–542 MB/s in Node, where
+            // a read is a `readSync` into a reused buffer, against 74–140 MB/s
+            // in a Worker, where it is a `blob.slice()` plus a `FileReaderSync`
+            // that allocates a fresh `ArrayBuffer`. Cutting 479 reads to 120
+            // moved the number not at all (96 MB/s, inside the existing spread),
+            // so the cost scales with bytes rather than with calls and the
+            // larger window bought only bigger transient allocations. Reverted
+            // rather than kept: a constant whose comment claims an effect it
+            // does not have is worse than no change.
             build_options: BuildOptions::default(),
             expand_options: ExpandOptions::default(),
             find: None,

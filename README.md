@@ -15,10 +15,11 @@ No freezing, no upload, no server.
 </div>
 
 > [!WARNING]
-> **Status: M2 in progress.** The engine is done and measured — streaming lexer,
-> both index tiers, row materialization, the WASM boundary. The virtualized tree,
-> the find bar and the keyboard UI are written and unit-tested but **have not yet
-> been verified in a browser**. Not yet something you would install.
+> **Status: M2 in progress.** The engine is done and measured, and the viewer now
+> runs: a 500 MB NDJSON file paints its first rows in **141 ms**, indexes at
+> **140 MB/s** in WASM, and scrolls at a median **16.6 ms** per frame with zero
+> long tasks. One criterion is not met — 0.7 % of frames exceed 32 ms
+> ([details](#numbers)). Validation, query, dedup and export are not built.
 > See the [roadmap](#roadmap).
 
 ---
@@ -185,9 +186,25 @@ than by convention:
 | Whole-file find | — | ✗ crashes | **466 ms** (1.1 GB/s) ✅ |
 | Lex throughput | ≥ 200 MB/s | — | **248–327 MB/s** ✅ |
 | Parse + validate | — | ✗ crashes | 216 MB/s |
-| First rows painted (browser) | < 2 s | ✗ never | — |
-| Index throughput (WASM) | ≥ 100 MB/s | — | — |
+| First rows painted (browser) | < 2 s | ✗ never | **124–143 ms** ✅ |
+| Long tasks > 50 ms while scrolling | 0 | ✗ constant | **0** ✅ |
+| Frame time, scrolling 100 k rows | — | ✗ never | median **16.6 ms**, p95 **16.9 ms** |
+| Longest frame | < 32 ms | ✗ never | **35.5 ms** ❌ — 2 frames of 2,500 |
+| Index throughput (WASM) | ≥ 100 MB/s | — | **74–140 MB/s** ❌ marginal |
 
+> **Two criteria are missed, and both are published rather than buried.**
+> Scrolling 100 000 rows: 2 500 frames, median 16.6 ms and **p95 16.9 ms** — 95 %
+> of frames at 60 fps, zero long tasks — but 2 frames reach 35.5 ms against a
+> 32 ms bar. And WASM index throughput runs **74–140 MB/s** against ≥ 100, so
+> half of five runs miss.
+>
+> The throughput is attributed, not guessed: the same `.wasm` indexes the same
+> file at **470–542 MB/s in Node**, where a read is a `readSync` into a reused
+> buffer rather than a `blob.slice()` plus a fresh `ArrayBuffer`. The engine is
+> not the limit; the browser's file API is. Cutting 479 reads to 120 changed
+> nothing, so the cost is per byte, not per call — and that change was reverted
+> rather than kept ([C54](DEEP_REASONING.md)).
+>
 > **Opening a file is six times cheaper than parsing it.** NDJSON indexing scans
 > for newlines and never parses — exact, not heuristic, because JSON forbids raw
 > control characters in strings. It runs at 1.4 GB/s against a 1.2 GB/s
@@ -265,7 +282,7 @@ CLI, and (v2) an MCP server.
 |---|---|---|
 | **M0** | Skeleton, WASM boundary, typed protocol, CI | ✅ |
 | **M1** | Streaming lexer + node index ← *the make-or-break phase* | ✅ measured, conformant, fuzzed |
-| **M2** | Virtual tree, navigation, find, trust indicators | 🔨 built, not yet browser-verified |
+| **M2** | Virtual tree, navigation, find + filter, trust indicators | 🔨 measured — 3 of 4 criteria met, frame-time tail open |
 | **M3** | Validation: byte-accurate errors, jump-to-position, JSON Schema | ⬜ |
 | **M4** | Query: JSONPath over the index | ⬜ |
 | **M5** | Dedup: duplicate keys and elements | ⬜ |

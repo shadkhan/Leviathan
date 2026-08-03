@@ -741,6 +741,40 @@ footer .actions button {
   color: var(--err);
 }
 
+/* The memory readout. Monospace and tabular so the digits do not jitter as it
+   updates — a number that dances while indexing reads as instability, which is
+   the opposite of what it is there to show. */
+.usage {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.usage[hidden] {
+  display: none;
+}
+
+/* Green because it is a guarantee, not a status: the manifest requests nothing,
+   so this cannot turn red at runtime. */
+.offline {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+  border-radius: 999px;
+  color: var(--ok);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.offline:hover,
+.offline:focus-visible {
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+
 #engine-version {
   flex: none;
   opacity: 0.7;

@@ -65,6 +65,7 @@ const findNext = el<HTMLButtonElement>('find-next');
 const viewport = el('viewport');
 const canvas = el('canvas');
 
+const usageInfo = el('usage');
 const selectionInfo = el('selection');
 const copyPath = el<HTMLButtonElement>('copy-path');
 const copyValue = el<HTMLButtonElement>('copy-value');
@@ -123,6 +124,29 @@ const STOPPED: Record<'malformed' | 'cancelled' | 'error', string> = {
   cancelled: 'stopped',
   error: 'unreadable',
 };
+
+/**
+ * Group a non-negative integer's digits: `1772686` → `1,772,686`.
+ *
+ * Hand-rolled rather than `toLocaleString`, which builds or consults an `Intl`
+ * formatter and is roughly an order of magnitude slower. That is irrelevant
+ * anywhere it is called once, and it is not irrelevant in {@link paintRow},
+ * which runs for every visible row of every frame — fifty-odd rows at sixty
+ * frames a second (C53).
+ */
+function grouped(value: number): string {
+  const digits = String(value);
+  if (digits.length <= 3) {
+    return digits;
+  }
+  let out = '';
+  let cut = digits.length;
+  while (cut > 3) {
+    cut -= 3;
+    out = `,${digits.slice(cut, cut + 3)}${out}`;
+  }
+  return digits.slice(0, cut) + out;
+}
 
 const UNITS = ['B', 'kB', 'MB', 'GB', 'TB'];
 
@@ -234,6 +258,24 @@ interface Parts {
   key: HTMLElement;
   value: HTMLElement;
   note: HTMLElement;
+  /**
+   * What this element was last painted with.
+   *
+   * Compared against here rather than read back from the DOM: a scroll repaints
+   * every visible row each frame, but most of them are unchanged, and assigning
+   * `textContent` invalidates style whether or not the string differs. Holding
+   * the previous values in JS turns "is this the same?" into a string compare
+   * instead of a DOM read followed by a write.
+   */
+  last: Record<string, string>;
+}
+
+/** Assign only when the value actually changed. */
+function set(part: Parts, slot: string, value: string, apply: (v: string) => void): void {
+  if (part.last[slot] !== value) {
+    part.last[slot] = value;
+    apply(value);
+  }
 }
 
 /**
@@ -270,7 +312,7 @@ function createRow(): HTMLElement {
   note.className = 'note';
 
   row.append(gutter, twisty, key, value, note);
-  parts.set(row, { gutter, twisty, key, value, note });
+  parts.set(row, { gutter, twisty, key, value, note, last: {} });
   return row;
 }
 
@@ -284,15 +326,24 @@ function paintRow(element: HTMLElement, flat: number): void {
   const index = recordIndex(at);
   const row = store.rowAt(at.branch.container, index);
 
-  element.dataset['flat'] = String(flat);
-  element.id = `row-${flat}`;
-  element.style.setProperty('--depth', String(at.depth));
-  element.setAttribute('aria-level', String(at.depth + 1));
-  element.setAttribute('aria-posinset', String(at.index + 1));
-  element.setAttribute('aria-setsize', String(at.branch.complete ? at.branch.count : -1));
+  const flatText = String(flat);
+  set(part, 'flat', flatText, (v) => {
+    element.dataset['flat'] = v;
+    element.id = `row-${v}`;
+  });
+  set(part, 'depth', String(at.depth), (v) => {
+    element.style.setProperty('--depth', v);
+    element.setAttribute('aria-level', String(at.depth + 1));
+  });
+  set(part, 'posinset', String(at.index + 1), (v) => element.setAttribute('aria-posinset', v));
+  set(part, 'setsize', String(at.branch.complete ? at.branch.count : -1), (v) =>
+    element.setAttribute('aria-setsize', v),
+  );
 
   const selected = isSelected(at);
-  element.setAttribute('aria-selected', selected ? 'true' : 'false');
+  set(part, 'selected', selected ? 'true' : 'false', (v) =>
+    element.setAttribute('aria-selected', v),
+  );
   if (selected) {
     viewport.setAttribute('aria-activedescendant', element.id);
   }
@@ -302,48 +353,76 @@ function paintRow(element: HTMLElement, flat: number): void {
   // nested value therefore marks the record that contains it, which is the row
   // the user is looking for anyway.
   const mark = at.branch.container === null ? search.mark(index) : undefined;
-  if (mark) {
-    element.dataset['match'] = mark === 'current' ? 'current' : 'true';
-  } else {
-    delete element.dataset['match'];
-  }
+  set(part, 'match', mark ?? '', (v) => {
+    if (v === '') {
+      delete element.dataset['match'];
+    } else {
+      element.dataset['match'] = v === 'current' ? 'current' : 'true';
+    }
+  });
 
-  part.gutter.textContent = index.toLocaleString();
+  set(part, 'gutter', grouped(index), (v) => {
+    part.gutter.textContent = v;
+  });
 
   if (!row) {
     // The bytes have not arrived. The row still occupies its place, so nothing
     // moves when it does.
-    element.dataset['loading'] = 'true';
-    element.dataset['kind'] = 'pending';
-    element.removeAttribute('aria-expanded');
-    part.twisty.textContent = '';
-    part.twisty.removeAttribute('title');
-    part.key.textContent = '';
-    part.value.textContent = '…';
-    part.note.textContent = '';
+    set(part, 'kind', 'pending', (v) => {
+      element.dataset['loading'] = 'true';
+      element.dataset['kind'] = v;
+      element.removeAttribute('aria-expanded');
+    });
+    set(part, 'twisty', '', (v) => {
+      part.twisty.textContent = v;
+      part.twisty.removeAttribute('title');
+    });
+    set(part, 'key', '', (v) => {
+      part.key.textContent = v;
+    });
+    set(part, 'value', '…', (v) => {
+      part.value.textContent = v;
+    });
+    set(part, 'note', '', (v) => {
+      part.note.textContent = v;
+    });
     keepIndexed(at);
     return;
   }
 
-  delete element.dataset['loading'];
-  element.dataset['kind'] = row.kind;
-
   const open = row.expandable ? tree.branchOf(row.offset) : undefined;
-  if (row.expandable) {
-    element.setAttribute('aria-expanded', open ? 'true' : 'false');
-    // U+2212 rather than a hyphen: a hyphen sits high and short next to a plus,
-    // and the pair has to read as one control at 15 px.
-    part.twisty.textContent = open ? '−' : '+';
-    part.twisty.title = open ? 'Collapse' : 'Expand';
-  } else {
-    element.removeAttribute('aria-expanded');
-    part.twisty.textContent = '';
-    part.twisty.removeAttribute('title');
-  }
 
-  part.key.textContent = row.key === null ? '' : `${JSON.stringify(row.key)}:`;
-  part.value.textContent = summarize(row);
-  part.note.textContent = open && !open.complete ? 'indexing…' : countOf(row);
+  set(part, 'kind', row.kind, (v) => {
+    delete element.dataset['loading'];
+    element.dataset['kind'] = v;
+  });
+  set(part, 'expanded', row.expandable ? (open ? 'true' : 'false') : '', (v) => {
+    if (v === '') {
+      element.removeAttribute('aria-expanded');
+    } else {
+      element.setAttribute('aria-expanded', v);
+    }
+  });
+  // U+2212 rather than a hyphen: a hyphen sits high and short next to a plus,
+  // and the pair has to read as one control at 15 px.
+  set(part, 'twisty', row.expandable ? (open ? '−' : '+') : '', (v) => {
+    part.twisty.textContent = v;
+    if (v === '') {
+      part.twisty.removeAttribute('title');
+    } else {
+      part.twisty.title = v === '−' ? 'Collapse' : 'Expand';
+    }
+  });
+
+  set(part, 'key', row.key === null ? '' : `${JSON.stringify(row.key)}:`, (v) => {
+    part.key.textContent = v;
+  });
+  set(part, 'value', summarize(row), (v) => {
+    part.value.textContent = v;
+  });
+  set(part, 'note', open && !open.complete ? 'indexing…' : countOf(row), (v) => {
+    part.note.textContent = v;
+  });
 
   keepIndexed(at);
 }
@@ -394,7 +473,7 @@ function countOf(row: Row): string {
     return 'empty';
   }
   // An inexact count is the budget having run out, not a mystery — C33.
-  const count = `${row.children.toLocaleString()}${row.childrenExact ? '' : '+'}`;
+  const count = `${grouped(row.children)}${row.childrenExact ? '' : '+'}`;
   return `${count} ${row.children === 1 ? 'item' : 'items'}`;
 }
 
@@ -403,6 +482,27 @@ function countOf(row: Row): string {
 /** Root rows the engine has indexed, and whether it finished. */
 let rootRows = 0;
 let rootComplete = false;
+
+/** The size of the open file, for the memory readout's ratio. */
+let fileBytes = 0;
+
+/**
+ * Show what the engine occupies (requirement 9).
+ *
+ * Both numbers are the engine's own: the index it built, and the linear memory
+ * the browser actually reserved for it. The ratio is the claim worth making —
+ * "14.2 MB for a 500 MB file" says more than either number alone, and it is the
+ * whole memory argument in six characters.
+ */
+function renderUsage(usage: { index: number; heap: number }): void {
+  usageInfo.hidden = false;
+  const share = fileBytes > 0 ? ` · ${((usage.index / fileBytes) * 100).toFixed(1)}% of file` : '';
+  usageInfo.textContent = `index ${humanBytes(usage.index)} · heap ${humanBytes(usage.heap)}${share}`;
+  usageInfo.title =
+    `Index: ${usage.index.toLocaleString()} bytes of node offsets, tier 1 plus resident expansions.\n` +
+    `Heap: ${usage.heap.toLocaleString()} bytes of WASM linear memory — the engine's real footprint.\n` +
+    `The file itself is never held in memory; the engine reads byte ranges from it on demand.`;
+}
 
 /**
  * Tell the tree how many rows its root offers.
@@ -986,6 +1086,7 @@ async function openFile(source: File): Promise<void> {
 
     fileInfo.hidden = false;
     fileName.textContent = source.name;
+    fileBytes = size;
     fileFacts.textContent = `${humanBytes(size)} · ${FORMAT_LABEL[format]}`;
     empty.hidden = true;
     viewport.hidden = false;
@@ -1044,6 +1145,7 @@ function onEvent(event: WorkerEvent): void {
 
   // Tier 1 only ever appends, so a growing root is a taller scrollbar and
   // nothing else — no row on screen moves, and nothing cached is invalidated.
+  renderUsage(event.usage);
   store.noteRoot(event.rows, event.done);
   rootRows = event.rows;
   rootComplete = event.done;

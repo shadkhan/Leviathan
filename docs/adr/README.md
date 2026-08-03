@@ -8,15 +8,17 @@ rejected and why, and what it cost.
 |---|---|---|
 | [001](ADR-001-parser-strategy.md) | Parser strategy — hand-written resumable streaming lexer | Accepted · M1 |
 | [002](ADR-002-wasm-boundary.md) | WASM boundary — packed binary row blocks, one transfer per screen | Accepted · M1 |
-| 003 | UI rendering — vanilla TS, hand-rolled recycling list, 150 KB budget | **Not yet written** · closes at M2 |
+| [003](ADR-003-ui-rendering.md) | UI rendering — vanilla TS, hand-rolled recycling list, capped scroll canvas | Accepted · M2 |
 | [004](ADR-004-index-representation.md) | Index representation — 8 bytes per child, byte-offset ids, two tiers | Accepted · M1 |
 | [005](ADR-005-file-access-model.md) | File access — synchronous pull trait, `FileReaderSync` in a Worker | Accepted · M1 |
 
-ADR-003 is deliberately unwritten. Its decision is made and its code is built,
-but the criterion it closes against is a measurement — 60 fps over 100 k rows,
-first paint under 2 s, zero long tasks — and an ADR that claims a performance
-decision was correct without the number is the kind of document this directory
-exists to avoid.
+All five are written. ADR-003 was deliberately held back until M2 had been
+measured in a browser, because an ADR claiming a rendering decision was correct
+without the frame times is the kind of document this directory exists to avoid.
+It now records two criteria that are **missed**, and the four rounds of
+measurement it took to get there — including one optimisation that made things
+worse and was reverted. That is a more useful decision record than a clean pass
+would have been.
 
 ## How these relate to the other documents
 

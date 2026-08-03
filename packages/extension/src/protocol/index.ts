@@ -32,7 +32,23 @@
  * `dist/` after a rebuild is the single most likely cause of a confusing bug in
  * this project, so it fails loudly at boot instead of subtly at use.
  */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
+
+/**
+ * What the engine currently occupies, for the memory readout.
+ *
+ * Requirement 9 is that bounded memory be *visible*: a user handing a viewer a
+ * gigabyte wants to watch it stay bounded, not be told that it does. Every
+ * number here is the engine's own — the index it built and the linear memory it
+ * asked the browser for — rather than a guess from `performance.memory`, which
+ * measures the JS heap of the wrong thread and is not in any standard.
+ */
+export interface Usage {
+  /** Bytes of index held: tier 1 plus every resident expansion. */
+  index: number;
+  /** WASM linear memory, which only ever grows. The engine's true footprint. */
+  heap: number;
+}
 
 /** Input shapes the core can index. Mirrors `leviathan_core::Format`. */
 export type Format = 'single-document' | 'ndjson' | 'empty' | 'unknown';
@@ -133,7 +149,7 @@ export interface Calls {
    */
   expand: {
     params: { offset: number };
-    result: { children: number; done: boolean; complete: boolean };
+    result: { children: number; done: boolean; complete: boolean; usage: Usage };
   };
 
   /**
@@ -238,6 +254,10 @@ export type WorkerEvent =
       stopped?: 'malformed' | 'cancelled' | 'error';
       /** Present when `stopped` is `'error'`. */
       error?: ProtocolError;
+      /** What the engine occupies right now. Carried on the event that already
+       * fires per batch rather than polled, so the readout costs no round
+       * trips of its own. */
+      usage: Usage;
     }
   | {
       kind: 'found';
