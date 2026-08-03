@@ -270,6 +270,22 @@ footer.bar {
   line-height: 1.5;
 }
 
+/* A pressed toggle has to look pressed, not merely hovered — it changes what
+   the tree *contains*, which is the most consequential control in the bar. */
+.toggle[aria-pressed="true"] {
+  background: var(--select);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* While filtering, the row-number gutter shows the record's real position in
+   the file, which is no longer the row's position on screen. Tinting it says
+   so without spending a column on an explanation. */
+.viewport[data-filtered="true"] .tree-row .gutter {
+  color: var(--accent);
+  opacity: 0.75;
+}
+
 /* A row containing a search hit. Marked rather than highlighted inline: a match
    is at a byte offset in the file, and the row's preview is decoded and
    truncated text (C33) — the two do not share a coordinate system, so
@@ -477,10 +493,14 @@ footer.bar {
   text-overflow: ellipsis;
 }
 
+/* The item count, and "indexing…". Pushed to the right so it never competes
+   with the value for the eye, and never truncates the value to fit itself. */
 .tree-row .note {
   flex: none;
+  margin-left: auto;
+  padding-left: 12px;
   color: var(--text-dim);
-  opacity: 0.7;
+  opacity: 0.65;
   font-size: 11px;
 }
 

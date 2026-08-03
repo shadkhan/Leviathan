@@ -58,6 +58,7 @@ const cancel = el<HTMLButtonElement>('cancel');
 const findBar = el('find-bar');
 const findInput = el<HTMLInputElement>('find-input');
 const findStatus = el('find-status');
+const findFilter = el<HTMLButtonElement>('find-filter');
 const findPrev = el<HTMLButtonElement>('find-prev');
 const findNext = el<HTMLButtonElement>('find-next');
 
@@ -189,6 +190,42 @@ let busy = false;
 /** Find results and the position within them. See `search.ts`. */
 const search = new Search();
 
+/** Whether the tree shows only matching records. */
+let filtering = true;
+
+/**
+ * Whether the filtered view is actually in effect.
+ *
+ * Filtering with nothing typed would show an empty tree, and filtering before
+ * the first result arrives would blank a file the user is still looking at. So
+ * the mode is a *preference*, and this is whether it currently applies.
+ */
+function filtered(): boolean {
+  return filtering && search.matchedRows.length > 0;
+}
+
+/**
+ * The real index of a row, given where the tree thinks it is.
+ *
+ * The tree — and everything built on it: sizes, scroll position, selection —
+ * works in *visible* positions. The store, the gutter and the search marks work
+ * in *record* positions. While filtering these differ for root rows only, and
+ * this is the single place they are reconciled. Keeping the translation here
+ * rather than inside `Tree` is what stops filtering from touching the geometry
+ * that virtual scrolling depends on.
+ */
+function recordIndex(at: { branch: Branch; index: number }): number {
+  if (at.branch.container !== null || !filtered()) {
+    return at.index;
+  }
+  return search.matchedRows[at.index] ?? at.index;
+}
+
+/** The row at a tree position, from cache, translating the position first. */
+function rowAtPosition(at: { branch: Branch; index: number }): Row | undefined {
+  return store.rowAt(at.branch.container, recordIndex(at));
+}
+
 // ------------------------------------------------------------------- rows
 
 interface Parts {
@@ -244,7 +281,8 @@ function paintRow(element: HTMLElement, flat: number): void {
   }
 
   const at = tree.locate(flat);
-  const row = store.rowAt(at.branch.container, at.index);
+  const index = recordIndex(at);
+  const row = store.rowAt(at.branch.container, index);
 
   element.dataset['flat'] = String(flat);
   element.id = `row-${flat}`;
@@ -263,14 +301,14 @@ function paintRow(element: HTMLElement, flat: number): void {
   // is resolved against is tier 1 (`rows_of` in the core). A match inside a
   // nested value therefore marks the record that contains it, which is the row
   // the user is looking for anyway.
-  const mark = at.branch.container === null ? search.mark(at.index) : undefined;
+  const mark = at.branch.container === null ? search.mark(index) : undefined;
   if (mark) {
     element.dataset['match'] = mark === 'current' ? 'current' : 'true';
   } else {
     delete element.dataset['match'];
   }
 
-  part.gutter.textContent = at.index.toLocaleString();
+  part.gutter.textContent = index.toLocaleString();
 
   if (!row) {
     // The bytes have not arrived. The row still occupies its place, so nothing
@@ -305,7 +343,7 @@ function paintRow(element: HTMLElement, flat: number): void {
 
   part.key.textContent = row.key === null ? '' : `${JSON.stringify(row.key)}:`;
   part.value.textContent = summarize(row);
-  part.note.textContent = open && !open.complete ? 'indexing…' : '';
+  part.note.textContent = open && !open.complete ? 'indexing…' : countOf(row);
 
   keepIndexed(at);
 }
@@ -326,24 +364,85 @@ function keepIndexed(at: Located): void {
   }
 }
 
-/** The one-line rendering of a value: its text, or its shape and size. */
+/**
+ * The one-line rendering of a value.
+ *
+ * For a container this is its first few fields — `{id: 0, level: "info", …}` —
+ * because a row reading `{ 11 items }` tells you nothing about the record you
+ * are looking at, and a tree you must expand before you can tell one row from
+ * the next is a tree that has not helped yet. The count moves to the right-hand
+ * note, where it is still visible but no longer the only thing there.
+ */
 function summarize(row: Row): string {
   if (row.kind === 'object' || row.kind === 'array') {
-    const [openBracket, closeBracket] = row.kind === 'object' ? ['{', '}'] : ['[', ']'];
+    const [open, close] = row.kind === 'object' ? ['{', '}'] : ['[', ']'];
     if (row.children === 0) {
-      return `${openBracket}${closeBracket}`;
+      return `${open}${close}`;
     }
-    // An inexact count is the budget having run out, not a mystery — C33.
-    const count = `${row.children.toLocaleString()}${row.childrenExact ? '' : '+'}`;
-    return `${openBracket} ${count} ${row.children === 1 ? 'item' : 'items'} ${closeBracket}`;
+    const inner = row.truncated ? `${row.preview}, …` : row.preview;
+    return `${open} ${inner} ${close}`;
   }
   return row.truncated ? `${row.preview}…` : row.preview;
 }
 
+/** The item count for a container, shown dimmed at the end of the row. */
+function countOf(row: Row): string {
+  if (row.kind !== 'object' && row.kind !== 'array') {
+    return '';
+  }
+  if (row.children === 0) {
+    return 'empty';
+  }
+  // An inexact count is the budget having run out, not a mystery — C33.
+  const count = `${row.children.toLocaleString()}${row.childrenExact ? '' : '+'}`;
+  return `${count} ${row.children === 1 ? 'item' : 'items'}`;
+}
+
 // -------------------------------------------------------------- structure
+
+/** Root rows the engine has indexed, and whether it finished. */
+let rootRows = 0;
+let rootComplete = false;
+
+/**
+ * Tell the tree how many rows its root offers.
+ *
+ * Filtered, that is the number of matching records; unfiltered, everything
+ * indexed so far. Nothing else in the tree knows the difference — which is the
+ * point, because scroll geometry and expansion arithmetic have no business
+ * caring whether a search is running.
+ */
+function applyRootCount(): void {
+  if (filtered()) {
+    tree.setCount(tree.root, search.matchedRows.length, !search.scanning);
+  } else {
+    tree.setCount(tree.root, rootRows, rootComplete);
+  }
+  viewport.dataset['filtered'] = filtered() ? 'true' : 'false';
+}
+
+/**
+ * Close every open container.
+ *
+ * Needed whenever root positions *move*, because an open branch remembers which
+ * child of the root it hangs from. Appending new matches never moves anything
+ * already in the list, so this is not called as results stream in — only when
+ * the filter is toggled or a new search replaces the old one.
+ */
+function collapseAll(): void {
+  while (tree.root.children.length > 0) {
+    for (const offset of tree.close(tree.root.children[0] as Branch)) {
+      store.forget(offset);
+    }
+  }
+  if (selection && selection.branch !== tree.root) {
+    select(undefined);
+  }
+}
 
 /** Push the model's current size into the list and refresh what is on screen. */
 function sync(): void {
+  applyRootCount();
   list.setCount(tree.size);
   list.refresh();
   renderCrumbs();
@@ -356,7 +455,7 @@ function isSelected(at: Located): boolean {
 /** Open or close the container at a flat row index. */
 function toggle(flat: number): void {
   const at = tree.locate(flat);
-  const row = store.rowAt(at.branch.container, at.index);
+  const row = store.rowAt(at.branch.container, recordIndex(at));
   if (!row?.expandable) {
     return;
   }
@@ -433,7 +532,8 @@ function selectFlat(flat: number): void {
  * had to see a node to open it, and are fetched individually when they are not.
  */
 async function rowFor(branch: Branch, index: number): Promise<Row | undefined> {
-  const cached = store.rowAt(branch.container, index);
+  const at = recordIndex({ branch, index });
+  const cached = store.rowAt(branch.container, at);
   if (cached) {
     return cached;
   }
@@ -473,7 +573,9 @@ function ancestry(of: Selection): Selection[] {
 /** The full path of a selection, fetching any ancestor rows not in cache. */
 async function pathOf(of: Selection): Promise<string> {
   const steps = await Promise.all(
-    ancestry(of).map(async (step) => segment(await rowFor(step.branch, step.index), step.index)),
+    ancestry(of).map(async (step) =>
+      segment(await rowFor(step.branch, step.index), recordIndex(step)),
+    ),
   );
   return `$${steps.join('')}`;
 }
@@ -494,7 +596,7 @@ function renderCrumbs(): void {
     // Cache-only: the breadcrumb repaints on every arrow key, and a fetch per
     // keystroke to label a crumb the user can already see is a poor trade. A
     // missing row shows as its index, which is what it is.
-    const label = segment(store.rowAt(step.branch.container, step.index), step.index);
+    const label = segment(rowAtPosition(step), recordIndex(step));
     const last = depth === chain.length - 1;
 
     if (last) {
@@ -525,11 +627,11 @@ function renderSelectionInfo(): void {
     return;
   }
 
-  const row = store.rowAt(selection.branch.container, selection.index);
+  const row = rowAtPosition(selection);
   const path = document.createElement('span');
   path.className = 'path';
   path.textContent = `$${ancestry(selection)
-    .map((step) => segment(store.rowAt(step.branch.container, step.index), step.index))
+    .map((step) => segment(rowAtPosition(step), recordIndex(step)))
     .join('')}`;
 
   const facts = document.createElement('span');
@@ -700,11 +802,31 @@ viewport.addEventListener('keydown', (event) => {
 
 // ------------------------------------------------------------------- find
 
+/** Turn filtering on or off, and put the tree back in a consistent state. */
+function setFiltering(on: boolean): void {
+  if (filtering === on) {
+    return;
+  }
+  filtering = on;
+  findFilter.setAttribute('aria-pressed', on ? 'true' : 'false');
+  // Root positions change meaning, so anything open is hanging from an index
+  // that no longer refers to what it did.
+  collapseAll();
+  list.reset();
+  sync();
+}
+
 /** Throw away every result and stop the Worker scanning. */
 function resetSearch(): void {
+  const wasFiltered = filtered();
   search.reset();
+  if (wasFiltered) {
+    // The filtered view is emptying, so every open branch's position is stale.
+    collapseAll();
+    list.reset();
+  }
+  sync();
   renderFind();
-  list.refresh();
 }
 
 /** Start scanning for what is in the box, or clear if it is empty. */
@@ -742,6 +864,10 @@ function onFound(event: FoundEvent): void {
     say('err', describe(new EngineError(event.error)));
   }
 
+  // Rows appended to the filtered view make the tree taller; nothing already in
+  // it moves, so open branches stay valid and no reset is needed.
+  sync();
+
   // Land on the first result as soon as there is one, the way a browser's find
   // does — waiting for a 500 MB scan to finish before moving is the behaviour
   // that makes people think a search is broken.
@@ -759,7 +885,10 @@ function goToMatch(n: number): void {
   if (row === undefined) {
     return;
   }
-  select({ branch: tree.root, index: row });
+  // `row` is a record index; the tree is addressed in visible positions, and
+  // while filtering those are not the same number.
+  const position = filtered() ? search.positionOf(row) : row;
+  select({ branch: tree.root, index: position < 0 ? row : position });
   renderFind();
 }
 
@@ -806,6 +935,10 @@ findInput.addEventListener('keydown', (event) => {
   }
 });
 
+findFilter.addEventListener('click', () => {
+  setFiltering(!filtering);
+});
+
 findNext.addEventListener('click', () => {
   goToMatch(search.at + 1);
 });
@@ -816,10 +949,18 @@ findPrev.addEventListener('click', () => {
 // Ctrl/Cmd+F anywhere on the page, including from inside the tree — the whole
 // point is that it is reachable without leaving the keyboard.
 document.addEventListener('keydown', (event) => {
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f' && !findBar.hidden) {
+  if (findBar.hidden) {
+    return;
+  }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
     event.preventDefault();
     findInput.focus();
     findInput.select();
+    return;
+  }
+  if (event.altKey && event.key.toLowerCase() === 'f') {
+    event.preventDefault();
+    setFiltering(!filtering);
   }
 });
 
@@ -904,7 +1045,8 @@ function onEvent(event: WorkerEvent): void {
   // Tier 1 only ever appends, so a growing root is a taller scrollbar and
   // nothing else — no row on screen moves, and nothing cached is invalidated.
   store.noteRoot(event.rows, event.done);
-  tree.setCount(tree.root, event.rows, event.done);
+  rootRows = event.rows;
+  rootComplete = event.done;
   sync();
 }
 

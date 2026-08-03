@@ -456,6 +456,57 @@ await check('stepping an empty result set does nothing', async () => {
   assert.equal(search.at, -1);
 });
 
+await check('the filtered view is distinct rows, ascending', async () => {
+  // What the tree shows when filtering: one entry per matching record, in file
+  // order, however many hits each record contains.
+  const search = new Search();
+  search.begin();
+  search.accept(found(1, [3, 3, 9]));
+  search.accept(found(1, [9, 14], { matches: 5, done: true }));
+
+  assert.deepEqual([...search.matchedRows], [3, 9, 14]);
+  assert.equal(search.size, 5, 'but all five hits are still navigable');
+});
+
+await check('a record maps to its position in the filtered view', async () => {
+  // The translation the renderer does for every painted row: record 9 is the
+  // second row on screen, not the tenth.
+  const search = new Search();
+  search.begin();
+  search.accept(found(1, [3, 9, 14], { done: true }));
+
+  assert.equal(search.positionOf(3), 0);
+  assert.equal(search.positionOf(9), 1);
+  assert.equal(search.positionOf(14), 2);
+  assert.equal(search.positionOf(10), -1, 'an unmatched record has no position');
+});
+
+await check('positions survive a large result set', async () => {
+  // Binary search, so a wrong bound shows up at scale rather than at three
+  // elements. Every tenth record from 0 to 99 990.
+  const search = new Search();
+  search.begin();
+  const rows = Array.from({ length: 10_000 }, (_, i) => i * 10);
+  search.accept(found(1, rows, { done: true }));
+
+  assert.equal(search.matchedRows.length, 10_000);
+  for (const probe of [0, 1, 500, 9_999]) {
+    assert.equal(search.positionOf(probe * 10), probe, `record ${probe * 10}`);
+  }
+  assert.equal(search.positionOf(5), -1);
+  assert.equal(search.positionOf(99_991), -1);
+});
+
+await check('clearing empties the filtered view', async () => {
+  const search = new Search();
+  search.begin();
+  search.accept(found(1, [1, 2, 3], { done: true }));
+  search.reset();
+
+  assert.deepEqual([...search.matchedRows], []);
+  assert.equal(search.positionOf(1), -1);
+});
+
 await check('the status line never overstates what was found', async () => {
   const search = new Search();
   assert.equal(describeSearch(search, ''), '', 'an empty box says nothing');

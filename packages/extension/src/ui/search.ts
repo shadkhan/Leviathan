@@ -29,6 +29,17 @@ export class Search {
   /** Distinct rows holding at least one match, for painting. */
   #marked = new Set<number>();
 
+  /**
+   * The same rows, distinct and ascending — the filtered view's contents.
+   *
+   * Maintained as results arrive rather than sorted on demand: matches are
+   * found in file order, so a new row is either the one already at the end or
+   * greater than it, and appending is the whole algorithm. Sorting a growing
+   * array on every instalment would be the one part of filtering that scales
+   * with the number of matches rather than with the screen.
+   */
+  #distinct: number[] = [];
+
   /** Index into {@link #rows} of the match the user is standing on. */
   #at = -1;
 
@@ -78,6 +89,31 @@ export class Search {
     return this.#scanning;
   }
 
+  /** Rows holding at least one match, ascending — what a filtered tree shows. */
+  get matchedRows(): readonly number[] {
+    return this.#distinct;
+  }
+
+  /**
+   * Where `row` sits in the filtered view, or `-1`.
+   *
+   * A binary search because this runs once per painted row: with ten thousand
+   * matches a linear scan would be five thousand comparisons per row, sixty
+   * times a second.
+   */
+  positionOf(row: number): number {
+    let low = 0;
+    let high = this.#distinct.length - 1;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      const at = this.#distinct[mid] as number;
+      if (at === row) return mid;
+      if (at < row) low = mid + 1;
+      else high = mid - 1;
+    }
+    return -1;
+  }
+
   /** How a row should be painted, if at all. */
   mark(row: number): 'current' | 'match' | undefined {
     if (!this.#marked.has(row)) {
@@ -97,6 +133,7 @@ export class Search {
     this.#stale = this.#id;
     this.#rows = [];
     this.#marked = new Set();
+    this.#distinct = [];
     this.#at = -1;
     this.#matches = 0;
     this.#pending = 0;
@@ -130,7 +167,10 @@ export class Search {
 
     for (const row of event.rows) {
       this.#rows.push(row);
-      this.#marked.add(row);
+      if (!this.#marked.has(row)) {
+        this.#marked.add(row);
+        this.#distinct.push(row);
+      }
     }
     this.#matches = event.matches;
     this.#pending = event.pending;

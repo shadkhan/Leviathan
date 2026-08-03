@@ -39,7 +39,7 @@
 use crate::index::ChildTable;
 use crate::lexer::{Lexer, TokenKind};
 use crate::source::{ByteRange, SourceError, read_clamped};
-use crate::structure::{Documents, Event, Structure};
+use crate::structure::{ContainerKind, Documents, Event, Structure};
 
 /// What kind of value a row holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -325,10 +325,11 @@ fn materialize_one(offset: u64, bytes: &[u8], keyed: bool, options: &RowOptions)
             // colon after it trailing garbage — reporting every such container
             // as empty. See C44.
             let from = usize::try_from(token.start.saturating_sub(offset)).unwrap_or(usize::MAX);
-            let (children, end) =
-                count_children(token.start, bytes.get(from..).unwrap_or(&[]), options);
-            row.children = children;
-            row.value_end = end;
+            let walked = walk_container(token.start, bytes.get(from..).unwrap_or(&[]), options);
+            row.children = walked.children;
+            row.value_end = walked.end;
+            row.preview = walked.preview;
+            row.truncated |= walked.truncated;
         }
         kind if kind.is_scalar() => {
             row.kind = ValueKind::of_token(kind);
@@ -375,33 +376,142 @@ fn next_token(lexer: &mut Lexer, bytes: &[u8], base: u64) -> Option<crate::lexer
     lexer.finish().ok().flatten()
 }
 
-/// Walk a container to count its direct children, within budget.
+/// Characters of a single key or value inside a container preview.
 ///
-/// Returns the count and, if the container closed inside the budget, its end.
-fn count_children(offset: u64, bytes: &[u8], options: &RowOptions) -> (Count, Option<u64>) {
+/// Short on purpose: the point of the preview is to show *which* fields a record
+/// has, and a row that spends its whole width on one timestamp has answered a
+/// question nobody asked. The whole preview is capped again by
+/// [`RowOptions::preview_chars`].
+const INLINE_CHARS: usize = 24;
+
+/// What one walk of a container's leading bytes learned.
+struct Walked {
+    children: Count,
+    end: Option<u64>,
+    /// The container's contents, rendered inline and without its brackets —
+    /// `id: 0, level: "info"` — for the caller to wrap.
+    preview: String,
+    /// Whether the preview stopped early, either at its budget or the walk's.
+    truncated: bool,
+}
+
+/// Count a container's children *and* compose an inline preview, in one pass.
+///
+/// The count and the preview want exactly the same walk over exactly the same
+/// bytes, so doing them separately would double the cost of the most frequently
+/// executed function in the renderer. Both are bounded by
+/// [`RowOptions::row_budget`], so a 400 MB container still costs what an 8 KiB
+/// one costs — the preview simply stops early and says so.
+///
+/// The preview exists because a row reading `{ 11 items }` tells the user
+/// nothing about the record they are looking at. Every other JSON viewer shows
+/// the first few fields, and a tree that does not is a tree you have to expand
+/// before you can decide whether you wanted to.
+fn walk_container(offset: u64, bytes: &[u8], options: &RowOptions) -> Walked {
     let limit = (options.row_budget as usize).min(bytes.len());
     let mut lexer = Lexer::resuming_at(offset, 1);
     let mut structure = Structure::new(Documents::One);
     let mut seen = 0u64;
 
+    let mut preview = String::new();
+    let mut truncated = false;
+    let mut pending_key: Option<String> = None;
+
+    // Once the preview is full the walk continues — the child count is still
+    // wanted, and it is nearly free from here.
+    let room = |text: &str| text.chars().count() < options.preview_chars;
+
     for token in lexer.feed(&bytes[..limit]) {
         let Ok(token) = token else {
-            return (Count::AtLeast(seen), None);
+            return Walked {
+                children: Count::AtLeast(seen),
+                end: None,
+                preview,
+                truncated: true,
+            };
         };
+
         match structure.push(token) {
             Ok(Some(Event::Close {
                 depth: 0,
                 children,
                 end,
                 ..
-            })) => return (Count::Exact(children), Some(end)),
-            Ok(Some(Event::Open { depth: 1, .. } | Event::Scalar { depth: 1, .. })) => seen += 1,
+            })) => {
+                return Walked {
+                    children: Count::Exact(children),
+                    end: Some(end),
+                    preview,
+                    truncated,
+                };
+            }
+            Ok(Some(Event::Key { token, depth: 1 })) => {
+                if room(&preview) {
+                    let (text, cut) =
+                        unescape(span_of(bytes, offset, token.start, token.end), INLINE_CHARS);
+                    pending_key = Some(if cut { format!("{text}…") } else { text });
+                }
+            }
+            Ok(Some(Event::Scalar { token, depth: 1 })) => {
+                seen += 1;
+                if room(&preview) {
+                    let raw = span_of(bytes, offset, token.start, token.end);
+                    let value = if matches!(token.kind, TokenKind::String { .. }) {
+                        let (text, cut) = unescape(raw, INLINE_CHARS);
+                        format!("\"{text}{}\"", if cut { "…" } else { "" })
+                    } else {
+                        String::from_utf8_lossy(raw).into_owned()
+                    };
+                    push_field(&mut preview, pending_key.take(), &value);
+                } else {
+                    truncated = true;
+                }
+            }
+            Ok(Some(Event::Open { kind, depth: 1, .. })) => {
+                seen += 1;
+                if room(&preview) {
+                    // Nested containers are named, not entered: descending would
+                    // make the cost of a row depend on the shape below it.
+                    let shape = match kind {
+                        ContainerKind::Object => "{…}",
+                        ContainerKind::Array => "[…]",
+                    };
+                    push_field(&mut preview, pending_key.take(), shape);
+                } else {
+                    truncated = true;
+                }
+            }
             Ok(_) => {}
-            Err(_) => return (Count::AtLeast(seen), None),
+            Err(_) => {
+                return Walked {
+                    children: Count::AtLeast(seen),
+                    end: None,
+                    preview,
+                    truncated: true,
+                };
+            }
         }
     }
 
-    (Count::AtLeast(seen), None)
+    // Ran out of budget before the container closed.
+    Walked {
+        children: Count::AtLeast(seen),
+        end: None,
+        preview,
+        truncated: true,
+    }
+}
+
+/// Append `key: value` (or just `value`) to a comma-separated preview.
+fn push_field(preview: &mut String, key: Option<String>, value: &str) {
+    if !preview.is_empty() {
+        preview.push_str(", ");
+    }
+    if let Some(key) = key {
+        preview.push_str(&key);
+        preview.push_str(": ");
+    }
+    preview.push_str(value);
 }
 
 /// A string value larger than the window still has a usable preview.
@@ -637,6 +747,75 @@ mod tests {
     }
 
     // ---- containers -------------------------------------------------------
+
+    #[test]
+    fn a_container_previews_its_contents_rather_than_only_counting_them() {
+        // The complaint this exists for: a row reading `{ 11 items }` says
+        // nothing about the record, so a user has to expand every one to find
+        // out which is which.
+        let source = br#"[{"id":0,"level":"info","tags":["a","b"],"meta":{"n":1}}]"#.to_vec();
+        let table = root_table(&source);
+        let mut src = source.as_slice();
+        let rows = materialize(&table, 0, 1, &mut src, &RowOptions::default()).unwrap();
+
+        assert_eq!(rows[0].kind, ValueKind::Object);
+        assert_eq!(rows[0].children, Count::Exact(4));
+        assert_eq!(
+            rows[0].preview, r#"id: 0, level: "info", tags: […], meta: {…}"#,
+            "keys and scalars inline; nested containers named, not entered"
+        );
+        assert!(!rows[0].truncated);
+    }
+
+    #[test]
+    fn an_array_previews_its_elements_without_keys() {
+        let source = br#"[[1,2,3],["x","y"]]"#.to_vec();
+        let table = root_table(&source);
+        let mut src = source.as_slice();
+        let rows = materialize(&table, 0, 2, &mut src, &RowOptions::default()).unwrap();
+
+        assert_eq!(rows[0].preview, "1, 2, 3");
+        assert_eq!(rows[1].preview, r#""x", "y""#);
+    }
+
+    #[test]
+    fn an_empty_container_previews_as_nothing() {
+        let source = br#"[{},[]]"#.to_vec();
+        let table = root_table(&source);
+        let mut src = source.as_slice();
+        let rows = materialize(&table, 0, 2, &mut src, &RowOptions::default()).unwrap();
+
+        assert_eq!(rows[0].preview, "");
+        assert_eq!(rows[1].preview, "");
+        assert_eq!(rows[0].children, Count::Exact(0));
+    }
+
+    #[test]
+    fn a_container_preview_stops_at_the_width_and_says_so() {
+        // Bounded like every other row cost: a 5 000-key object must paint in
+        // the time a 3-key one does.
+        let mut source = Vec::from(b"[{");
+        for i in 0..500 {
+            if i > 0 {
+                source.push(b',');
+            }
+            source.extend_from_slice(format!("\"key{i}\":\"value{i}\"").as_bytes());
+        }
+        source.extend_from_slice(b"}]");
+
+        let table = root_table(&source);
+        let mut src = source.as_slice();
+        let options = RowOptions::default();
+        let rows = materialize(&table, 0, 1, &mut src, &options).unwrap();
+
+        assert!(rows[0].truncated, "the preview was cut short");
+        assert!(
+            rows[0].preview.chars().count() < options.preview_chars * 2,
+            "and it stayed near its budget: {} chars",
+            rows[0].preview.chars().count()
+        );
+        assert!(rows[0].preview.starts_with("key0: \"value0\""));
+    }
 
     #[test]
     fn containers_report_their_child_counts() {
