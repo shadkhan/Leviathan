@@ -247,6 +247,96 @@ check('the engine pulls ranges rather than being handed the file', () => {
   document.free();
 });
 
+/** Drive a search to completion, collecting the rows each step reports. */
+function findAll(document, needle, caseSensitive = false) {
+  document.findStart(needle, caseSensitive, undefined);
+  const rows = [];
+  let steps = 0;
+  let last;
+  for (;;) {
+    const step = document.findStep();
+    rows.push(...step.rows);
+    last = {
+      matches: step.matches,
+      pending: step.pending,
+      scanned: step.scanned,
+      done: step.done,
+      limited: step.limited,
+    };
+    step.free();
+    steps++;
+    assert.ok(steps < 10_000, 'findStep must terminate');
+    if (last.done) {
+      return { rows, steps, ...last };
+    }
+  }
+}
+
+check('a search finds matches and resolves them to rows', () => {
+  const { document } = open(
+    '{"id":1,"status":"ok"}\n{"id":2,"status":"error"}\n{"id":3,"status":"ok"}\n',
+  );
+  const found = findAll(document, 'error');
+
+  assert.equal(found.matches, 1, 'one match');
+  assert.deepEqual([...found.rows], [1], 'in record 1, not 0 or 2');
+  assert.equal(found.pending, 0, 'nothing beyond the indexed region');
+  assert.ok(!found.limited, 'the cap was not reached');
+  document.free();
+});
+
+check('a search reads the file, not the row previews', () => {
+  // The property C47 exists for. A preview is truncated (C33), so a needle
+  // buried deep in a long record is exactly what a preview-based search would
+  // miss — and would miss silently, reporting "no matches" for a string that
+  // is in the file.
+  const buried = `{"pad":"${'x'.repeat(4000)}","needle":"buried-treasure"}\n`;
+  const { document } = open(`{"a":1}\n${buried}{"b":2}\n`);
+
+  const found = findAll(document, 'buried-treasure');
+  assert.equal(found.matches, 1, 'found 4 kB into a record');
+  assert.deepEqual([...found.rows], [1]);
+  document.free();
+});
+
+check('two hits in one record are two results but one row', () => {
+  const { document } = open('{"a":"xx"}\n{"b":1}\n');
+  const found = findAll(document, 'x');
+  assert.equal(found.matches, 2);
+  assert.deepEqual([...found.rows], [0, 0], 'the same row, reported twice');
+  document.free();
+});
+
+check('search is case-insensitive on request and exact otherwise', () => {
+  const { document } = open('{"v":"Leviathan"}\n{"v":"LEVIATHAN"}\n{"v":"leviathan"}\n');
+
+  assert.equal(findAll(document, 'leviathan', false).matches, 3, 'folded');
+  assert.equal(findAll(document, 'leviathan', true).matches, 1, 'exact');
+  document.free();
+});
+
+check('a needle that is absent scans the whole file and finds nothing', () => {
+  const text = '{"a":1}\n'.repeat(2000);
+  const { document } = open(text);
+  const found = findAll(document, 'not-in-this-file');
+
+  assert.equal(found.matches, 0);
+  assert.equal(found.rows.length, 0);
+  assert.equal(found.scanned, utf8.encode(text).length, 'every byte was read');
+  document.free();
+});
+
+check('starting a new search discards the one before it', () => {
+  // What every keystroke in the find box does.
+  const { document } = open('{"v":"alpha"}\n{"v":"beta"}\n');
+  document.findStart('alpha', false, undefined);
+  const superseded = findAll(document, 'beta');
+
+  assert.equal(superseded.matches, 1, 'only the new needle is counted');
+  assert.deepEqual([...superseded.rows], [1]);
+  document.free();
+});
+
 check('the row layout version is the one the extension bundle expects', () => {
   // The bundle's copy lives in src/protocol/rows.ts. Two constants, one layout;
   // this is the seam where a stale `dist/` shows up as an error rather than as
