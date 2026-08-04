@@ -22,6 +22,12 @@
     <div class="toolbar">
       <button type="button" id="pick">Open file…</button>
       <input type="file" id="file" accept=".json,.ndjson,.jsonl,application/json" hidden />
+      <!--
+        A folder. `webkitdirectory` is non-standard in name only — every engine
+        implements it — and it needs no permission, which is why the folder load
+        path survives where "open URL" did not.
+      -->
+      <input type="file" id="folder" webkitdirectory multiple hidden />
 
       <!--
         Find. Deliberately a plain input and not a query bar: this searches the
@@ -51,6 +57,27 @@
         </button>
         <button type="button" id="find-prev" title="Previous match — Shift+Enter" disabled>↑</button>
         <button type="button" id="find-next" title="Next match — Enter" disabled>↓</button>
+      </div>
+
+      <!--
+        Go to. Accepts what the user already has in hand: a row number, a byte
+        offset from an error message, or a path pasted back from "Copy path".
+        The last is the one that matters — a viewer that hands out `$.a.b[3]`
+        and cannot take it back is only half a tool.
+      -->
+      <div class="goto" id="goto-bar" hidden>
+        <input
+          type="text"
+          id="goto-input"
+          placeholder="Go to… 1234, @byte, $.a.b[2]"
+          aria-label="Go to a row, byte offset, or path"
+          title="A row number (1234), a byte offset (@450000), or a path ($.orders[3].id)"
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <button type="button" id="collapse-all" title="Collapse everything — Alt+C">
+          Collapse all
+        </button>
       </div>
 
       <nav class="crumbs" id="crumbs" aria-label="Path to the selected row"></nav>
@@ -87,7 +114,13 @@
       <div class="drop" id="drop" tabindex="0" role="button">
         <strong>Drop a <code>.json</code> or <code>.ndjson</code> file</strong>
         <span class="or">or</span>
-        <button type="button" id="pick-empty">Choose a file…</button>
+        <span class="choices">
+          <button type="button" id="pick-empty">Choose a file…</button>
+          <button type="button" id="pick-folder">Choose a folder…</button>
+        </span>
+
+        <!-- Populated when a folder holds more than one JSON file. -->
+        <ul class="files" id="file-list" hidden></ul>
         <p class="prose">
           Nothing is uploaded and nothing is read whole. The engine holds a handle to the
           file and pulls byte ranges out of it as you scroll, which is why size does not
@@ -115,6 +148,10 @@
         <dd>first / last row</dd>
         <dt><kbd>Ctrl</kbd><kbd>F</kbd></dt>
         <dd>find in file</dd>
+        <dt><kbd>Ctrl</kbd><kbd>G</kbd></dt>
+        <dd>go to row, byte, or path</dd>
+        <dt><kbd>Alt</kbd><kbd>C</kbd></dt>
+        <dd>collapse all</dd>
         <dt><kbd>Ctrl</kbd><kbd>C</kbd></dt>
         <dd>copy value</dd>
         <dt><kbd>Ctrl</kbd><kbd>⇧</kbd><kbd>C</kbd></dt>

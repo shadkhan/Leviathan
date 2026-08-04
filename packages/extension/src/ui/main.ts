@@ -23,6 +23,7 @@ import { Engine, EngineError } from './engine.js';
 import { VirtualList } from './list.js';
 import { Search, describeSearch } from './search.js';
 import { BLOCK_ROWS, RowStore } from './store.js';
+import { parsePath, type Step } from './path.js';
 import { Tree, type Branch, type Located } from './tree.js';
 
 /** Look up a required element, failing loudly rather than at first null deref. */
@@ -45,6 +46,9 @@ const fileFacts = el('file-facts');
 const pick = el<HTMLButtonElement>('pick');
 const pickEmpty = el<HTMLButtonElement>('pick-empty');
 const filePicker = el<HTMLInputElement>('file');
+const pickFolder = el<HTMLButtonElement>('pick-folder');
+const folderPicker = el<HTMLInputElement>('folder');
+const fileList = el('file-list');
 const drop = el('drop');
 const paste = el<HTMLTextAreaElement>('paste');
 const empty = el('empty');
@@ -55,6 +59,9 @@ const progressFill = el('progress-fill');
 const indexState = el('index-state');
 const cancel = el<HTMLButtonElement>('cancel');
 
+const gotoBar = el('goto-bar');
+const gotoInput = el<HTMLInputElement>('goto-input');
+const collapseAllButton = el<HTMLButtonElement>('collapse-all');
 const findBar = el('find-bar');
 const findInput = el<HTMLInputElement>('find-input');
 const findStatus = el('find-status');
@@ -900,6 +907,160 @@ viewport.addEventListener('keydown', (event) => {
   event.preventDefault();
 });
 
+// ---------------------------------------------------------------- go to
+
+/** How many children a key lookup will scan before giving up. */
+const PATH_SCAN_LIMIT = 200_000;
+
+/**
+ * Find the child index matching `step` within `branch`.
+ *
+ * An index is O(1). A **key** is a scan: the engine indexes where children
+ * start, not what they are called (C1), so the only way to find `"orders"` is
+ * to materialize rows until one matches. Bounded by {@link PATH_SCAN_LIMIT} so
+ * a wrong path against a five-million-element array stops rather than hangs.
+ */
+async function resolveStep(branch: Branch, step: Step): Promise<number | undefined> {
+  if ('index' in step) {
+    return step.index < branch.count ? step.index : undefined;
+  }
+
+  for (let index = 0; index < Math.min(branch.count, PATH_SCAN_LIMIT); index += BLOCK_ROWS) {
+    const { packed } = await engine.call('rows', {
+      container: branch.container,
+      start: index,
+      count: BLOCK_ROWS,
+    });
+    const block = new RowBlock(packed);
+    for (let n = 0; n < block.length; n++) {
+      if (block.row(n).key === step.key) {
+        return index + n;
+      }
+    }
+    if (block.length === 0) {
+      break;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Open the tree down to `steps` and select what it names.
+ *
+ * Each step opens the container it lands in, which is what makes the
+ * destination reachable rather than merely known — the row has to exist in the
+ * tree before the list can scroll to it.
+ */
+async function goToPath(steps: Step[]): Promise<boolean> {
+  // A path addresses records, so a filtered view would be addressing something
+  // else. Showing the whole file is the honest response to being given one.
+  setFiltering(false);
+
+  let branch = tree.root;
+  for (const [depth, step] of steps.entries()) {
+    const index = await resolveStep(branch, step);
+    if (index === undefined) {
+      return false;
+    }
+
+    const last = depth === steps.length - 1;
+    if (last) {
+      select({ branch, index });
+      return true;
+    }
+
+    const row = await rowFor(branch, index);
+    if (!row?.expandable) {
+      return false;
+    }
+    const at: Located = { branch, index, depth };
+    const existing = tree.branchOf(row.offset);
+    if (existing) {
+      branch = existing;
+    } else {
+      const extent = store.extentOf(row.offset);
+      branch = tree.open(at, row.offset, extent.count, extent.complete);
+      store.grow(row.offset, PREFETCH_ROWS);
+      // The next step needs children to look at, so wait for the first batch.
+      for (let spin = 0; spin < 200 && store.extentOf(row.offset).count === 0; spin++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      tree.setCount(branch, store.extentOf(row.offset).count, store.extentOf(row.offset).complete);
+    }
+    sync();
+  }
+  return false;
+}
+
+/** Interpret whatever is in the box and go there. */
+async function goTo(text: string): Promise<boolean> {
+  const trimmed = text.trim();
+  if (trimmed === '') {
+    return false;
+  }
+
+  // `@` means a byte offset — the form an error message or a hex editor gives.
+  if (trimmed.startsWith('@')) {
+    const offset = Number(trimmed.slice(1).replace(/[_,\s]/g, ''));
+    if (!Number.isFinite(offset) || offset < 0) {
+      return false;
+    }
+    const { row } = await engine.call('locate', { offset });
+    if (row === null) {
+      return false;
+    }
+    setFiltering(false);
+    select({ branch: tree.root, index: row });
+    return true;
+  }
+
+  // A bare number is a row.
+  if (/^\d[\d,_\s]*$/.test(trimmed)) {
+    const row = Number(trimmed.replace(/[_,\s]/g, ''));
+    if (!Number.isFinite(row) || row < 0 || row >= tree.root.count) {
+      return false;
+    }
+    setFiltering(false);
+    select({ branch: tree.root, index: row });
+    return true;
+  }
+
+  const steps = parsePath(trimmed);
+  return steps ? goToPath(steps) : false;
+}
+
+gotoInput.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter') {
+    if (event.key === 'Escape') {
+      gotoInput.value = '';
+      delete gotoInput.dataset['state'];
+      viewport.focus();
+    }
+    return;
+  }
+  event.preventDefault();
+  const text = gotoInput.value;
+  void goTo(text)
+    .then((found) => {
+      gotoInput.dataset['state'] = found ? '' : 'bad';
+      say(found ? 'ok' : 'err', found ? `went to ${text.trim()}` : `no such row or path: ${text}`);
+      if (found) {
+        viewport.focus();
+      }
+    })
+    .catch((thrown: unknown) => {
+      gotoInput.dataset['state'] = 'bad';
+      say('err', describe(thrown));
+    });
+});
+
+collapseAllButton.addEventListener('click', () => {
+  collapseAll();
+  list.reset();
+  sync();
+  say('ok', 'collapsed everything');
+});
+
 // ------------------------------------------------------------------- find
 
 /** Turn filtering on or off, and put the tree back in a consistent state. */
@@ -1061,6 +1222,19 @@ document.addEventListener('keydown', (event) => {
   if (event.altKey && event.key.toLowerCase() === 'f') {
     event.preventDefault();
     setFiltering(!filtering);
+    return;
+  }
+  if (event.altKey && event.key.toLowerCase() === 'c') {
+    event.preventDefault();
+    collapseAll();
+    list.reset();
+    sync();
+    return;
+  }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'g') {
+    event.preventDefault();
+    gotoInput.focus();
+    gotoInput.select();
   }
 });
 
@@ -1092,6 +1266,7 @@ async function openFile(source: File): Promise<void> {
     viewport.hidden = false;
     indexing.hidden = false;
     findBar.hidden = false;
+    gotoBar.hidden = false;
     viewport.focus();
     say('', '');
 
@@ -1172,6 +1347,66 @@ for (const button of [pick, pickEmpty]) {
   });
 }
 
+pickFolder.addEventListener('click', () => {
+  folderPicker.click();
+});
+
+/**
+ * Offer the JSON files in a chosen folder.
+ *
+ * A folder picker hands over every file it contains, including the ones nobody
+ * wants — `.DS_Store`, images, a 4 GB video. Filtering by extension keeps the
+ * list to what this can actually open, and sorting by name keeps a directory of
+ * dated exports in the order the names imply.
+ *
+ * One match opens immediately: making someone choose from a list of one is a
+ * click that exists only because the code was easier to write that way.
+ */
+function offerFolder(files: File[]): void {
+  const candidates = files
+    .filter((file) => /\.(json|ndjson|jsonl)$/i.test(file.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  fileList.replaceChildren();
+
+  if (candidates.length === 0) {
+    fileList.hidden = true;
+    say('err', `No .json, .ndjson or .jsonl files in that folder (${files.length} files seen).`);
+    return;
+  }
+  if (candidates.length === 1) {
+    fileList.hidden = true;
+    void openFile(candidates[0] as File);
+    return;
+  }
+
+  for (const file of candidates) {
+    const item = document.createElement('li');
+    const button = document.createElement('button');
+    button.type = 'button';
+
+    const name = document.createElement('span');
+    name.textContent = file.name;
+    const size = document.createElement('span');
+    size.className = 'size';
+    size.textContent = humanBytes(file.size);
+
+    button.append(name, size);
+    button.addEventListener('click', () => {
+      void openFile(file);
+    });
+    item.append(button);
+    fileList.append(item);
+  }
+
+  fileList.hidden = false;
+  say('ok', `${candidates.length} JSON files — choose one.`);
+}
+
+folderPicker.addEventListener('change', () => {
+  offerFolder([...(folderPicker.files ?? [])]);
+});
+
 filePicker.addEventListener('change', () => {
   const chosen = filePicker.files?.[0];
   if (chosen) {
@@ -1180,7 +1415,11 @@ filePicker.addEventListener('change', () => {
 });
 
 drop.addEventListener('click', (event) => {
-  if (event.target !== pickEmpty) {
+  // The drop zone is itself a big click target, but it now contains real
+  // controls — the folder button, and a list of files to choose from. A click
+  // that landed on one of those has already been handled; opening the file
+  // picker on top of it would replace the user's actual choice with a dialog.
+  if (!(event.target as HTMLElement).closest('button')) {
     filePicker.click();
   }
 });

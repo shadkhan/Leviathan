@@ -630,6 +630,20 @@ impl Document {
         self.reported = 0;
     }
 
+    /// Which root row contains byte `offset`, if any.
+    ///
+    /// The join between where the engine thinks and where the user thinks: a
+    /// jump-to-offset, a validation error, and a search hit all arrive as a byte
+    /// and have to become a row before anyone can be sent there. A binary search
+    /// over tier 1 — 21 comparisons on the 500 MB fixture.
+    ///
+    /// `undefined` for a byte before the first row, which is a real answer: a
+    /// document's opening `[` genuinely precedes every row.
+    #[wasm_bindgen(js_name = rowAtByte)]
+    pub fn row_at_byte(&self, offset: f64) -> Option<u32> {
+        self.build.table().locate(offset_of(offset)).map(clamp_u32)
+    }
+
     /// Forget one container's expansion — what a collapse does.
     ///
     /// Safe at any time: a node is addressed by its byte offset, so nothing the

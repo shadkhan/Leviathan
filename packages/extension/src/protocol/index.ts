@@ -197,6 +197,15 @@ export interface Calls {
   /** Abandon the search in progress. Idempotent. */
   findStop: { params: Record<string, never>; result: Record<string, never> };
 
+  /**
+   * Which root row contains a byte offset.
+   *
+   * `null` for a byte before the first row. What "go to offset" is built on,
+   * and what M3's jump-to-error will use to turn a parse failure's byte into a
+   * place in the tree.
+   */
+  locate: { params: { offset: number }; result: { row: number | null } };
+
   /** Close the current file and release every index built over it. */
   close: { params: Record<string, never>; result: Record<string, never> };
 }

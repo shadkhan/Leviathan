@@ -12,7 +12,7 @@
     "typecheck": "pnpm -C packages/extension typecheck",
     "test": "pnpm -C packages/extension test",
     "smoke": "pnpm -C packages/extension smoke",
-    "check": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && pnpm typecheck && pnpm test && pnpm build && pnpm smoke"
+    "check": "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && pnpm build:wasm && pnpm typecheck && pnpm test && pnpm build && pnpm smoke"
   },
   "packageManager": "pnpm@10.33.2"
 }

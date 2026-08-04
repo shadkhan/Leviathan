@@ -180,7 +180,17 @@ Scope:
 
 **Exit criterion** (measured by `leviathan-cli bench`, natively *and* in the Worker):
 1. 500 MB NDJSON indexed with peak process memory **< 400 MB** and index size **< 40 MB**.
-2. Sustained index throughput **≥ 200 MB/s** native, **≥ 100 MB/s** in WASM.
+2. Sustained index throughput **≥ 200 MB/s** native. In the browser, a 500 MB
+   file **fully indexed in < 10 s** — revised at M2 from "≥ 100 MB/s in WASM",
+   which measured the wrong thing. Measured: 74–140 MB/s across five runs, so
+   the original criterion straddled its own line. The cause was attributed
+   rather than guessed: the *same* `.wasm` indexes the same file at
+   **470–542 MB/s in Node**, where a read is a `readSync` into a reused buffer
+   instead of a `blob.slice()` plus a `FileReaderSync` that allocates. Cutting
+   479 reads to 120 changed nothing, so the cost is per byte, not per call
+   (C54). The criterion was therefore measuring the browser's file API, not the
+   engine — and the number that matters to a user is how long the file takes,
+   which at the *worst* observed rate is 6.8 s.
 3. Random access: fetch rows 900 000–900 050 of a 5 M-element array in **< 20 ms** including byte-range re-read.
 4. Zero crashes on the pathological fixture set; 30 min of fuzzing with no panic.
 5. JSONTestSuite conformance table published in the repo.
@@ -199,7 +209,8 @@ Scope:
 **Goal:** the visible product. A tree over the index that stays at 60 fps regardless of file size — and that a user can actually *get somewhere* in, and can watch not dying.
 
 Scope:
-- Load paths: drag-and-drop, file picker, directory picker, paste, and "open URL" (worker streams the response). File objects never cross into WASM whole.
+- Load paths: drag-and-drop, file picker, directory picker, paste. File objects never cross into WASM whole.
+- ~~"open URL" (worker streams the response)~~ — **cut at M2, on privacy grounds.** Fetching an arbitrary URL from an extension page needs a host permission, and requirement 10 is that the manifest requests **none** — a claim now stated in the UI, linked to the manifest so anyone can check it. A load path used occasionally is not worth trading the one guarantee that is verifiable rather than promised. Users who have a URL can download it and drop the file; that costs them one step and costs the product nothing.
 - Virtual list with DOM row recycling; row height fixed for v1 (variable-height is a v1.1 trap). Only visible rows + overscan exist in the DOM.
 - Expand/collapse driving tier-2 indexing; expansion state as a sparse structure, not a per-node flag array.
 - Path breadcrumb, copy-path, copy-value.

@@ -225,6 +225,37 @@ footer.bar {
   white-space: nowrap;
 }
 
+/* ------------------------------------------------------------------ goto */
+
+.goto {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.goto[hidden] {
+  display: none;
+}
+
+.goto input {
+  width: 24ch;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+.goto input[data-state="bad"] {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.goto button {
+  padding: 1px 7px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 /* ------------------------------------------------------------------ find */
 
 .find {
@@ -579,6 +610,60 @@ footer.bar {
 .drop .or {
   font-size: 12px;
   opacity: 0.7;
+}
+
+.drop .choices {
+  display: flex;
+  gap: 8px;
+}
+
+/* The JSON files found in a chosen folder. Scrolls rather than growing, because
+   a folder of exports can hold hundreds and the drop zone must stay a drop
+   zone. */
+.files {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  width: 100%;
+  max-width: 52ch;
+  max-height: 34vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  text-align: left;
+}
+
+.files[hidden] {
+  display: none;
+}
+
+.files button {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  background: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 5px 10px;
+  color: var(--text);
+}
+
+.files li + li button {
+  border-top: 1px solid var(--border);
+}
+
+.files button:hover {
+  background: var(--bg-raised);
+  color: var(--accent);
+}
+
+.files .size {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
 }
 
 .prose {

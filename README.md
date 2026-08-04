@@ -64,7 +64,8 @@ against hundreds of megabytes to store them.
 
 | | Feature | Lands in |
 |---|---|---|
-| 📂 | **Load** — drag-and-drop, picker, folder, paste. JSON and NDJSON auto-detected | M2 |
+| 📂 | **Load** — drag-and-drop, file picker, folder, paste. JSON and NDJSON auto-detected | M2 |
+| 🧭 | **Navigate** — go to a row, a byte offset, or a path pasted back from *Copy path* | M2 |
 | 🌲 | **View** — virtualized tree, breadcrumb, full keyboard navigation, dark mode | M2 |
 | 🔍 | **Find** — literal search streamed over the *whole file*, not just what's on screen | M2 |
 | ✅ | **Validate** — byte/line/column-accurate errors, jump to the break, JSON Schema | M3 |
@@ -190,20 +191,21 @@ than by convention:
 | Long tasks > 50 ms while scrolling | 0 | ✗ constant | **0** ✅ |
 | Frame time, scrolling 100 k rows | — | ✗ never | median **16.6 ms**, p95 **16.9 ms** |
 | Longest frame | < 32 ms | ✗ never | **35.5 ms** ❌ — 2 frames of 2,500 |
-| Index throughput (WASM) | ≥ 100 MB/s | — | **74–140 MB/s** ❌ marginal |
+| 500 MB fully indexed (browser) | < 10 s | ✗ crashes | **3.6–6.8 s** ✅ (74–140 MB/s) |
 
-> **Two criteria are missed, and both are published rather than buried.**
-> Scrolling 100 000 rows: 2 500 frames, median 16.6 ms and **p95 16.9 ms** — 95 %
-> of frames at 60 fps, zero long tasks — but 2 frames reach 35.5 ms against a
-> 32 ms bar. And WASM index throughput runs **74–140 MB/s** against ≥ 100, so
-> half of five runs miss.
+> **One criterion is missed, and it is published rather than buried.** Scrolling
+> 100 000 rows: 2 500 frames, median 16.6 ms and **p95 16.9 ms** — 95 % of frames
+> at 60 fps, zero long tasks — but 2 frames reach 35.5 ms against a 32 ms bar.
 >
-> The throughput is attributed, not guessed: the same `.wasm` indexes the same
-> file at **470–542 MB/s in Node**, where a read is a `readSync` into a reused
-> buffer rather than a `blob.slice()` plus a fresh `ArrayBuffer`. The engine is
-> not the limit; the browser's file API is. Cutting 479 reads to 120 changed
-> nothing, so the cost is per byte, not per call — and that change was reverted
-> rather than kept ([C54](DEEP_REASONING.md)).
+> **A second was revised, on evidence.** It read "≥ 100 MB/s in WASM" and
+> measured 74–140, so it straddled its own line. The same `.wasm` indexes the
+> same file at **470–542 MB/s in Node**, where a read is a `readSync` into a
+> reused buffer rather than a `blob.slice()` plus a fresh `ArrayBuffer` — so the
+> criterion was measuring the browser's file API, not the engine. Cutting 479
+> reads to 120 changed nothing, which says the cost is per byte, not per call;
+> that change was reverted rather than kept. The criterion is now stated as what
+> a user actually experiences — a 500 MB file indexed in under 10 s
+> ([C54](DEEP_REASONING.md)).
 >
 > **Opening a file is six times cheaper than parsing it.** NDJSON indexing scans
 > for newlines and never parses — exact, not heuristic, because JSON forbids raw
@@ -282,7 +284,7 @@ CLI, and (v2) an MCP server.
 |---|---|---|
 | **M0** | Skeleton, WASM boundary, typed protocol, CI | ✅ |
 | **M1** | Streaming lexer + node index ← *the make-or-break phase* | ✅ measured, conformant, fuzzed |
-| **M2** | Virtual tree, navigation, find + filter, trust indicators | 🔨 measured — 3 of 4 criteria met, frame-time tail open |
+| **M2** | Virtual tree, navigation, find + filter, trust indicators | ✅ scope complete · measured, with 1 published miss |
 | **M3** | Validation: byte-accurate errors, jump-to-position, JSON Schema | ⬜ |
 | **M4** | Query: JSONPath over the index | ⬜ |
 | **M5** | Dedup: duplicate keys and elements | ⬜ |

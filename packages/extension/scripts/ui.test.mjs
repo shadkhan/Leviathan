@@ -29,6 +29,7 @@ const bundled = await build({
       export { RowStore, BLOCK_ROWS } from './src/ui/store.js';
       export { Search, describeSearch } from './src/ui/search.js';
       export { RowBlock } from './src/protocol/rows.js';
+      export { parsePath } from './src/ui/path.js';
     `,
     resolveDir: root,
     loader: 'ts',
@@ -42,7 +43,7 @@ const bundled = await build({
 });
 
 const source = bundled.outputFiles[0].text;
-const { Tree, RowStore, BLOCK_ROWS, Search, describeSearch, RowBlock } = await import(
+const { Tree, RowStore, BLOCK_ROWS, Search, describeSearch, RowBlock, parsePath } = await import(
   `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
 );
 
@@ -455,6 +456,44 @@ await check('stepping an empty result set does nothing', async () => {
   assert.equal(search.goTo(0), undefined);
   assert.equal(search.goTo(-1), undefined);
   assert.equal(search.at, -1);
+});
+
+/* ------------------------------------------------------------------ path */
+
+await check('a copied path parses back into the steps that made it', async () => {
+  // The round trip that matters: "Copy path" emits this shape, and pasting it
+  // into "Go to" must land on the same row.
+  assert.deepEqual(parsePath('$.orders[3].id'), [
+    { key: 'orders' },
+    { index: 3 },
+    { key: 'id' },
+  ]);
+  assert.deepEqual(parsePath('$[1595372]'), [{ index: 1595372 }]);
+  assert.deepEqual(parsePath('$["odd key"].x'), [{ key: 'odd key' }, { key: 'x' }]);
+});
+
+await check('a path that has been chewed on the way still parses', async () => {
+  // Paths travel through chat clients and shells before they come back.
+  assert.deepEqual(parsePath('orders[3]'), [{ key: 'orders' }, { index: 3 }]);
+  assert.deepEqual(parsePath('  $.a.b  '), [{ key: 'a' }, { key: 'b' }]);
+  assert.deepEqual(parsePath("$['single quoted']"), [{ key: 'single quoted' }]);
+  assert.deepEqual(parsePath('$["with \\"quotes\\""]'), [{ key: 'with "quotes"' }]);
+});
+
+await check('nonsense is rejected rather than guessed at', async () => {
+  // Returning undefined lets the caller try reading it as a row number; a
+  // guess would navigate somewhere confidently wrong.
+  for (const bad of ['', '$', '$.', '$..a', '$[', '$[abc]', '$[1', '$.a]b', '$["unclosed]']) {
+    assert.equal(parsePath(bad), undefined, `should reject ${JSON.stringify(bad)}`);
+  }
+});
+
+await check('a key that looks like a number is still a key', async () => {
+  // `$.2024` is a member called "2024"; `$[2024]` is the 2025th element. The
+  // bracket is what distinguishes them, and conflating the two would silently
+  // navigate to the wrong place in any object keyed by year or by id.
+  assert.deepEqual(parsePath('$.2024'), [{ key: '2024' }]);
+  assert.deepEqual(parsePath('$[2024]'), [{ index: 2024 }]);
 });
 
 await check('a decoded row is cached, and the cache is the same row', async () => {

@@ -240,6 +240,8 @@ const handlers: Handlers = {
     return {};
   },
 
+  locate: ({ offset }) => ({ row: requireOpen().rowAtByte(offset) ?? null }),
+
   close: () => {
     closeCurrent();
     return {};
