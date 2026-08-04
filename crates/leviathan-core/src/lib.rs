@@ -75,6 +75,7 @@ mod format;
 mod index;
 mod lexer;
 mod rows;
+mod schema;
 mod source;
 mod structure;
 mod validate;
@@ -86,6 +87,7 @@ pub use format::{Format, sniff_format};
 pub use index::{ChildTable, RecordScanner, RootCollector, Tier1};
 pub use lexer::{LexError, LexErrorKind, Lexer, Position, Token, TokenKind, Tokens};
 pub use rows::{Count, Row, RowOptions, ValueKind, materialize};
+pub use schema::{Schema, SchemaError};
 pub use source::{ByteRange, SourceError};
 pub use structure::{
     ContainerKind, DEFAULT_MAX_DEPTH, Documents, Event, StructError, StructErrorKind, Structure,
