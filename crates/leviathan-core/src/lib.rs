@@ -77,6 +77,7 @@ mod lexer;
 mod rows;
 mod source;
 mod structure;
+mod validate;
 
 pub use build::{Build, BuildOptions, Built};
 pub use expand::{DEFAULT_EXPANSION_BUDGET, ExpandOptions, Expansion, ExpansionCache, Stopped};
@@ -89,6 +90,7 @@ pub use source::{ByteRange, SourceError};
 pub use structure::{
     ContainerKind, DEFAULT_MAX_DEPTH, Documents, Event, StructError, StructErrorKind, Structure,
 };
+pub use validate::{Invalid, Validate, ValidateOptions};
 
 /// The version of this crate, as reported across the WASM boundary and by the CLI.
 ///

@@ -886,11 +886,17 @@ impl Lexer {
     }
 
     /// Where the lexer is, as a human-readable position.
+    ///
+    /// The column is saturating. Line tracking only knows about the line the
+    /// lexer is *on*, so an offset from an earlier line — which a caller holding
+    /// a remembered token offset can legitimately ask about — would otherwise
+    /// underflow and panic. Reporting column 1 for such an offset is wrong by a
+    /// few characters; panicking inside a validator is wrong by a whole product.
     const fn position_at(&self, offset: u64) -> Position {
         Position {
             offset,
             line: self.line,
-            column: offset - self.line_start + 1,
+            column: offset.saturating_sub(self.line_start) + 1,
         }
     }
 
