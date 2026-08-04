@@ -36,7 +36,8 @@ mod pack;
 
 use leviathan_core::{
     Build, BuildOptions, Built, ByteRange, ExpandOptions, ExpansionCache, Find, FindOptions,
-    FindStop, Format, RowOptions, SourceError, Stopped, materialize, rows_of, sniff_format,
+    FindStop, Format, RowOptions, SourceError, Stopped, Validate, ValidateOptions, materialize,
+    rows_of, sniff_format,
 };
 use wasm_bindgen::prelude::*;
 
@@ -303,6 +304,81 @@ impl Found {
     }
 }
 
+/// How far validation has got, and what it found.
+///
+/// Errors cross as two parallel payloads rather than as objects: four doubles
+/// each in [`positions`](Validated::positions), and the messages joined into one
+/// string. A malformed 500 MB log can have a thousand errors, and a thousand JS
+/// objects built inside a pass the user is watching is the stall the pass was
+/// made resumable to avoid (C43, one layer up).
+#[wasm_bindgen]
+pub struct Validated {
+    positions: Vec<f64>,
+    messages: String,
+    checked: f64,
+    total: f64,
+    values: f64,
+    errors: u32,
+    done: bool,
+}
+
+#[wasm_bindgen]
+impl Validated {
+    /// Four doubles per error found by *this* step: byte offset, line, column,
+    /// and the row it belongs to — or `-1` for a byte before the first row.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn positions(&self) -> Vec<f64> {
+        self.positions.clone()
+    }
+
+    /// The same errors' messages, separated by U+0001.
+    ///
+    /// A control character rather than a newline: a message could plausibly
+    /// contain a newline one day, and a separator that can appear in the data
+    /// is a parsing bug waiting for the right input.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn messages(&self) -> String {
+        self.messages.clone()
+    }
+
+    /// Bytes examined so far.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn checked(&self) -> f64 {
+        self.checked
+    }
+
+    /// Bytes in the file.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn total(&self) -> f64 {
+        self.total
+    }
+
+    /// Top-level values checked — records, for NDJSON.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn values(&self) -> f64 {
+        self.values
+    }
+
+    /// Errors found in total, which may exceed what this step reported.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn errors(&self) -> u32 {
+        self.errors
+    }
+
+    /// Whether the pass has finished.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.done
+    }
+}
+
 /// One open file, and every index built over it.
 ///
 /// Owns the tier-1 index, the tier-2 expansion cache, and the host's reader.
@@ -320,6 +396,10 @@ pub struct Document {
     find_options: FindOptions,
     /// Matches already handed to the host, so each step reports only new ones.
     reported: usize,
+    validate: Option<Validate>,
+    validate_options: ValidateOptions,
+    /// Errors already handed to the host, for the same reason.
+    validated: usize,
 }
 
 #[wasm_bindgen]
@@ -377,6 +457,9 @@ impl Document {
             find: None,
             find_options: FindOptions::default(),
             reported: 0,
+            validate: None,
+            validate_options: ValidateOptions::default(),
+            validated: 0,
         })
     }
 
@@ -628,6 +711,84 @@ impl Document {
     pub fn find_stop(&mut self) {
         self.find = None;
         self.reported = 0;
+    }
+
+    /// Begin checking the document for well-formedness.
+    ///
+    /// Replaces any pass in progress. Nothing is checked yet — call
+    /// [`validate_step`](Document::validate_step) until it reports `done`.
+    #[wasm_bindgen(js_name = validateStart)]
+    pub fn validate_start(&mut self) {
+        self.validate = Some(Validate::new(self.build.format()));
+        self.validated = 0;
+    }
+
+    /// Check the next batch, and report the errors it found.
+    ///
+    /// Only errors new to *this* step are returned, so a host appends rather
+    /// than replacing a growing list every few milliseconds. Each is resolved to
+    /// a row here, where the index is, rather than in a second round trip.
+    ///
+    /// # Errors
+    ///
+    /// If the host's reader fails. Malformed JSON is the thing being looked
+    /// for, and is never an error of this call.
+    #[wasm_bindgen(js_name = validateStep)]
+    pub fn validate_step(&mut self) -> Result<Validated, JsError> {
+        let Document {
+            source,
+            build,
+            validate,
+            validate_options,
+            validated,
+            ..
+        } = self;
+
+        let Some(pass) = validate.as_mut() else {
+            return Ok(Validated {
+                positions: Vec::new(),
+                messages: String::new(),
+                checked: 0.0,
+                total: 0.0,
+                values: 0.0,
+                errors: 0,
+                done: true,
+            });
+        };
+
+        pass.advance(source, validate_options).map_err(to_js)?;
+
+        let all = pass.errors();
+        let fresh = all.get(*validated..).unwrap_or(&[]);
+        let mut positions = Vec::with_capacity(fresh.len() * 4);
+        let mut messages = String::new();
+
+        for (at, error) in fresh.iter().enumerate() {
+            if at > 0 {
+                messages.push('\u{1}');
+            }
+            messages.push_str(&error.message);
+            positions.push(error.offset as f64);
+            positions.push(error.line as f64);
+            positions.push(error.column as f64);
+            positions.push(
+                build
+                    .table()
+                    .locate(error.offset)
+                    .map_or(-1.0, |row| row as f64),
+            );
+        }
+        *validated = all.len();
+
+        Ok(Validated {
+            positions,
+            messages,
+            checked: pass.checked() as f64,
+            total: source.len as f64,
+            values: pass.values() as f64,
+            errors: clamp_u32(all.len()),
+            done: pass.is_done(),
+        })
     }
 
     /// Which root row contains byte `offset`, if any.

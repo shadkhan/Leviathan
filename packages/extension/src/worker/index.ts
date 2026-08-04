@@ -120,6 +120,9 @@ let cancelled = false;
  */
 let search = 0;
 
+/** Which validation pass is current. Same discipline as `search`. */
+let pass = 0;
+
 const DECODER = new TextDecoder();
 
 function requireOpen(): Document {
@@ -242,11 +245,95 @@ const handlers: Handlers = {
 
   locate: ({ offset }) => ({ row: requireOpen().rowAtByte(offset) ?? null }),
 
+  validate: () => {
+    const document = requireOpen();
+    document.validateStart();
+    void checkToEnd(document, ++pass);
+    return {};
+  },
+
+  validateStop: () => {
+    pass++;
+    return {};
+  },
+
   close: () => {
     closeCurrent();
     return {};
   },
 };
+
+/**
+ * Check the whole file, posting errors as they are found.
+ *
+ * Same shape as the indexing and search loops, for the same reason: a pass over
+ * 500 MB is seconds of work, and a Worker that stops answering during it cannot
+ * be cancelled, cannot report progress, and cannot serve the rows the user is
+ * still scrolling through while it runs.
+ */
+async function checkToEnd(document: Document, id: number): Promise<void> {
+  for (;;) {
+    if (document !== open || id !== pass) {
+      return; // Superseded, stopped, or the file was closed.
+    }
+
+    let done: boolean;
+    try {
+      const step = document.validateStep();
+      try {
+        done = step.done;
+        // Four doubles per error, and the messages in one string — unpacked
+        // here so the UI never sees the wire format.
+        const positions = step.positions;
+        // U+0001, matching `Validated::messages`. Written as an escape rather
+                // than as the character itself, which is invisible in every editor.
+                const messages =
+          step.messages === '' ? [] : step.messages.split('\u0001');
+        const problems = messages.map((message, at) => ({
+          offset: positions[at * 4] ?? 0,
+          line: positions[at * 4 + 1] ?? 1,
+          column: positions[at * 4 + 2] ?? 1,
+          row: (positions[at * 4 + 3] ?? -1) < 0 ? null : (positions[at * 4 + 3] as number),
+          message,
+        }));
+
+        emit({
+          kind: 'validated',
+          pass: id,
+          problems,
+          total: step.errors,
+          checked: step.checked,
+          bytes: step.total,
+          values: step.values,
+          done,
+        });
+      } finally {
+        step.free();
+      }
+    } catch (thrown) {
+      emit({
+        kind: 'validated',
+        pass: id,
+        problems: [],
+        total: 0,
+        checked: 0,
+        bytes: document.size,
+        values: 0,
+        done: true,
+        error: toProtocolError(thrown, 'Validation stopped: the file could not be read.'),
+      });
+      return;
+    }
+
+    if (done) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
+}
 
 /**
  * Scan the file for the current needle, posting results as they are found.
@@ -381,9 +468,10 @@ function halted(document: Document, why: 'cancelled' | 'error'): ProgressEvent {
 function closeCurrent(): void {
   cancelled = true;
   // Any scan in flight belongs to a file that is about to be freed. Bumping the
-  // id is what makes its next iteration return instead of calling into a
+  // ids is what makes their next iteration return instead of calling into a
   // `Document` that no longer exists.
   search++;
+  pass++;
   reader = undefined;
   open?.free();
   // Cleared before the loop can observe it: the loop's first act after a yield

@@ -1321,6 +1321,86 @@ cost: first paint is unaffected, because browsability never waited for indexing.
 tasks" as equivalent to "no dropped frames"; keeping an optimisation that its
 own measurement does not support.
 
+### C55 — Opening and validating are different questions — **validated**
+
+Conformance found it, M3 answered it. `leviathan conformance` reports 185/188 on
+`n_` because three cases — an empty file, a single space, a lone BOM — are
+*opened* rather than refused. That was recorded as a deliberate deviation (C6:
+refusing a zero-byte file is the failure this product replaces), and it was also
+one predicate answering two questions.
+
+They are now two. **Opening** still accepts all three and reports the format as
+`empty`. **Validating** reports `no JSON value: the document is empty` at offset
+0, because RFC 8259 requires a JSON text to contain a value and it does not.
+The three deviations remain, and are now correctly described as deviations *of
+the opener* — the validator does not deviate at all.
+
+The general shape is worth keeping: when a conformance suite and a product
+disagree, the useful question is not "who is right" but "are these the same
+question". Twice now the answer has been no — here, and at C19 where a format
+sniffer and a parser were being asked to agree about a file neither could see
+all of.
+
+### C56 — A rejection without a location is a log line — **validated**
+
+M3's exit criterion asks that every `n_` case locate its failure. The corpus
+carries no ground-truth offsets, so "within ±1 byte of the true failure point"
+cannot be checked against it — and quietly checking something weaker while
+claiming the criterion was met would be worse than saying so.
+
+What *is* checkable across all of them is that a location exists, lies inside
+the file, and is 1-based. `leviathan conformance` now runs the validator over
+every rejected case and reports **198 / 198 locatable**, failing the run if any
+rejection comes back without somewhere to point. Exact offsets are asserted
+separately in the core's own corpus, where the right answer is known because the
+case was written for it.
+
+Building it found a latent panic first: `Lexer::position_at` computed
+`offset - line_start`, which underflows for any offset on an earlier line — a
+public API that panics on a plausible input, in a crate that forbids unsafe and
+fuzzes two billion inputs a run. The fuzzer never reached it because it only
+ever asks about the *current* position; the validator asks about remembered
+token offsets. Now saturating: a column that is wrong by a few characters beats
+a validator that aborts.
+
+### C57 — The dependency was disqualified twice, and only one reason was the one we planned to check — **validated**
+
+SPEC reserved the JSON Schema decision for M3 and named the criterion in
+advance: crate versus hand-rolled, **settled on `.wasm` size delta**, budget
+≤ 250 KB. Deciding it by measurement rather than by taste was the whole point of
+naming it early.
+
+Measured, in a scratch wasm32 cdylib so the workspace stayed clean, with
+`jsonschema` 0.49's HTTP and TLS features **disabled** (its defaults pull
+`reqwest`, `rustls` and `aws-lc-rs` for remote `$ref` resolution — disqualifying
+on their own for a bundled extension):
+
+| | Raw | Gzipped |
+|---|---:|---:|
+| Leviathan today | 60 286 B | 27 074 B |
+| Trivial cdylib + `jsonschema` | 2 448 938 B | 752 336 B |
+| **Delta** | **+2 448 860 B** | **+725 262 B** |
+
+**9.5× the budget**, 41.6× the current binary, and 119 transitive crates. Not
+`wasm-opt`'d, which would take perhaps 15–30 % off and change nothing.
+
+The second reason is the one the criterion would have missed, and it is the
+stronger one. Every mainstream Rust schema validator — this one included —
+validates a **`serde_json::Value`**. The experiment compiled precisely because
+it was handed one. Leviathan never has a `Value`: not materializing the document
+is C1, is ADR-004, and is why a 500 MB file opens at all. Adopting the crate
+would mean building a `Value` per record, or one for an entire 500 MB document —
+reintroducing the failure the product exists to remove, in order to add a
+feature to it.
+
+Worth keeping as a pattern: a pre-declared criterion is what makes a decision
+defensible, and it is not a guarantee that it is the criterion that decides. The
+size number is the one that will be quoted; the `Value` requirement is the one
+that would have made a 250 KB crate the wrong answer too.
+
+*Rules out:* an off-the-shelf schema validator, at any size; validating anything
+by first materializing it.
+
 ---
 
 ## Log of revisions

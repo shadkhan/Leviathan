@@ -78,6 +78,13 @@
         <button type="button" id="collapse-all" title="Collapse everything — Alt+C">
           Collapse all
         </button>
+        <button
+          type="button"
+          id="validate"
+          title="Check every record for syntax errors, and show where they are"
+        >
+          Validate
+        </button>
       </div>
 
       <nav class="crumbs" id="crumbs" aria-label="Path to the selected row"></nav>
@@ -109,6 +116,19 @@
     >
       <div class="canvas" id="canvas"></div>
     </main>
+
+    <!--
+      Syntax errors, with somewhere to go. An error location the user cannot
+      navigate to is a log line, not a feature (requirement 8).
+    -->
+    <section class="problems" id="problems" hidden>
+      <header>
+        <strong id="problems-title">Problems</strong>
+        <span class="state" id="problems-state"></span>
+        <button type="button" id="problems-close" title="Hide">✕</button>
+      </header>
+      <ul id="problems-list"></ul>
+    </section>
 
     <section class="empty" id="empty">
       <div class="drop" id="drop" tabindex="0" role="button">

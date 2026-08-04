@@ -30,7 +30,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use leviathan_core::{Documents, Lexer, Structure};
+use leviathan_core::{Documents, Lexer, Structure, Validate, ValidateOptions, sniff_format};
 
 /// Cases where this engine knowingly disagrees with the corpus.
 ///
@@ -47,9 +47,11 @@ use leviathan_core::{Documents, Lexer, Structure};
 /// export, an interrupted download — would be the "it won't open" failure this
 /// product exists to replace (DEEP_REASONING C6).
 ///
-/// The distinction this glosses over is real and belongs to M3: *opening* an
-/// empty file should succeed, and *validating* one should report "no JSON
-/// value". Today one predicate answers both questions.
+/// These are deviations of the **opener**, and only of the opener. Since M3,
+/// `Validate` answers the other question separately and correctly: an empty
+/// document reports "no JSON value" at offset 0. Opening a zero-byte file and
+/// calling it valid JSON would have been one predicate answering two questions;
+/// now each is answered where it belongs.
 const KNOWN_DEVIATIONS: &[(&str, &str)] = &[
     ("n_structure_no_data.json", "empty input opens as `empty`"),
     (
@@ -75,6 +77,8 @@ struct Case {
     expected: Expect,
     accepted: bool,
     why: Option<String>,
+    /// Why the reported location is unusable, for a rejected case.
+    unlocated: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +97,54 @@ impl Case {
             Expect::Either => false,
         }
     }
+}
+
+/// Whether a rejected case also reported a *usable* location.
+///
+/// M3's exit criterion asks that every `n_` case locate its failure. The corpus
+/// carries no ground-truth offsets, so "within ±1 byte of the true failure
+/// point" cannot be checked automatically against it — what can be checked, on
+/// all 188 of them, is that a location exists, lies inside the file, and is
+/// 1-based. Exact offsets are asserted separately in the core's own corpus,
+/// where the right answer is known because the case was written for it.
+///
+/// Returns the complaint, if the location is unusable.
+fn locates(bytes: &[u8]) -> Option<String> {
+    let mut pass = Validate::new(sniff_format(bytes));
+    let mut source = bytes;
+    let options = ValidateOptions::default();
+    let mut spins = 0;
+
+    while !pass.is_done() {
+        if pass.advance(&mut source, &options).is_err() {
+            return Some("the source could not be read".to_string());
+        }
+        spins += 1;
+        if spins > 10_000 {
+            return Some("validation did not terminate".to_string());
+        }
+    }
+
+    let Some(first) = pass.errors().first() else {
+        return Some("rejected, but validation found nothing to report".to_string());
+    };
+    if first.offset > bytes.len() as u64 {
+        return Some(format!(
+            "offset {} is past the end of a {}-byte file",
+            first.offset,
+            bytes.len()
+        ));
+    }
+    if first.line == 0 || first.column == 0 {
+        return Some(format!(
+            "positions must be 1-based: line {} column {}",
+            first.line, first.column
+        ));
+    }
+    if first.message.is_empty() {
+        return Some("the error has no message".to_string());
+    }
+    None
 }
 
 /// Whether the engine accepts `bytes` as one well-formed JSON document.
@@ -174,11 +226,18 @@ pub fn run(root: &Path) -> io::Result<(String, bool)> {
 
         let bytes = fs::read(&path)?;
         let outcome = accepts(&bytes);
+        // A rejected case owes a location as well as a verdict (M3).
+        let unlocated = if outcome.is_err() {
+            locates(&bytes)
+        } else {
+            None
+        };
         cases.push(Case {
             name,
             expected,
             accepted: outcome.is_ok(),
             why: outcome.err(),
+            unlocated,
         });
     }
 
@@ -242,11 +301,22 @@ fn report(cases: &[Case], dir: &Path) -> (String, bool) {
         accepted_i, total_i
     );
 
+    // M3: a rejection without a location is a log line, not a feature.
+    let rejected = cases.iter().filter(|c| !c.accepted).count();
+    let unlocated: Vec<&Case> = cases.iter().filter(|c| c.unlocated.is_some()).collect();
+    let _ = writeln!(
+        out,
+        "  loc    every rejection locatable        {:>4} / {:<4}",
+        rejected - unlocated.len(),
+        rejected
+    );
+
     if unexpected.is_empty() && stale.is_empty() {
         let _ = writeln!(
             out,
-            "\n  no undocumented disagreements: every y_ case parsed, and every n_\n  \
-             case was refused except the {} documented below.",
+            "\n  no undocumented disagreements: every y_ case parsed, every n_ case\n  \
+             was refused except the {} documented below, and every rejection\n  \
+             reported a location inside the file.",
             deviations.len()
         );
     }
@@ -267,6 +337,24 @@ fn report(cases: &[Case], dir: &Path) -> (String, bool) {
                 )
             };
             let _ = writeln!(out, "    {:<44} {verdict}", case.name);
+        }
+    }
+
+    if !unlocated.is_empty() {
+        let _ = writeln!(
+            out,
+            "
+  {} rejection(s) with no usable location:
+",
+            unlocated.len()
+        );
+        for case in &unlocated {
+            let _ = writeln!(
+                out,
+                "    {:<44} {}",
+                case.name,
+                case.unlocated.as_deref().unwrap_or("")
+            );
         }
     }
 
@@ -309,7 +397,10 @@ fn report(cases: &[Case], dir: &Path) -> (String, bool) {
         }
     }
 
-    (out, unexpected.is_empty() && stale.is_empty())
+    (
+        out,
+        unexpected.is_empty() && stale.is_empty() && unlocated.is_empty(),
+    )
 }
 
 #[cfg(test)]

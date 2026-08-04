@@ -562,6 +562,91 @@ footer.bar {
   opacity: 0.45;
 }
 
+/* -------------------------------------------------------------- problems */
+
+.problems {
+  flex: none;
+  max-height: 34vh;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--bg-raised);
+}
+
+.problems[hidden] {
+  display: none;
+}
+
+.problems header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.problems header .state {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.problems header button {
+  margin-left: auto;
+  padding: 0 6px;
+  font-size: 12px;
+}
+
+.problems ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+}
+
+.problems li button {
+  display: flex;
+  gap: 12px;
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  background: none;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 14px;
+  color: var(--text);
+}
+
+.problems li + li button {
+  border-top: 1px solid var(--border);
+}
+
+.problems li button:hover {
+  background: var(--bg);
+  color: var(--accent);
+}
+
+/* The location is the point of the row, so it leads and never wraps. */
+.problems .where {
+  flex: none;
+  min-width: 16ch;
+  color: var(--err);
+  font-variant-numeric: tabular-nums;
+}
+
+.problems .what {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A row the validator objected to. */
+.tree-row[data-problem="true"] {
+  box-shadow: inset 2px 0 0 var(--err);
+}
+
 /* ----------------------------------------------------------- empty state */
 
 .empty {

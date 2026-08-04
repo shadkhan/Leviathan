@@ -164,7 +164,7 @@ impl Validate {
             let bytes = read_clamped(source, self.cursor, u64::from(options.window))?;
             if bytes.is_empty() {
                 self.close_segment();
-                self.done = true;
+                self.finish_pass();
                 break;
             }
 
@@ -323,6 +323,32 @@ impl Validate {
             });
         }
         Ok(())
+    }
+
+    /// Close the pass, and answer the question opening the file did not.
+    ///
+    /// RFC 8259 requires a JSON text to contain a value, so empty input — an
+    /// empty file, whitespace only, a lone BOM — is **not valid JSON**. The
+    /// viewer opens it anyway and reports the format as `empty`, because
+    /// refusing a zero-byte file is the "it won't open" failure this project
+    /// replaces (C6), and JSONTestSuite records that as one of three deliberate
+    /// deviations.
+    ///
+    /// Those are two different questions and they were being answered by one
+    /// predicate (SPEC §6 open question 6). This is where they part: *opening*
+    /// still succeeds, and *validating* says what is true — there is no JSON
+    /// value here. Said once, at offset 0, rather than as a syntax error, since
+    /// there is no syntax to be wrong.
+    fn finish_pass(&mut self) {
+        if self.values == 0 && self.errors.is_empty() {
+            self.errors.push(Invalid {
+                offset: 0,
+                line: 1,
+                column: 1,
+                message: "no JSON value: the document is empty".to_string(),
+            });
+        }
+        self.done = true;
     }
 
     /// Note an error, and stop if the cap is reached.
@@ -508,13 +534,30 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_document_is_not_an_error_here() {
-        // The open/validate split conformance surfaced: opening an empty file
-        // succeeds, and M3 owes an answer about validity. This layer reports no
-        // *syntax* error, because there is no syntax; saying "no JSON value" is
-        // the caller's to say, once, rather than a parse failure.
-        assert!(validate(b"", Format::Empty).is_valid());
-        assert!(validate(b"   \n ", Format::Empty).is_valid());
-        assert_eq!(validate(b"", Format::Empty).values(), 0);
+    fn an_empty_document_has_no_json_value() {
+        // The open/validate split, settled. RFC 8259 requires a JSON text to
+        // contain a value, so these are invalid — and the viewer still opens
+        // them, which is the deliberate deviation conformance records.
+        for empty in [b"".as_slice(), b"   \n ", b"\xEF\xBB\xBF"] {
+            let pass = validate(empty, Format::Empty);
+            assert!(!pass.is_valid(), "{empty:?} should not validate");
+            assert_eq!(pass.errors().len(), 1);
+            assert_eq!(pass.errors()[0].offset, 0);
+            assert!(pass.errors()[0].message.contains("no JSON value"));
+        }
+    }
+
+    #[test]
+    fn a_stream_of_only_blank_lines_has_no_json_value_either() {
+        let pass = validate(b"\n\n   \n\n", Format::Ndjson);
+        assert!(!pass.is_valid());
+        assert_eq!(pass.values(), 0);
+    }
+
+    #[test]
+    fn one_value_is_enough_to_not_be_empty() {
+        // The boundary of the rule: the check is "no value at all", not "few".
+        assert!(validate(b"null", Format::SingleDocument).is_valid());
+        assert!(validate(b"\n\n{\"a\":1}\n\n", Format::Ndjson).is_valid());
     }
 }

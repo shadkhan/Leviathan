@@ -62,6 +62,12 @@ const cancel = el<HTMLButtonElement>('cancel');
 const gotoBar = el('goto-bar');
 const gotoInput = el<HTMLInputElement>('goto-input');
 const collapseAllButton = el<HTMLButtonElement>('collapse-all');
+const validateButton = el<HTMLButtonElement>('validate');
+const problems = el('problems');
+const problemsTitle = el('problems-title');
+const problemsState = el('problems-state');
+const problemsClose = el<HTMLButtonElement>('problems-close');
+const problemsList = el('problems-list');
 const findBar = el('find-bar');
 const findInput = el<HTMLInputElement>('find-input');
 const findStatus = el('find-status');
@@ -359,6 +365,11 @@ function paintRow(element: HTMLElement, flat: number): void {
   // is resolved against is tier 1 (`rows_of` in the core). A match inside a
   // nested value therefore marks the record that contains it, which is the row
   // the user is looking for anyway.
+  set(part, 'problem', at.branch.container === null && problemRows.has(index) ? 'true' : '', (v) => {
+    if (v === '') delete element.dataset['problem'];
+    else element.dataset['problem'] = v;
+  });
+
   const mark = at.branch.container === null ? search.mark(index) : undefined;
   set(part, 'match', mark ?? '', (v) => {
     if (v === '') {
@@ -907,6 +918,103 @@ viewport.addEventListener('keydown', (event) => {
   event.preventDefault();
 });
 
+// ------------------------------------------------------------ validation
+
+/** Rows the validator objected to, for painting. */
+let problemRows = new Set<number>();
+
+/** Which pass the UI is listening to. Same discipline as search (C48). */
+let validating = 0;
+
+/** How many problems the list will hold before it stops growing. */
+const PROBLEM_ROWS = 500;
+
+function resetProblems(): void {
+  problemRows = new Set();
+  problemsList.replaceChildren();
+  problems.hidden = true;
+}
+
+/** One instalment of validation results. */
+function onValidated(event: Extract<WorkerEvent, { kind: 'validated' }>): void {
+  if (event.pass < validating) {
+    return; // A superseded pass still reporting.
+  }
+  validating = event.pass;
+  problems.hidden = false;
+
+  if (event.error) {
+    say('err', describe(new EngineError(event.error)));
+  }
+
+  for (const problem of event.problems) {
+    if (problem.row !== null) {
+      problemRows.add(problem.row);
+    }
+    if (problemsList.childElementCount >= PROBLEM_ROWS) {
+      continue;
+    }
+
+    const item = document.createElement('li');
+    const button = document.createElement('button');
+    button.type = 'button';
+
+    const where = document.createElement('span');
+    where.className = 'where';
+    where.textContent = `${grouped(problem.line)}:${grouped(problem.column)}`;
+
+    const what = document.createElement('span');
+    what.className = 'what';
+    what.textContent = problem.message;
+
+    button.append(where, what);
+    button.addEventListener('click', () => {
+      // Requirement 8: an error location you can go to. The row was resolved
+      // by the engine, where the index is; if the byte fell before the first
+      // row there is nothing to select, and the offset is still shown.
+      if (problem.row === null) {
+        say('err', `byte ${grouped(problem.offset)} is before the first row`);
+        return;
+      }
+      setFiltering(false);
+      select({ branch: tree.root, index: problem.row });
+      viewport.focus();
+    });
+
+    item.append(button);
+    problemsList.append(item);
+  }
+
+  const checked = event.bytes > 0 ? Math.round((event.checked / event.bytes) * 100) : 100;
+  const capped = event.total > problemsList.childElementCount ? ' (first 500 shown)' : '';
+  problemsTitle.textContent =
+    event.total === 0 && event.done
+      ? 'No syntax errors'
+      : `${grouped(event.total)} ${event.total === 1 ? 'problem' : 'problems'}`;
+  problemsState.textContent = event.done
+    ? `${grouped(event.values)} values checked${capped}`
+    : `checking… ${checked}%`;
+
+  list.refresh();
+}
+
+validateButton.addEventListener('click', () => {
+  resetProblems();
+  problems.hidden = false;
+  problemsTitle.textContent = 'Checking…';
+  problemsState.textContent = '';
+  engine.call('validate', {}).catch((thrown: unknown) => {
+    say('err', describe(thrown));
+  });
+});
+
+problemsClose.addEventListener('click', () => {
+  problems.hidden = true;
+  void engine.call('validateStop', {}).catch(() => {
+    // Nothing to stop is not a failure.
+  });
+});
+
 // ---------------------------------------------------------------- go to
 
 /** How many children a key lookup will scan before giving up. */
@@ -1252,6 +1360,8 @@ async function openFile(source: File): Promise<void> {
   list.setCount(0);
   findInput.value = '';
   resetSearch();
+  resetProblems();
+  validating = 0;
   renderCrumbs();
   renderSelectionInfo();
 
@@ -1293,6 +1403,11 @@ function onEvent(event: WorkerEvent): void {
 
   if (event.kind === 'found') {
     onFound(event);
+    return;
+  }
+
+  if (event.kind === 'validated') {
+    onValidated(event);
     return;
   }
 

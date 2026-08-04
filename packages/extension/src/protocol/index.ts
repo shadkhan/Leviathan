@@ -206,6 +206,19 @@ export interface Calls {
    */
   locate: { params: { offset: number }; result: { row: number | null } };
 
+  /**
+   * Check the document for well-formedness.
+   *
+   * Starts a pass and returns immediately; results arrive as `validated`
+   * events. Uses the same lexer and grammar walk that built the index, so an
+   * error's offset is an offset the tree can be sent to — a validator that
+   * agreed with itself but not with the viewer would be worse than none.
+   */
+  validate: { params: Record<string, never>; result: Record<string, never> };
+
+  /** Abandon the validation pass in progress. Idempotent. */
+  validateStop: { params: Record<string, never>; result: Record<string, never> };
+
   /** Close the current file and release every index built over it. */
   close: { params: Record<string, never>; result: Record<string, never> };
 }
@@ -294,7 +307,39 @@ export type WorkerEvent =
       limited: boolean;
       /** Present if the scan failed; the matches found before it still stand. */
       error?: ProtocolError;
+    }
+  | {
+      kind: 'validated';
+      /** Which pass these belong to, so a superseded one is discarded. */
+      pass: number;
+      /** Errors found by this step only — the UI appends. */
+      problems: Problem[];
+      /** Errors found in total, which may exceed what has been reported. */
+      total: number;
+      /** Bytes checked, and bytes there are. */
+      checked: number;
+      bytes: number;
+      /** Top-level values checked — records, for NDJSON. */
+      values: number;
+      /** Whether the pass has finished. */
+      done: boolean;
+      /** Present if the pass could not read the file. */
+      error?: ProtocolError;
     };
+
+/** One syntax error, with everywhere it can be pointed at. */
+export interface Problem {
+  /** Byte offset of the offending token. */
+  offset: number;
+  /** 1-based line. */
+  line: number;
+  /** 1-based column, in bytes. */
+  column: number;
+  /** The row it belongs to, or `null` for a byte before the first row. */
+  row: number | null;
+  /** What went wrong, phrased for a person. */
+  message: string;
+}
 
 /** The indexing report, named so the Worker can build one before posting it. */
 export type ProgressEvent = Extract<WorkerEvent, { kind: 'progress' }>;

@@ -537,7 +537,7 @@ fn span_of(bytes: &[u8], base: u64, from: u64, to: u64) -> &[u8] {
 /// Unescape a quoted JSON string, truncating at `max_chars`.
 ///
 /// Returns the text and whether it was cut short.
-fn unescape(quoted: &[u8], max_chars: usize) -> (String, bool) {
+pub(crate) fn unescape(quoted: &[u8], max_chars: usize) -> (String, bool) {
     let body = quoted
         .strip_prefix(b"\"")
         .map_or(quoted, |rest| rest.strip_suffix(b"\"").unwrap_or(rest));
