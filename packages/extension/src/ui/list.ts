@@ -63,7 +63,7 @@ export class VirtualList {
   constructor(options: ListOptions) {
     this.#options = { overscan: 8, ...options };
 
-    this.#options.viewport.addEventListener('scroll', () => {
+    this.#options.viewport.addEventListener("scroll", () => {
       this.#schedule();
     });
 
@@ -91,7 +91,10 @@ export class VirtualList {
 
   /** How many rows fit in the viewport, rounded down. */
   get pageSize(): number {
-    return Math.max(1, Math.floor(this.#options.viewport.clientHeight / this.#options.rowHeight));
+    return Math.max(
+      1,
+      Math.floor(this.#options.viewport.clientHeight / this.#options.rowHeight),
+    );
   }
 
   /**
@@ -187,7 +190,8 @@ export class VirtualList {
   }
 
   #update(): void {
-    const { viewport, canvas, rowHeight, overscan, create, paint } = this.#options;
+    const { viewport, canvas, rowHeight, overscan, create, paint } =
+      this.#options;
 
     const totalPx = this.#count * rowHeight;
     canvas.style.height = `${Math.min(totalPx, MAX_CANVAS_PX)}px`;
@@ -211,7 +215,9 @@ export class VirtualList {
     // Rows are positioned relative to the current scroll offset rather than at
     // their absolute pixel, because above the cap those are different numbers.
     // Below the cap the two expressions are identical, so there is one path.
-    const anchor = viewport.scrollTop - (virtualTop - Math.floor(virtualTop / rowHeight) * rowHeight);
+    const anchor =
+      viewport.scrollTop -
+      (virtualTop - Math.floor(virtualTop / rowHeight) * rowHeight);
     const base = Math.floor(virtualTop / rowHeight);
 
     for (const [index, element] of this.#active) {
@@ -241,7 +247,7 @@ export class VirtualList {
     this.#active.delete(index);
     // Kept in the DOM but parked off-screen: removing and re-appending is the
     // expensive half of what a recycling list exists to avoid.
-    element.style.transform = 'translateY(-9999px)';
+    element.style.transform = "translateY(-9999px)";
     this.#pool.push(element);
   }
 }

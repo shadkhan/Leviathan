@@ -30,7 +30,7 @@ import init, {
   echo,
   rowLayoutVersion,
   sniffFormat,
-} from '../wasm/leviathan_wasm.js';
+} from "../wasm/leviathan_wasm.js";
 import {
   PROTOCOL_VERSION,
   toProtocolError,
@@ -41,11 +41,12 @@ import {
   type Params,
   type ProgressEvent,
   type RequestEnvelope,
+  type SearchMode,
   type Usage,
   type Result,
   type WorkerEvent,
-} from '../protocol/index.js';
-import { ROW_LAYOUT_VERSION } from '../protocol/rows.js';
+} from "../protocol/index.js";
+import { ROW_LAYOUT_VERSION } from "../protocol/rows.js";
 
 /**
  * Where the `.wasm` lives, resolved against this script rather than hardcoded.
@@ -55,7 +56,7 @@ import { ROW_LAYOUT_VERSION } from '../protocol/rows.js';
  * Deliberately not a network URL: MV3 rejects remote code, and a JSON viewer
  * that phones home would defeat the reason people reach for a local tool.
  */
-const WASM_URL = new URL('leviathan_wasm_bg.wasm', self.location.href);
+const WASM_URL = new URL("leviathan_wasm_bg.wasm", self.location.href);
 
 /**
  * A synchronous byte-range reader over a `File`, for the engine to pull from.
@@ -82,7 +83,9 @@ class BlobReader {
     if (to <= from) {
       return new Uint8Array(0);
     }
-    return new Uint8Array(this.#reader.readAsArrayBuffer(this.#file.slice(from, to)));
+    return new Uint8Array(
+      this.#reader.readAsArrayBuffer(this.#file.slice(from, to)),
+    );
   }
 }
 
@@ -148,7 +151,9 @@ const handlers: Handlers = {
    * `Format` union and `leviathan_core::Format::as_str` are kept in step by
    * hand; there are four values and they are covered by a test on each side.
    */
-  sniff: ({ prefix }) => ({ format: sniffFormat(new Uint8Array(prefix)) as Format }),
+  sniff: ({ prefix }) => ({
+    format: sniffFormat(new Uint8Array(prefix)) as Format,
+  }),
 
   open: ({ file }) => {
     closeCurrent();
@@ -226,20 +231,41 @@ const handlers: Handlers = {
     return {};
   },
 
-  find: ({ needle, caseSensitive }) => {
+  find: ({ needle, caseSensitive, mode }) => {
     const document = requireOpen();
-    document.findStart(needle, caseSensitive, undefined);
+
+    if (mode === "filter") {
+      try {
+        document.filterSet(needle);
+      } catch (thrown) {
+        // A syntax error is about what was typed, not about the file, so it is
+        // answered here rather than posted later as if it were a finding. The
+        // previous search is still cancelled: the results on screen belong to a
+        // query the user has moved on from either way.
+        search++;
+        document.filterStop();
+        return {
+          error: toProtocolError(thrown, "That filter could not be parsed.")
+            .message,
+        };
+      }
+      document.filterStart();
+    } else {
+      document.findStart(needle, caseSensitive, undefined);
+    }
+
     // Same shape as `open`: the answer is "started", and the results arrive as
     // events. Awaiting the scan would hold the response for as long as it takes
     // to read the file, which on the file this product exists for is the whole
     // point of not doing it that way.
-    void searchToEnd(document, ++search);
-    return {};
+    void searchToEnd(document, ++search, mode);
+    return { error: null };
   },
 
   findStop: () => {
     search++;
     open?.findStop();
+    open?.filterStop();
     return {};
   },
 
@@ -257,6 +283,16 @@ const handlers: Handlers = {
     return {};
   },
 
+  schema: ({ source }) => {
+    const document = requireOpen();
+    const unsupported = document.schemaSet(source);
+    document.schemaStart();
+    void checkToEnd(document, ++pass, true);
+    return {
+      unsupported: unsupported === "" ? [] : unsupported.split("\u0001"),
+    };
+  },
+
   close: () => {
     closeCurrent();
     return {};
@@ -271,7 +307,11 @@ const handlers: Handlers = {
  * be cancelled, cannot report progress, and cannot serve the rows the user is
  * still scrolling through while it runs.
  */
-async function checkToEnd(document: Document, id: number): Promise<void> {
+async function checkToEnd(
+  document: Document,
+  id: number,
+  schema = false,
+): Promise<void> {
   for (;;) {
     if (document !== open || id !== pass) {
       return; // Superseded, stopped, or the file was closed.
@@ -279,26 +319,29 @@ async function checkToEnd(document: Document, id: number): Promise<void> {
 
     let done: boolean;
     try {
-      const step = document.validateStep();
+      const step = schema ? document.schemaStep() : document.validateStep();
       try {
         done = step.done;
         // Four doubles per error, and the messages in one string — unpacked
         // here so the UI never sees the wire format.
         const positions = step.positions;
         // U+0001, matching `Validated::messages`. Written as an escape rather
-                // than as the character itself, which is invisible in every editor.
-                const messages =
-          step.messages === '' ? [] : step.messages.split('\u0001');
+        // than as the character itself, which is invisible in every editor.
+        const messages =
+          step.messages === "" ? [] : step.messages.split("\u0001");
         const problems = messages.map((message, at) => ({
           offset: positions[at * 4] ?? 0,
           line: positions[at * 4 + 1] ?? 1,
           column: positions[at * 4 + 2] ?? 1,
-          row: (positions[at * 4 + 3] ?? -1) < 0 ? null : (positions[at * 4 + 3] as number),
+          row:
+            (positions[at * 4 + 3] ?? -1) < 0
+              ? null
+              : (positions[at * 4 + 3] as number),
           message,
         }));
 
         emit({
-          kind: 'validated',
+          kind: "validated",
           pass: id,
           problems,
           total: step.errors,
@@ -312,7 +355,7 @@ async function checkToEnd(document: Document, id: number): Promise<void> {
       }
     } catch (thrown) {
       emit({
-        kind: 'validated',
+        kind: "validated",
         pass: id,
         problems: [],
         total: 0,
@@ -320,7 +363,10 @@ async function checkToEnd(document: Document, id: number): Promise<void> {
         bytes: document.size,
         values: 0,
         done: true,
-        error: toProtocolError(thrown, 'Validation stopped: the file could not be read.'),
+        error: toProtocolError(
+          thrown,
+          "Validation stopped: the file could not be read.",
+        ),
       });
       return;
     }
@@ -343,7 +389,11 @@ async function checkToEnd(document: Document, id: number): Promise<void> {
  * batches is a Worker that stops answering — including stopping answering the
  * keystroke that would have replaced this search with a better one.
  */
-async function searchToEnd(document: Document, id: number): Promise<void> {
+async function searchToEnd(
+  document: Document,
+  id: number,
+  mode: SearchMode,
+): Promise<void> {
   for (;;) {
     if (document !== open || id !== search) {
       return; // Superseded, stopped, or the file was closed. Say nothing.
@@ -351,11 +401,15 @@ async function searchToEnd(document: Document, id: number): Promise<void> {
 
     let done: boolean;
     try {
-      const step = document.findStep();
+      // Both steppers return the same `Found`, so everything past this line is
+      // identical for a byte scan and a record filter — which is the point of
+      // having reused it.
+      const step =
+        mode === "filter" ? document.filterStep() : document.findStep();
       try {
         done = step.done;
         emit({
-          kind: 'found',
+          kind: "found",
           search: id,
           rows: step.rows,
           matches: step.matches,
@@ -370,7 +424,7 @@ async function searchToEnd(document: Document, id: number): Promise<void> {
       }
     } catch (thrown) {
       emit({
-        kind: 'found',
+        kind: "found",
         search: id,
         rows: new Float64Array(0),
         matches: 0,
@@ -379,7 +433,10 @@ async function searchToEnd(document: Document, id: number): Promise<void> {
         total: document.size,
         done: true,
         limited: false,
-        error: toProtocolError(thrown, 'Search stopped: the file could not be read.'),
+        error: toProtocolError(
+          thrown,
+          "Search stopped: the file could not be read.",
+        ),
       });
       return;
     }
@@ -407,7 +464,7 @@ async function indexToEnd(document: Document): Promise<void> {
       return; // A newer file replaced this one; stop quietly.
     }
     if (cancelled) {
-      emit(halted(document, 'cancelled'));
+      emit(halted(document, "cancelled"));
       return;
     }
 
@@ -417,8 +474,11 @@ async function indexToEnd(document: Document): Promise<void> {
         return document.indexStep();
       } catch (thrown) {
         emit({
-          ...halted(document, 'error'),
-          error: toProtocolError(thrown, 'Indexing stopped: the file could not be read.'),
+          ...halted(document, "error"),
+          error: toProtocolError(
+            thrown,
+            "Indexing stopped: the file could not be read.",
+          ),
         });
         return undefined;
       }
@@ -430,12 +490,12 @@ async function indexToEnd(document: Document): Promise<void> {
     try {
       done = step.done;
       emit({
-        kind: 'progress',
+        kind: "progress",
         consumed: step.consumed,
         total: step.total,
         rows: step.rows,
         done,
-        ...(step.malformed ? { stopped: 'malformed' as const } : {}),
+        ...(step.malformed ? { stopped: "malformed" as const } : {}),
         usage: usage(document),
       });
     } finally {
@@ -453,9 +513,9 @@ async function indexToEnd(document: Document): Promise<void> {
 }
 
 /** The final progress event for an index that stopped without finishing. */
-function halted(document: Document, why: 'cancelled' | 'error'): ProgressEvent {
+function halted(document: Document, why: "cancelled" | "error"): ProgressEvent {
   return {
-    kind: 'progress',
+    kind: "progress",
     consumed: document.indexedBytes,
     total: document.size,
     rows: document.rowCount(null),
@@ -507,8 +567,7 @@ function emit(event: WorkerEvent): void {
  */
 function answer(request: RequestEnvelope): void {
   const handler = handlers[request.method] as
-    | ((params: Params<Method>) => Result<Method>)
-    | undefined;
+    ((params: Params<Method>) => Result<Method>) | undefined;
 
   if (!handler) {
     post({
@@ -516,7 +575,7 @@ function answer(request: RequestEnvelope): void {
       ok: false,
       error: {
         message: `Unknown method "${request.method}".`,
-        cause: 'The UI and Worker bundles are probably from different builds.',
+        cause: "The UI and Worker bundles are probably from different builds.",
       },
     });
     return;
@@ -550,7 +609,7 @@ async function start(): Promise<void> {
     );
   }
 
-  emit({ kind: 'ready', core: coreVersion(), protocol: PROTOCOL_VERSION });
+  emit({ kind: "ready", core: coreVersion(), protocol: PROTOCOL_VERSION });
 }
 
 self.onmessage = (message: MessageEvent<RequestEnvelope>): void => {
@@ -558,10 +617,10 @@ self.onmessage = (message: MessageEvent<RequestEnvelope>): void => {
 
   // Guard the runtime shape: `onmessage` accepts whatever anyone posts, and a
   // malformed message must not take the Worker down with it.
-  if (typeof request?.id !== 'number' || typeof request?.method !== 'string') {
+  if (typeof request?.id !== "number" || typeof request?.method !== "string") {
     emit({
-      kind: 'fatal',
-      error: { message: 'Worker received a message that is not a request.' },
+      kind: "fatal",
+      error: { message: "Worker received a message that is not a request." },
     });
     return;
   }
@@ -571,10 +630,10 @@ self.onmessage = (message: MessageEvent<RequestEnvelope>): void => {
   // response rather than hanging in the client's pending map.
   ready ??= start().catch((thrown: unknown) => {
     emit({
-      kind: 'fatal',
+      kind: "fatal",
       error: toProtocolError(
         thrown,
-        'Could not start the Leviathan engine. The bundled WebAssembly module failed to load.',
+        "Could not start the Leviathan engine. The bundled WebAssembly module failed to load.",
       ),
     });
   });

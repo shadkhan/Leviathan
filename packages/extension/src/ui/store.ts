@@ -23,9 +23,9 @@
  *   that dies on the file it was built for — just more slowly.
  */
 
-import type { NodeId } from '../protocol/index.js';
-import { RowBlock, type Row } from '../protocol/rows.js';
-import type { Engine } from './engine.js';
+import type { NodeId } from "../protocol/index.js";
+import { RowBlock, type Row } from "../protocol/rows.js";
+import type { Engine } from "./engine.js";
 
 /**
  * Rows per fetch.
@@ -88,7 +88,7 @@ export class RowStore {
   readonly #inflight = new Set<string>();
 
   /** What each container is known to hold. */
-  readonly #extents = new Map<number | 'root', Extent>();
+  readonly #extents = new Map<number | "root", Extent>();
 
   /** Expansions currently being driven, by container offset. */
   readonly #growing = new Map<number, Growth>();
@@ -146,13 +146,15 @@ export class RowStore {
 
   /** What the store believes a container holds. */
   extentOf(container: NodeId): Extent {
-    return this.#extents.get(container ?? 'root') ?? { count: 0, complete: false };
+    return (
+      this.#extents.get(container ?? "root") ?? { count: 0, complete: false }
+    );
   }
 
   /** Record the root's extent, which comes from indexing progress, not expansion. */
   noteRoot(count: number, complete: boolean): void {
     const before = this.extentOf(null);
-    this.#extents.set('root', { count, complete });
+    this.#extents.set("root", { count, complete });
     if (count > before.count) {
       this.#invalidateFrom(null, before.count);
       this.#events.rows();
@@ -189,13 +191,16 @@ export class RowStore {
 
     try {
       for (;;) {
-        const step = await this.#engine.call('expand', { offset });
+        const step = await this.#engine.call("expand", { offset });
         if (generation !== this.#generation) {
           return; // Another file was opened while this was in flight.
         }
 
         const before = this.extentOf(offset);
-        this.#extents.set(offset, { count: step.children, complete: step.done });
+        this.#extents.set(offset, {
+          count: step.children,
+          complete: step.done,
+        });
         if (step.children > before.count) {
           this.#invalidateFrom(offset, before.count);
         }
@@ -232,7 +237,7 @@ export class RowStore {
         this.#blocks.delete(key);
       }
     }
-    void this.#engine.call('forget', { offset }).catch(() => {
+    void this.#engine.call("forget", { offset }).catch(() => {
       // Purely advisory: the cache evicts on its own and a byte offset stays
       // valid whether or not its expansion is resident (C36).
     });
@@ -255,7 +260,7 @@ export class RowStore {
       // stale (C36).
       const extent = this.extentOf(container);
       if (
-        typeof container === 'number' &&
+        typeof container === "number" &&
         start + block.length < Math.min(extent.count, start + BLOCK_ROWS)
       ) {
         await this.#rebuild(container, start + BLOCK_ROWS - 1);
@@ -282,7 +287,7 @@ export class RowStore {
   }
 
   async #fetch(container: NodeId, start: number): Promise<RowBlock> {
-    const { packed } = await this.#engine.call('rows', {
+    const { packed } = await this.#engine.call("rows", {
       container,
       start,
       count: BLOCK_ROWS,
@@ -294,7 +299,7 @@ export class RowStore {
   async #rebuild(offset: number, upTo: number): Promise<void> {
     const generation = this.#generation;
     for (;;) {
-      const step = await this.#engine.call('expand', { offset });
+      const step = await this.#engine.call("expand", { offset });
       if (generation !== this.#generation) {
         return;
       }
@@ -307,7 +312,7 @@ export class RowStore {
 
   /** Drop cached blocks that may be short because a container grew. */
   #invalidateFrom(container: NodeId, index: number): void {
-    const prefix = `${container ?? 'r'}:`;
+    const prefix = `${container ?? "r"}:`;
     const from = index - (index % BLOCK_ROWS);
     for (const key of [...this.#blocks.keys()]) {
       if (!key.startsWith(prefix)) {
@@ -332,5 +337,5 @@ export class RowStore {
 }
 
 function keyOf(container: NodeId, start: number): string {
-  return `${container ?? 'r'}:${start}`;
+  return `${container ?? "r"}:${start}`;
 }

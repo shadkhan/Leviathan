@@ -30,7 +30,7 @@
  * small structure, and it is tested as such (`scripts/ui.test.mjs`).
  */
 
-import type { NodeId } from '../protocol/index.js';
+import type { NodeId } from "../protocol/index.js";
 
 /** One container the user has opened, and the state of its subtree. */
 export interface Branch {
@@ -165,7 +165,7 @@ export class Tree {
     const stack = [branch];
     while (stack.length > 0) {
       const node = stack.pop() as Branch;
-      if (typeof node.container === 'number') {
+      if (typeof node.container === "number") {
         this.#open.delete(node.container);
         forgotten.push(node.container);
       }

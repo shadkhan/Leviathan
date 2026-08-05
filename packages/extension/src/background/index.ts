@@ -15,7 +15,7 @@
  * when it is asserted in a store listing.
  */
 
-const VIEWER_PAGE = 'viewer.html';
+const VIEWER_PAGE = "viewer.html";
 
 chrome.action.onClicked.addListener(() => {
   void chrome.tabs.create({ url: chrome.runtime.getURL(VIEWER_PAGE) });

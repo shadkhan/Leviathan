@@ -20,7 +20,7 @@
  *   not, for counting.
  */
 
-import type { FoundEvent } from '../protocol/index.js';
+import type { FoundEvent, SearchMode } from "../protocol/index.js";
 
 export class Search {
   /** Root row indices, ascending, one per match. Duplicates are meaningful. */
@@ -115,11 +115,11 @@ export class Search {
   }
 
   /** How a row should be painted, if at all. */
-  mark(row: number): 'current' | 'match' | undefined {
+  mark(row: number): "current" | "match" | undefined {
     if (!this.#marked.has(row)) {
       return undefined;
     }
-    return this.row === row ? 'current' : 'match';
+    return this.row === row ? "current" : "match";
   }
 
   /**
@@ -204,17 +204,33 @@ export class Search {
  * is printed with a `+`; `pending` is matches with no row, and saying nothing
  * about them would let "1,024 matches" sit above a list of 890.
  */
-export function describeSearch(search: Search, needle: string): string {
+export function describeSearch(
+  search: Search,
+  needle: string,
+  mode: SearchMode = "literal",
+): string {
   if (needle.length === 0) {
-    return '';
+    return "";
   }
   if (search.matches === 0) {
-    return search.scanning ? 'searching…' : 'no matches';
+    if (search.scanning) {
+      return mode === "filter" ? "filtering…" : "searching…";
+    }
+    return mode === "filter" ? "no records match" : "no matches";
   }
 
-  const total = `${search.matches.toLocaleString()}${search.limited ? '+' : ''}`;
-  const position = search.at >= 0 ? `${(search.at + 1).toLocaleString()} of ` : '';
-  const scanning = search.scanning ? '…' : '';
-  const unreachable = search.pending > 0 ? ` · ${search.pending.toLocaleString()} unindexed` : '';
-  return `${position}${total}${scanning}${unreachable}`;
+  // A filter's limit caps the *listing*, not the count, so its `+` means
+  // something different from a find's and is not printed: "12,431 records" is
+  // an exact number even when only the first 10,000 can be visited.
+  const total = `${search.matches.toLocaleString()}${search.limited && mode === "literal" ? "+" : ""}`;
+  const position =
+    search.at >= 0 ? `${(search.at + 1).toLocaleString()} of ` : "";
+  const scanning = search.scanning ? "…" : "";
+  const unreachable =
+    search.pending > 0 ? ` · ${search.pending.toLocaleString()} unindexed` : "";
+  const listed =
+    mode === "filter" && search.limited
+      ? ` · first ${search.size.toLocaleString()} listed`
+      : "";
+  return `${position}${total}${scanning}${unreachable}${listed}`;
 }

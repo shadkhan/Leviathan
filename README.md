@@ -10,17 +10,18 @@ No freezing, no upload, no server.
 [![CI](https://github.com/shadkhan/leviathan/actions/workflows/ci.yml/badge.svg)](https://github.com/shadkhan/leviathan/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/core-rust%20%E2%86%92%20wasm-orange.svg)](crates/leviathan-core)
-[![Tests](https://img.shields.io/badge/tests-280%20rust%20%C2%B7%2019%20ui-green.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-333%20rust%20%C2%B7%2030%20ui%20%C2%B7%2022%20wasm-green.svg)](#testing)
 
 </div>
 
 > [!WARNING]
-> **Status: M2 in progress.** The engine is done and measured, and the viewer now
-> runs: a 500 MB NDJSON file paints its first rows in **141 ms**, indexes at
-> **140 MB/s** in WASM, and scrolls at a median **16.6 ms** per frame with zero
-> long tasks. One criterion is not met — 0.7 % of frames exceed 32 ms
-> ([details](#numbers)). Validation, query, dedup and export are not built.
-> See the [roadmap](#roadmap).
+> **Status: M4 in progress.** The engine, the viewer, validation and filtering
+> all run: a 500 MB NDJSON file paints its first rows in **141 ms**, indexes at
+> **140 MB/s** in WASM, scrolls at a median **16.6 ms** per frame with zero long
+> tasks, and answers `@.level == "error"` over 1.77 M records in **8.7 s** while
+> staying interactive throughout. One criterion is not met — 0.7 % of frames
+> exceed 32 ms ([details](#numbers)). Dedup and export are not built, and the
+> RFC 9535 compliance run is outstanding. See the [roadmap](#roadmap).
 
 ---
 
@@ -69,7 +70,7 @@ against hundreds of megabytes to store them.
 | 🌲 | **View** — virtualized tree, breadcrumb, full keyboard navigation, dark mode | M2 |
 | 🔍 | **Find** — literal search streamed over the *whole file*, not just what's on screen | M2 |
 | ✅ | **Validate** — byte/line/column-accurate errors, jump to the break, JSON Schema | M3 |
-| 🧭 | **Query** — JSONPath (RFC 9535) evaluated against the index, results streamed | M4 |
+| 🧭 | **Filter** — `@.status == "error" && @.latency_ms > 1000`, evaluated against the index, results streamed | M4 |
 | 🧬 | **Dedup** — duplicate keys and elements, reported with both locations | M5 |
 | 📤 | **Export** — JSON, NDJSON, CSV, or the current query result — streamed to disk | M6 |
 
@@ -185,6 +186,9 @@ than by convention:
 | 50 rows from the middle | < 20 ms | ✗ crashes | **68 µs** warm · 132 µs cold ✅ |
 | Same, 5 M-element array | < 20 ms | ✗ crashes | **65–119 µs** ✅ |
 | Whole-file find | — | ✗ crashes | **466 ms** (1.1 GB/s) ✅ |
+| JSON Schema, 50 MB / 177,906 records (WASM) | < 5 s | ✗ crashes | **2.78 s** ✅ |
+| Filter, 500 MB / 1.77 M records (WASM) | — | ✗ crashes | **8.7 s** (55–57 MB/s, ~200 k records/s) |
+| Longest filter step | < 500 ms | ✗ crashes | **52 ms** ✅ |
 | Lex throughput | ≥ 200 MB/s | — | **248–327 MB/s** ✅ |
 | Parse + validate | — | ✗ crashes | 216 MB/s |
 | First rows painted (browser) | < 2 s | ✗ never | **124–143 ms** ✅ |
@@ -206,6 +210,22 @@ than by convention:
 > that change was reverted rather than kept. The criterion is now stated as what
 > a user actually experiences — a 500 MB file indexed in under 10 s
 > ([C54](DEEP_REASONING.md)).
+>
+> **A third was revised, for a different reason.** M4's criterion read "first
+> results in < 500 ms". Across five filters, four returned in 10–21 ms and one
+> took 6.1 s — because its single matching record sits 330 MB into the file, and
+> 330 MB ÷ 57 MB/s is 5.7 s of arithmetic that no engine change touches. A
+> criterion the same code passes or fails depending on where a match happens to
+> be cannot distinguish a good implementation from a bad one, so it is now
+> stated over what the code controls: **no single step over 500 ms**, meaning
+> results stream and nothing blocks ([C62](DEEP_REASONING.md)).
+>
+> **The filter got 2.5× faster by deleting reads, not by parsing better.** The
+> first version read each record's own byte range — 1.77 million reads of ~280
+> bytes — and ran at 23 MB/s. Reading 1 MB windows and reusing one matcher
+> across records took it to 57 MB/s. Notably, the *same* change to the indexer
+> bought nothing (C54): there the cost scaled with bytes, here with calls, and
+> the two look identical from the source ([C60, C61](DEEP_REASONING.md)).
 >
 > **Opening a file is six times cheaper than parsing it.** NDJSON indexing scans
 > for newlines and never parses — exact, not heuristic, because JSON forbids raw
@@ -285,8 +305,8 @@ CLI, and (v2) an MCP server.
 | **M0** | Skeleton, WASM boundary, typed protocol, CI | ✅ |
 | **M1** | Streaming lexer + node index ← *the make-or-break phase* | ✅ measured, conformant, fuzzed |
 | **M2** | Virtual tree, navigation, find + filter, trust indicators | ✅ scope complete · measured, with 1 published miss |
-| **M3** | Validation: byte-accurate errors, jump-to-position, JSON Schema | ⬜ |
-| **M4** | Query: JSONPath over the index | ⬜ |
+| **M3** | Validation: byte-accurate errors, jump-to-position, JSON Schema | ✅ measured — 50 MB schema-checked in 2.78 s |
+| **M4** | Query: JSONPath filters over the index | 🔷 engine + UI done, measured · RFC 9535 suite outstanding |
 | **M5** | Dedup: duplicate keys and elements | ⬜ |
 | **M6** | Export: JSON / NDJSON / CSV, streamed | ⬜ |
 | **M7** | Publish: crates.io + npm + Chrome Web Store | ⬜ |

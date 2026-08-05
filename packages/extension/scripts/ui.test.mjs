@@ -15,12 +15,12 @@
  * artefact, no test framework, no new dependency.
  */
 
-import assert from 'node:assert/strict';
-import { build } from 'esbuild';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import assert from "node:assert/strict";
+import { build } from "esbuild";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const bundled = await build({
   stdin: {
@@ -30,21 +30,31 @@ const bundled = await build({
       export { Search, describeSearch } from './src/ui/search.js';
       export { RowBlock } from './src/protocol/rows.js';
       export { parsePath } from './src/ui/path.js';
+      export { searchModeOf } from './src/protocol/index.js';
     `,
     resolveDir: root,
-    loader: 'ts',
+    loader: "ts",
   },
   bundle: true,
-  format: 'esm',
-  platform: 'neutral',
-  target: 'es2022',
+  format: "esm",
+  platform: "neutral",
+  target: "es2022",
   write: false,
-  logLevel: 'warning',
+  logLevel: "warning",
 });
 
 const source = bundled.outputFiles[0].text;
-const { Tree, RowStore, BLOCK_ROWS, Search, describeSearch, RowBlock, parsePath } = await import(
-  `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
+const {
+  Tree,
+  RowStore,
+  BLOCK_ROWS,
+  Search,
+  describeSearch,
+  RowBlock,
+  parsePath,
+  searchModeOf,
+} = await import(
+  `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`
 );
 
 const checks = [];
@@ -65,12 +75,12 @@ function openAt(tree, branch, index, count, offset = (index + 1) * 1000) {
   return tree.open({ branch, index, depth: 0 }, offset, count, true);
 }
 
-await check('an empty tree has no rows', () => {
+await check("an empty tree has no rows", () => {
   const tree = new Tree();
   assert.equal(tree.size, 0);
 });
 
-await check('a flat root is its own row count', () => {
+await check("a flat root is its own row count", () => {
   const tree = new Tree();
   tree.setCount(tree.root, 5, true);
   assert.equal(tree.size, 5);
@@ -82,12 +92,12 @@ await check('a flat root is its own row count', () => {
   }
 });
 
-await check('opening a container inserts its children after it', () => {
+await check("opening a container inserts its children after it", () => {
   const tree = new Tree();
   tree.setCount(tree.root, 5, true);
   const branch = openAt(tree, tree.root, 2, 3);
 
-  assert.equal(tree.size, 8, '5 root rows plus 3 children');
+  assert.equal(tree.size, 8, "5 root rows plus 3 children");
 
   // 0 1 2 [c0 c1 c2] 3 4
   assert.deepEqual(
@@ -95,24 +105,27 @@ await check('opening a container inserts its children after it', () => {
       const at = tree.locate(i);
       return `${at.depth}:${at.index}`;
     }),
-    ['0:0', '0:1', '0:2', '1:0', '1:1', '1:2', '0:3', '0:4'],
+    ["0:0", "0:1", "0:2", "1:0", "1:1", "1:2", "0:3", "0:4"],
   );
   assert.equal(tree.locate(4).branch, branch);
 });
 
-await check('a container that grows makes the tree taller, not different', () => {
-  const tree = new Tree();
-  tree.setCount(tree.root, 3, true);
-  const branch = openAt(tree, tree.root, 0, 2);
-  assert.equal(tree.size, 5);
+await check(
+  "a container that grows makes the tree taller, not different",
+  () => {
+    const tree = new Tree();
+    tree.setCount(tree.root, 3, true);
+    const branch = openAt(tree, tree.root, 0, 2);
+    assert.equal(tree.size, 5);
 
-  tree.setCount(branch, 10, false);
-  assert.equal(tree.size, 13);
-  assert.equal(tree.locate(11).index, 1, 'the root rows after it moved down');
-  assert.equal(tree.locate(11).depth, 0);
-});
+    tree.setCount(branch, 10, false);
+    assert.equal(tree.size, 13);
+    assert.equal(tree.locate(11).index, 1, "the root rows after it moved down");
+    assert.equal(tree.locate(11).depth, 0);
+  },
+);
 
-await check('nested containers nest', () => {
+await check("nested containers nest", () => {
   const tree = new Tree();
   tree.setCount(tree.root, 2, true);
   const outer = openAt(tree, tree.root, 0, 2, 100);
@@ -126,26 +139,29 @@ await check('nested containers nest', () => {
   assert.equal(tree.locate(5).index, 1);
 });
 
-await check('closing a container takes its whole subtree with it', () => {
+await check("closing a container takes its whole subtree with it", () => {
   const tree = new Tree();
   tree.setCount(tree.root, 2, true);
   const outer = openAt(tree, tree.root, 0, 2, 100);
   openAt(tree, outer, 1, 2, 200);
 
   const forgotten = tree.close(outer);
-  assert.deepEqual(forgotten.sort((a, b) => a - b), [100, 200]);
-  assert.equal(tree.size, 2, 'back to the root rows');
-  assert.equal(tree.branchOf(200), undefined, 'and the descendant is not open');
+  assert.deepEqual(
+    forgotten.sort((a, b) => a - b),
+    [100, 200],
+  );
+  assert.equal(tree.size, 2, "back to the root rows");
+  assert.equal(tree.branchOf(200), undefined, "and the descendant is not open");
 });
 
-await check('the root cannot be closed', () => {
+await check("the root cannot be closed", () => {
   const tree = new Tree();
   tree.setCount(tree.root, 3, true);
   assert.deepEqual(tree.close(tree.root), []);
   assert.equal(tree.size, 3);
 });
 
-await check('flatIndexOf is the exact inverse of locate, everywhere', () => {
+await check("flatIndexOf is the exact inverse of locate, everywhere", () => {
   // The property the virtual list and the keyboard both depend on: a row's
   // position and a row's identity have to be the same fact read two ways. A
   // deterministic pseudo-random tree, so a failure is reproducible.
@@ -162,14 +178,19 @@ await check('flatIndexOf is the exact inverse of locate, everywhere', () => {
     const branch = branches[random(branches.length)];
     if (branch.count === 0) continue;
     const index = random(branch.count);
-    if (branch.children.some((child) => child.indexInParent === index)) continue;
+    if (branch.children.some((child) => child.indexInParent === index))
+      continue;
     branches.push(openAt(tree, branch, index, 1 + random(9), 1000 + opened));
   }
 
-  assert.ok(tree.size > 40, 'the tree actually opened something');
+  assert.ok(tree.size > 40, "the tree actually opened something");
   for (let flat = 0; flat < tree.size; flat++) {
     const at = tree.locate(flat);
-    assert.equal(tree.flatIndexOf(at.branch, at.index), flat, `round trip at ${flat}`);
+    assert.equal(
+      tree.flatIndexOf(at.branch, at.index),
+      flat,
+      `round trip at ${flat}`,
+    );
   }
 });
 
@@ -186,8 +207,8 @@ function pack(rows) {
   const encoder = new TextEncoder();
   const encoded = rows.map((row) => ({
     ...row,
-    keyBytes: encoder.encode(row.key ?? ''),
-    previewBytes: encoder.encode(row.preview ?? ''),
+    keyBytes: encoder.encode(row.key ?? ""),
+    previewBytes: encoder.encode(row.preview ?? ""),
   }));
   const stringBytes = encoded.reduce(
     (total, row) => total + row.keyBytes.length + row.previewBytes.length,
@@ -243,12 +264,12 @@ class FakeEngine {
 
   async call(method, params) {
     this.calls[method] = (this.calls[method] ?? 0) + 1;
-    if (method === 'expand') {
+    if (method === "expand") {
       this.resident = Math.min(this.total, this.resident + this.batch);
       const done = this.resident >= this.total;
       return { children: this.resident, done, complete: done };
     }
-    if (method === 'rows') {
+    if (method === "rows") {
       const end = Math.min(params.start + params.count, this.resident);
       const rows = [];
       for (let i = params.start; i < end; i++) {
@@ -256,7 +277,7 @@ class FakeEngine {
       }
       return { packed: pack(rows) };
     }
-    if (method === 'forget') {
+    if (method === "forget") {
       this.resident = 0;
       return {};
     }
@@ -286,25 +307,32 @@ const events = () => ({
   },
 });
 
-await check('a miss returns undefined, and the row arrives after the round trip', async () => {
-  const engine = new FakeEngine(200);
-  const seen = events();
-  const store = new RowStore(engine, seen);
+await check(
+  "a miss returns undefined, and the row arrives after the round trip",
+  async () => {
+    const engine = new FakeEngine(200);
+    const seen = events();
+    const store = new RowStore(engine, seen);
 
-  store.grow(7, 0);
-  await settle();
+    store.grow(7, 0);
+    await settle();
 
-  assert.equal(store.rowAt(7, 0), undefined, 'the first ask is always a miss');
-  await settle();
+    assert.equal(
+      store.rowAt(7, 0),
+      undefined,
+      "the first ask is always a miss",
+    );
+    await settle();
 
-  const row = store.rowAt(7, 0);
-  assert.ok(row, 'and the second is not');
-  assert.equal(row.preview, '0');
-  assert.equal(row.key, 'k0');
-  assert.ok(seen.repaints > 0, 'and the page was told to repaint');
-});
+    const row = store.rowAt(7, 0);
+    assert.ok(row, "and the second is not");
+    assert.equal(row.preview, "0");
+    assert.equal(row.key, "k0");
+    assert.ok(seen.repaints > 0, "and the page was told to repaint");
+  },
+);
 
-await check('one fetch serves a whole block', async () => {
+await check("one fetch serves a whole block", async () => {
   const engine = new FakeEngine(1000, 1000);
   const store = new RowStore(engine, events());
 
@@ -317,67 +345,85 @@ await check('one fetch serves a whole block', async () => {
   for (let i = 0; i < BLOCK_ROWS; i++) {
     assert.ok(store.rowAt(7, i), `row ${i} is present`);
   }
-  assert.equal(engine.calls.rows, after, 'no further calls for rows in the same block');
+  assert.equal(
+    engine.calls.rows,
+    after,
+    "no further calls for rows in the same block",
+  );
 
   store.rowAt(7, BLOCK_ROWS);
   await settle();
-  assert.equal(engine.calls.rows, after + 1, 'and exactly one for the next block');
+  assert.equal(
+    engine.calls.rows,
+    after + 1,
+    "and exactly one for the next block",
+  );
 });
 
-await check('an evicted container is rebuilt rather than shown as empty', async () => {
-  // The bargain C36 struck: eviction costs work, never addressability. If this
-  // regresses, a collapsed-then-scrolled tree paints blank rows and looks like
-  // data loss.
-  const engine = new FakeEngine(300, 300);
-  const store = new RowStore(engine, events());
+await check(
+  "an evicted container is rebuilt rather than shown as empty",
+  async () => {
+    // The bargain C36 struck: eviction costs work, never addressability. If this
+    // regresses, a collapsed-then-scrolled tree paints blank rows and looks like
+    // data loss.
+    const engine = new FakeEngine(300, 300);
+    const store = new RowStore(engine, events());
 
-  store.grow(7, 0);
-  await settle();
-  assert.equal(store.extentOf(7).count, 300);
+    store.grow(7, 0);
+    await settle();
+    assert.equal(store.extentOf(7).count, 300);
 
-  engine.evict();
-  const expansions = engine.calls.expand;
+    engine.evict();
+    const expansions = engine.calls.expand;
 
-  store.rowAt(7, 260); // a block nothing has fetched yet
-  await settle();
+    store.rowAt(7, 260); // a block nothing has fetched yet
+    await settle();
 
-  assert.ok(engine.calls.expand > expansions, 'the store re-expanded');
-  const row = store.rowAt(7, 260);
-  assert.ok(row, 'and the row is there');
-  assert.equal(row.preview, '260');
-});
+    assert.ok(engine.calls.expand > expansions, "the store re-expanded");
+    const row = store.rowAt(7, 260);
+    assert.ok(row, "and the row is there");
+    assert.equal(row.preview, "260");
+  },
+);
 
-await check('growth stops once the target is covered', async () => {
+await check("growth stops once the target is covered", async () => {
   const engine = new FakeEngine(5_000_000, 10_000);
   const store = new RowStore(engine, events());
 
   store.grow(7, 100);
   await settle(40);
 
-  assert.equal(engine.calls.expand, 1, 'one batch was enough for row 100');
+  assert.equal(engine.calls.expand, 1, "one batch was enough for row 100");
   assert.equal(store.extentOf(7).count, 10_000);
   assert.equal(store.extentOf(7).complete, false);
 });
 
-await check('clearing discards answers to the file that was closed', async () => {
-  const engine = new FakeEngine(200);
-  const seen = events();
-  const store = new RowStore(engine, seen);
+await check(
+  "clearing discards answers to the file that was closed",
+  async () => {
+    const engine = new FakeEngine(200);
+    const seen = events();
+    const store = new RowStore(engine, seen);
 
-  store.grow(7, 0);
-  store.rowAt(7, 0);
-  store.clear();
-  await settle();
+    store.grow(7, 0);
+    store.rowAt(7, 0);
+    store.clear();
+    await settle();
 
-  assert.equal(store.rowAt(7, 0), undefined, 'nothing from the old file was kept');
-  assert.equal(store.extentOf(7).count, 0);
-});
+    assert.equal(
+      store.rowAt(7, 0),
+      undefined,
+      "nothing from the old file was kept",
+    );
+    assert.equal(store.extentOf(7).count, 0);
+  },
+);
 
 /* ---------------------------------------------------------------- Search */
 
 /** One instalment as the Worker posts it. */
 const found = (search, rows, extra = {}) => ({
-  kind: 'found',
+  kind: "found",
   search,
   rows: Float64Array.from(rows),
   matches: extra.matches ?? rows.length,
@@ -388,7 +434,7 @@ const found = (search, rows, extra = {}) => ({
   limited: extra.limited ?? false,
 });
 
-await check('results accumulate across instalments', async () => {
+await check("results accumulate across instalments", async () => {
   const search = new Search();
   search.begin();
 
@@ -397,58 +443,72 @@ await check('results accumulate across instalments', async () => {
 
   assert.equal(search.size, 3);
   assert.equal(search.matches, 3);
-  assert.equal(search.scanning, false, 'the last instalment ended the scan');
+  assert.equal(search.scanning, false, "the last instalment ended the scan");
 });
 
-await check('a superseded search is ignored, and a newer one takes over', async () => {
-  // The property typing depends on: every keystroke starts a scan, and the one
-  // it replaced keeps posting for a frame or two. Accepting those would splice
-  // one search's results into another's list.
-  const search = new Search();
-  search.begin();
-  search.accept(found(1, [1, 2, 3]));
-  assert.equal(search.size, 3);
+await check(
+  "a superseded search is ignored, and a newer one takes over",
+  async () => {
+    // The property typing depends on: every keystroke starts a scan, and the one
+    // it replaced keeps posting for a frame or two. Accepting those would splice
+    // one search's results into another's list.
+    const search = new Search();
+    search.begin();
+    search.accept(found(1, [1, 2, 3]));
+    assert.equal(search.size, 3);
 
-  search.begin(); // the next keystroke
-  assert.equal(search.accept(found(1, [4])), false, 'the old scan is not ours');
-  assert.equal(search.size, 0);
+    search.begin(); // the next keystroke
+    assert.equal(
+      search.accept(found(1, [4])),
+      false,
+      "the old scan is not ours",
+    );
+    assert.equal(search.size, 0);
 
-  assert.equal(search.accept(found(2, [8])), true, 'the new one is');
-  assert.equal(search.size, 1);
-  assert.equal(search.row, undefined, 'and nothing has been jumped to yet');
-});
+    assert.equal(search.accept(found(2, [8])), true, "the new one is");
+    assert.equal(search.size, 1);
+    assert.equal(search.row, undefined, "and nothing has been jumped to yet");
+  },
+);
 
-await check('a row that matches twice is two results but one mark', async () => {
-  // "3 of 12" has to agree with pressing Enter twelve times, and a row can only
-  // be painted once.
-  const search = new Search();
-  search.begin();
-  search.accept(found(1, [5, 5, 9], { matches: 3, done: true }));
+await check(
+  "a row that matches twice is two results but one mark",
+  async () => {
+    // "3 of 12" has to agree with pressing Enter twelve times, and a row can only
+    // be painted once.
+    const search = new Search();
+    search.begin();
+    search.accept(found(1, [5, 5, 9], { matches: 3, done: true }));
 
-  assert.equal(search.size, 3, 'three results');
-  assert.equal(search.mark(5), 'match');
-  assert.equal(search.mark(9), 'match');
-  assert.equal(search.mark(6), undefined);
+    assert.equal(search.size, 3, "three results");
+    assert.equal(search.mark(5), "match");
+    assert.equal(search.mark(9), "match");
+    assert.equal(search.mark(6), undefined);
 
-  assert.equal(search.goTo(0), 5);
-  assert.equal(search.mark(5), 'current');
-  assert.equal(search.goTo(1), 5, 'the second hit is in the same row');
-  assert.equal(search.goTo(2), 9);
-  assert.equal(search.mark(5), 'match', 'which is no longer the current one');
-});
+    assert.equal(search.goTo(0), 5);
+    assert.equal(search.mark(5), "current");
+    assert.equal(search.goTo(1), 5, "the second hit is in the same row");
+    assert.equal(search.goTo(2), 9);
+    assert.equal(search.mark(5), "match", "which is no longer the current one");
+  },
+);
 
-await check('stepping wraps at both ends', async () => {
+await check("stepping wraps at both ends", async () => {
   const search = new Search();
   search.begin();
   search.accept(found(1, [2, 4, 6], { done: true }));
 
   assert.equal(search.goTo(0), 2);
-  assert.equal(search.goTo(3), 2, 'past the last result comes back to the first');
-  assert.equal(search.goTo(-1), 6, 'and back from the first is the last');
+  assert.equal(
+    search.goTo(3),
+    2,
+    "past the last result comes back to the first",
+  );
+  assert.equal(search.goTo(-1), 6, "and back from the first is the last");
   assert.equal(search.at, 2);
 });
 
-await check('stepping an empty result set does nothing', async () => {
+await check("stepping an empty result set does nothing", async () => {
   const search = new Search();
   search.begin();
   search.accept(found(1, [], { matches: 0, done: true }));
@@ -460,58 +520,83 @@ await check('stepping an empty result set does nothing', async () => {
 
 /* ------------------------------------------------------------------ path */
 
-await check('a copied path parses back into the steps that made it', async () => {
-  // The round trip that matters: "Copy path" emits this shape, and pasting it
-  // into "Go to" must land on the same row.
-  assert.deepEqual(parsePath('$.orders[3].id'), [
-    { key: 'orders' },
-    { index: 3 },
-    { key: 'id' },
-  ]);
-  assert.deepEqual(parsePath('$[1595372]'), [{ index: 1595372 }]);
-  assert.deepEqual(parsePath('$["odd key"].x'), [{ key: 'odd key' }, { key: 'x' }]);
-});
+await check(
+  "a copied path parses back into the steps that made it",
+  async () => {
+    // The round trip that matters: "Copy path" emits this shape, and pasting it
+    // into "Go to" must land on the same row.
+    assert.deepEqual(parsePath("$.orders[3].id"), [
+      { key: "orders" },
+      { index: 3 },
+      { key: "id" },
+    ]);
+    assert.deepEqual(parsePath("$[1595372]"), [{ index: 1595372 }]);
+    assert.deepEqual(parsePath('$["odd key"].x'), [
+      { key: "odd key" },
+      { key: "x" },
+    ]);
+  },
+);
 
-await check('a path that has been chewed on the way still parses', async () => {
+await check("a path that has been chewed on the way still parses", async () => {
   // Paths travel through chat clients and shells before they come back.
-  assert.deepEqual(parsePath('orders[3]'), [{ key: 'orders' }, { index: 3 }]);
-  assert.deepEqual(parsePath('  $.a.b  '), [{ key: 'a' }, { key: 'b' }]);
-  assert.deepEqual(parsePath("$['single quoted']"), [{ key: 'single quoted' }]);
-  assert.deepEqual(parsePath('$["with \\"quotes\\""]'), [{ key: 'with "quotes"' }]);
+  assert.deepEqual(parsePath("orders[3]"), [{ key: "orders" }, { index: 3 }]);
+  assert.deepEqual(parsePath("  $.a.b  "), [{ key: "a" }, { key: "b" }]);
+  assert.deepEqual(parsePath("$['single quoted']"), [{ key: "single quoted" }]);
+  assert.deepEqual(parsePath('$["with \\"quotes\\""]'), [
+    { key: 'with "quotes"' },
+  ]);
 });
 
-await check('nonsense is rejected rather than guessed at', async () => {
+await check("nonsense is rejected rather than guessed at", async () => {
   // Returning undefined lets the caller try reading it as a row number; a
   // guess would navigate somewhere confidently wrong.
-  for (const bad of ['', '$', '$.', '$..a', '$[', '$[abc]', '$[1', '$.a]b', '$["unclosed]']) {
-    assert.equal(parsePath(bad), undefined, `should reject ${JSON.stringify(bad)}`);
+  for (const bad of [
+    "",
+    "$",
+    "$.",
+    "$..a",
+    "$[",
+    "$[abc]",
+    "$[1",
+    "$.a]b",
+    '$["unclosed]',
+  ]) {
+    assert.equal(
+      parsePath(bad),
+      undefined,
+      `should reject ${JSON.stringify(bad)}`,
+    );
   }
 });
 
-await check('a key that looks like a number is still a key', async () => {
+await check("a key that looks like a number is still a key", async () => {
   // `$.2024` is a member called "2024"; `$[2024]` is the 2025th element. The
   // bracket is what distinguishes them, and conflating the two would silently
   // navigate to the wrong place in any object keyed by year or by id.
-  assert.deepEqual(parsePath('$.2024'), [{ key: '2024' }]);
-  assert.deepEqual(parsePath('$[2024]'), [{ index: 2024 }]);
+  assert.deepEqual(parsePath("$.2024"), [{ key: "2024" }]);
+  assert.deepEqual(parsePath("$[2024]"), [{ index: 2024 }]);
 });
 
-await check('a decoded row is cached, and the cache is the same row', async () => {
-  // Painting repeats: a scrolling list asks for the same row on consecutive
-  // frames, and decoding allocates an object and two strings each time. The
-  // cache must be transparent — same values, and cheap enough to be worth it.
-  const block = new RowBlock(pack([{ offset: 40, key: 'k', preview: 'v' }]));
+await check(
+  "a decoded row is cached, and the cache is the same row",
+  async () => {
+    // Painting repeats: a scrolling list asks for the same row on consecutive
+    // frames, and decoding allocates an object and two strings each time. The
+    // cache must be transparent — same values, and cheap enough to be worth it.
+    const block = new RowBlock(pack([{ offset: 40, key: "k", preview: "v" }]));
 
-  const first = block.row(0);
-  const second = block.row(0);
+    const first = block.row(0);
+    const second = block.row(0);
 
-  assert.equal(first, second, 'the same object comes back');
-  assert.equal(second.key, 'k');
-  assert.equal(second.preview, 'v');
-  assert.equal(second.offset, 40);
-});
+    assert.equal(first, second, "the same object comes back");
+    assert.equal(second.key, "k");
+    assert.equal(second.preview, "v");
+    assert.equal(second.offset, 40);
+  },
+);
 
-await check('the filtered view is distinct rows, ascending', async () => {
+await check("the filtered view is distinct rows, ascending", async () => {
   // What the tree shows when filtering: one entry per matching record, in file
   // order, however many hits each record contains.
   const search = new Search();
@@ -520,10 +605,10 @@ await check('the filtered view is distinct rows, ascending', async () => {
   search.accept(found(1, [9, 14], { matches: 5, done: true }));
 
   assert.deepEqual([...search.matchedRows], [3, 9, 14]);
-  assert.equal(search.size, 5, 'but all five hits are still navigable');
+  assert.equal(search.size, 5, "but all five hits are still navigable");
 });
 
-await check('a record maps to its position in the filtered view', async () => {
+await check("a record maps to its position in the filtered view", async () => {
   // The translation the renderer does for every painted row: record 9 is the
   // second row on screen, not the tenth.
   const search = new Search();
@@ -533,10 +618,14 @@ await check('a record maps to its position in the filtered view', async () => {
   assert.equal(search.positionOf(3), 0);
   assert.equal(search.positionOf(9), 1);
   assert.equal(search.positionOf(14), 2);
-  assert.equal(search.positionOf(10), -1, 'an unmatched record has no position');
+  assert.equal(
+    search.positionOf(10),
+    -1,
+    "an unmatched record has no position",
+  );
 });
 
-await check('positions survive a large result set', async () => {
+await check("positions survive a large result set", async () => {
   // Binary search, so a wrong bound shows up at scale rather than at three
   // elements. Every tenth record from 0 to 99 990.
   const search = new Search();
@@ -552,7 +641,7 @@ await check('positions survive a large result set', async () => {
   assert.equal(search.positionOf(99_991), -1);
 });
 
-await check('clearing empties the filtered view', async () => {
+await check("clearing empties the filtered view", async () => {
   const search = new Search();
   search.begin();
   search.accept(found(1, [1, 2, 3], { done: true }));
@@ -562,31 +651,92 @@ await check('clearing empties the filtered view', async () => {
   assert.equal(search.positionOf(1), -1);
 });
 
-await check('the status line never overstates what was found', async () => {
+await check("the status line never overstates what was found", async () => {
   const search = new Search();
-  assert.equal(describeSearch(search, ''), '', 'an empty box says nothing');
+  assert.equal(describeSearch(search, ""), "", "an empty box says nothing");
 
   search.begin();
-  assert.equal(describeSearch(search, 'x'), 'searching…');
+  assert.equal(describeSearch(search, "x"), "searching…");
 
   search.accept(found(1, [], { matches: 0, done: true }));
-  assert.equal(describeSearch(search, 'x'), 'no matches');
+  assert.equal(describeSearch(search, "x"), "no matches");
 
   // A capped scan has a floor, not a total, and must print the `+`.
   const capped = new Search();
   capped.begin();
-  capped.accept(found(2, [1, 2], { matches: 10_000, done: true, limited: true }));
+  capped.accept(
+    found(2, [1, 2], { matches: 10_000, done: true, limited: true }),
+  );
   capped.goTo(0);
-  assert.equal(describeSearch(capped, 'x'), '1 of 10,000+');
+  assert.equal(describeSearch(capped, "x"), "1 of 10,000+");
 
   // Matches with no row must be visible, or the count disagrees with the list.
   const partial = new Search();
   partial.begin();
   partial.accept(found(3, [1], { matches: 12, pending: 11, done: true }));
   partial.goTo(0);
-  assert.equal(describeSearch(partial, 'x'), '1 of 12 · 11 unindexed');
+  assert.equal(describeSearch(partial, "x"), "1 of 12 · 11 unindexed");
 });
 
-console.log('\nleviathan viewer unit tests\n');
-console.log(checks.join('\n'));
-console.log(process.exitCode ? '\nFAILED\n' : '\nall good\n');
+await check("one box picks its engine from what was typed", () => {
+  // The rule has to be narrow in one direction and total in the other: anything
+  // a person plausibly means literally must stay literal, and anything that even
+  // looks like an expression must reach the parser rather than be searched for.
+  for (const literal of [
+    "error",
+    "ap-south-1",
+    '{"id":',
+    "user@example.com",
+    "price $40",
+    "",
+    "  ",
+  ]) {
+    assert.equal(
+      searchModeOf(literal),
+      "literal",
+      `${JSON.stringify(literal)} is a search`,
+    );
+  }
+
+  for (const filter of [
+    '@.status == "error"',
+    "$[?@.n > 1]",
+    "  @.a && @.b",
+    "@",
+    // Incomplete, and still a filter: falling back to a literal search here is
+    // how a typo becomes "no matches" instead of "you left off the value".
+    "@.status ==",
+  ]) {
+    assert.equal(
+      searchModeOf(filter),
+      "filter",
+      `${JSON.stringify(filter)} is a filter`,
+    );
+  }
+});
+
+await check("a filter reports its results in records, not matches", () => {
+  const search = new Search();
+  search.begin();
+  assert.equal(describeSearch(search, "@.a", "filter"), "filtering…");
+
+  search.accept(found(1, [], { matches: 0, done: true }));
+  assert.equal(describeSearch(search, "@.a", "filter"), "no records match");
+
+  // A filter counts every match but lists only the first 10,000, so the `+` a
+  // find prints would be a lie here — the count is exact.
+  const capped = new Search();
+  capped.begin();
+  capped.accept(
+    found(2, [1, 2], { matches: 12_431, done: true, limited: true }),
+  );
+  capped.goTo(0);
+  assert.equal(
+    describeSearch(capped, "@.a", "filter"),
+    "1 of 12,431 · first 2 listed",
+  );
+});
+
+console.log("\nleviathan viewer unit tests\n");
+console.log(checks.join("\n"));
+console.log(process.exitCode ? "\nFAILED\n" : "\nall good\n");

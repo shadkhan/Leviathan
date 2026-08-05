@@ -51,7 +51,34 @@ export interface Usage {
 }
 
 /** Input shapes the core can index. Mirrors `leviathan_core::Format`. */
-export type Format = 'single-document' | 'ndjson' | 'empty' | 'unknown';
+export type Format = "single-document" | "ndjson" | "empty" | "unknown";
+
+/**
+ * Which engine a search string reaches.
+ *
+ * `'literal'` scans bytes; `'filter'` compiles a JSONPath filter expression.
+ */
+export type SearchMode = "literal" | "filter";
+
+/**
+ * Decide which of the two a typed string is.
+ *
+ * One box, two engines, and no mode switch to forget the state of — the syntax
+ * itself says which. The rule is deliberately narrow: only a string beginning
+ * with `@` or `$` is a filter, and both are characters that are vanishingly
+ * rare at the start of something someone meant to search for literally. Anything
+ * broader would eventually swallow a real search term and answer a question
+ * nobody asked.
+ *
+ * A string that *looks* like a filter but does not compile stays a filter and
+ * reports its syntax error. Falling back to a literal search on a parse failure
+ * would be the worst of both: `@.statu == "x"` would quietly become a search for
+ * the text `@.statu == "x"`, find nothing, and blame the file.
+ */
+export function searchModeOf(query: string): SearchMode {
+  const start = query.trimStart();
+  return start.startsWith("@") || start.startsWith("$") ? "filter" : "literal";
+}
 
 /** A failure, flattened for structured-clone transport across the boundary. */
 export interface ProtocolError {
@@ -123,7 +150,10 @@ export interface Calls {
    * The partial index stays usable — every row found so far is a real row — so
    * this is "that is enough of this file", not "throw it away".
    */
-  cancel: { params: Record<string, never>; result: { consumed: number; rows: number } };
+  cancel: {
+    params: Record<string, never>;
+    result: { consumed: number; rows: number };
+  };
 
   /** How many rows a container currently offers. `null` is the root. */
   rowCount: { params: { container: NodeId }; result: { count: number } };
@@ -149,7 +179,12 @@ export interface Calls {
    */
   expand: {
     params: { offset: number };
-    result: { children: number; done: boolean; complete: boolean; usage: Usage };
+    result: {
+      children: number;
+      done: boolean;
+      complete: boolean;
+      usage: Usage;
+    };
   };
 
   /**
@@ -177,7 +212,15 @@ export interface Calls {
   forget: { params: { offset: number }; result: Record<string, never> };
 
   /**
-   * Search the file's bytes for a literal string.
+   * Search the file — for a literal string, or for records matching a
+   * condition.
+   *
+   * The two modes answer different questions and share one entry point because
+   * the user has one box. `'literal'` scans the file's bytes; `'filter'`
+   * compiles a JSONPath filter expression and tests each record against it. A
+   * filter that does not compile is reported in the *result*, synchronously,
+   * because a syntax error is about what was typed and should not have to
+   * arrive later as if it were a finding.
    *
    * Starts a scan and returns immediately; results arrive as `found` events
    * (see {@link WorkerEvent}) until one reports `done`. A scan replaces any
@@ -190,8 +233,8 @@ export interface Calls {
    * search at all because the user believes the answer.
    */
   find: {
-    params: { needle: string; caseSensitive: boolean };
-    result: Record<string, never>;
+    params: { needle: string; caseSensitive: boolean; mode: SearchMode };
+    result: { error: string | null };
   };
 
   /** Abandon the search in progress. Idempotent. */
@@ -217,7 +260,23 @@ export interface Calls {
   validate: { params: Record<string, never>; result: Record<string, never> };
 
   /** Abandon the validation pass in progress. Idempotent. */
-  validateStop: { params: Record<string, never>; result: Record<string, never> };
+  validateStop: {
+    params: Record<string, never>;
+    result: Record<string, never>;
+  };
+
+  /**
+   * Compile a JSON Schema and check every record against it.
+   *
+   * `unsupported` lists the keywords the validator does not implement, so the
+   * UI can say how much of the schema was actually applied — a schema using
+   * `pattern` is only partly checked, and not saying so would claim more than
+   * was done. Results arrive as `validated` events, like well-formedness.
+   */
+  schema: {
+    params: { source: string };
+    result: { unsupported: string[] };
+  };
 
   /** Close the current file and release every index built over it. */
   close: { params: Record<string, never>; result: Record<string, never> };
@@ -227,10 +286,10 @@ export interface Calls {
 export type Method = keyof Calls;
 
 /** Parameters of call `M`. */
-export type Params<M extends Method> = Calls[M]['params'];
+export type Params<M extends Method> = Calls[M]["params"];
 
 /** Result of call `M`. */
-export type Result<M extends Method> = Calls[M]['result'];
+export type Result<M extends Method> = Calls[M]["result"];
 
 /** How much of a file is enough to tell single-document from NDJSON. */
 export const SNIFF_PREFIX_BYTES = 64 * 1024;
@@ -259,10 +318,10 @@ export type ResponseEnvelope<M extends Method = Method> =
  * the UI only ever reacts to.
  */
 export type WorkerEvent =
-  | { kind: 'ready'; core: string; protocol: number }
-  | { kind: 'fatal'; error: ProtocolError }
+  | { kind: "ready"; core: string; protocol: number }
+  | { kind: "fatal"; error: ProtocolError }
   | {
-      kind: 'progress';
+      kind: "progress";
       /** Bytes indexed so far. */
       consumed: number;
       /** Bytes in the file. */
@@ -273,7 +332,7 @@ export type WorkerEvent =
       done: boolean;
       /** Why, when it is worth saying: a malformed document, or a cancel. The
        * rows found before that point are still real rows (C6). */
-      stopped?: 'malformed' | 'cancelled' | 'error';
+      stopped?: "malformed" | "cancelled" | "error";
       /** Present when `stopped` is `'error'`. */
       error?: ProtocolError;
       /** What the engine occupies right now. Carried on the event that already
@@ -282,7 +341,7 @@ export type WorkerEvent =
       usage: Usage;
     }
   | {
-      kind: 'found';
+      kind: "found";
       /** Which search these results belong to. Answers to a superseded search
        * are discarded rather than merged into the current one's list. */
       search: number;
@@ -309,7 +368,7 @@ export type WorkerEvent =
       error?: ProtocolError;
     }
   | {
-      kind: 'validated';
+      kind: "validated";
       /** Which pass these belong to, so a superseded one is discarded. */
       pass: number;
       /** Errors found by this step only — the UI appends. */
@@ -342,17 +401,17 @@ export interface Problem {
 }
 
 /** The indexing report, named so the Worker can build one before posting it. */
-export type ProgressEvent = Extract<WorkerEvent, { kind: 'progress' }>;
+export type ProgressEvent = Extract<WorkerEvent, { kind: "progress" }>;
 
 /** One instalment of search results. */
-export type FoundEvent = Extract<WorkerEvent, { kind: 'found' }>;
+export type FoundEvent = Extract<WorkerEvent, { kind: "found" }>;
 
 /** Anything the Worker may post to the UI. */
 export type FromWorker = ResponseEnvelope | WorkerEvent;
 
 /** Narrow a worker message to an event. */
 export function isEvent(message: FromWorker): message is WorkerEvent {
-  return !('id' in message);
+  return !("id" in message);
 }
 
 /**
@@ -370,7 +429,10 @@ export function transferables(payload: object): Transferable[] {
 }
 
 /** Coerce an unknown thrown value into a transportable {@link ProtocolError}. */
-export function toProtocolError(thrown: unknown, message: string): ProtocolError {
+export function toProtocolError(
+  thrown: unknown,
+  message: string,
+): ProtocolError {
   if (thrown instanceof Error) {
     return { message, cause: `${thrown.name}: ${thrown.message}` };
   }

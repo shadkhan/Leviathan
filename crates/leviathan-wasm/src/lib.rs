@@ -35,9 +35,9 @@
 mod pack;
 
 use leviathan_core::{
-    Build, BuildOptions, Built, ByteRange, ExpandOptions, ExpansionCache, Find, FindOptions,
-    FindStop, Format, RowOptions, SourceError, Stopped, Validate, ValidateOptions, materialize,
-    rows_of, sniff_format,
+    Build, BuildOptions, Built, ByteRange, ExpandOptions, ExpansionCache, Filter, Find,
+    FindOptions, FindStop, Format, RowOptions, Schema, SourceError, Stopped, Validate,
+    ValidateOptions, materialize, rows_of, sniff_format,
 };
 use wasm_bindgen::prelude::*;
 
@@ -45,6 +45,24 @@ use wasm_bindgen::prelude::*;
 ///
 /// Mirrors `SNIFF_PREFIX_BYTES` in the TypeScript protocol.
 const SNIFF_PREFIX_BYTES: u64 = 64 * 1024;
+
+/// Records checked per `schemaStep`, so the Worker yields between batches.
+const SCHEMA_BATCH: usize = 2_000;
+
+/// Schema problems collected before a pass gives up. A file whose every record
+/// is wrong has as many problems as it has records, and nobody reads the
+/// thousandth.
+const SCHEMA_ERROR_LIMIT: usize = 1_000;
+
+/// Records tested per `filterStep`, so the Worker yields between batches.
+const FILTER_BATCH: usize = 2_000;
+
+/// How many matching rows are listed. The *count* keeps going past this — a
+/// filter that matches half the file should still say so.
+const FILTER_MATCH_LIMIT: usize = 10_000;
+
+/// Bytes of records read per host call while filtering. See `filterStep`.
+const FILTER_WINDOW: u64 = 1 << 20;
 
 /// Version of the `leviathan-core` engine compiled into this module.
 ///
@@ -322,6 +340,21 @@ pub struct Validated {
     done: bool,
 }
 
+impl Validated {
+    /// The answer when there is nothing running.
+    fn empty() -> Self {
+        Self {
+            positions: Vec::new(),
+            messages: String::new(),
+            checked: 0.0,
+            total: 0.0,
+            values: 0.0,
+            errors: 0,
+            done: true,
+        }
+    }
+}
+
 #[wasm_bindgen]
 impl Validated {
     /// Four doubles per error found by *this* step: byte offset, line, column,
@@ -400,6 +433,14 @@ pub struct Document {
     validate_options: ValidateOptions,
     /// Errors already handed to the host, for the same reason.
     validated: usize,
+    schema: Option<Schema>,
+    /// The next row a schema pass will check, if one is running.
+    schema_row: Option<usize>,
+    schema_errors: u32,
+    filter: Option<Filter>,
+    /// The next row a filter pass will test, if one is running.
+    filter_row: Option<usize>,
+    filter_matches: u32,
 }
 
 #[wasm_bindgen]
@@ -460,6 +501,12 @@ impl Document {
             validate: None,
             validate_options: ValidateOptions::default(),
             validated: 0,
+            schema: None,
+            schema_row: None,
+            schema_errors: 0,
+            filter: None,
+            filter_row: None,
+            filter_matches: 0,
         })
     }
 
@@ -789,6 +836,289 @@ impl Document {
             errors: clamp_u32(all.len()),
             done: pass.is_done(),
         })
+    }
+
+    /// Compile a JSON Schema, ready to check records against.
+    ///
+    /// Returns the keywords it does **not** implement, separated by U+0001, so
+    /// the host can say how much of the schema was actually applied. An empty
+    /// string means all of it.
+    ///
+    /// # Errors
+    ///
+    /// If the schema is not valid JSON, is not a schema, or uses a remote
+    /// `$ref` — which would be a network fetch, and the manifest requests no
+    /// host permissions.
+    #[wasm_bindgen(js_name = schemaSet)]
+    pub fn schema_set(&mut self, source: &str) -> Result<String, JsError> {
+        let schema =
+            Schema::compile(source.as_bytes()).map_err(|error| JsError::new(&error.message))?;
+        let unsupported = schema.unsupported().join("\u{1}");
+        self.schema = Some(schema);
+        Ok(unsupported)
+    }
+
+    /// Begin checking every record against the compiled schema.
+    ///
+    /// # Errors
+    ///
+    /// If no schema has been set.
+    #[wasm_bindgen(js_name = schemaStart)]
+    pub fn schema_start(&mut self) -> Result<(), JsError> {
+        if self.schema.is_none() {
+            return Err(JsError::new("no schema has been set"));
+        }
+        self.schema_row = Some(0);
+        self.schema_errors = 0;
+        Ok(())
+    }
+
+    /// Check the next batch of records against the schema.
+    ///
+    /// Records are checked **one at a time, from their own byte range** — the
+    /// index says where each one starts, so each is read, checked and dropped.
+    /// Nothing accumulates, which is what lets a 500 MB file be schema-checked
+    /// at all: the peak is one record, not one document.
+    ///
+    /// # Errors
+    ///
+    /// If the host's reader fails.
+    #[wasm_bindgen(js_name = schemaStep)]
+    pub fn schema_step(&mut self) -> Result<Validated, JsError> {
+        let Document {
+            source,
+            build,
+            schema,
+            schema_row,
+            schema_errors,
+            row_options,
+            ..
+        } = self;
+
+        let (Some(schema), Some(row)) = (schema.as_ref(), *schema_row) else {
+            return Ok(Validated::empty());
+        };
+
+        let table = build.table();
+        let rows = table.len();
+        let last = (row + SCHEMA_BATCH).min(rows);
+
+        let mut positions = Vec::new();
+        let mut messages = String::new();
+        let mut first = true;
+
+        for index in row..last {
+            let Some(start) = table.child(index) else {
+                continue;
+            };
+            // A record ends where the next begins; the last one runs to the end
+            // of the file. Capped, so one pathological record cannot be read
+            // whole into memory.
+            let end = table
+                .child(index + 1)
+                .unwrap_or(source.len)
+                .min(start.saturating_add(u64::from(row_options.row_budget) * 64));
+            let length = clamp_u32(usize::try_from(end.saturating_sub(start)).unwrap_or(0));
+
+            let bytes = source.read(start, length).map_err(to_js)?.to_vec();
+            for problem in schema.check(&bytes) {
+                *schema_errors += 1;
+                if *schema_errors as usize > SCHEMA_ERROR_LIMIT {
+                    break;
+                }
+                if !first {
+                    messages.push('\u{1}');
+                }
+                first = false;
+                messages.push_str(&problem.message);
+                positions.push((start + problem.offset) as f64);
+                positions.push(problem.line as f64);
+                positions.push(problem.column as f64);
+                positions.push(index as f64);
+            }
+        }
+
+        let done = last >= rows || (*schema_errors as usize) > SCHEMA_ERROR_LIMIT;
+        *schema_row = if done { None } else { Some(last) };
+
+        Ok(Validated {
+            positions,
+            messages,
+            checked: table.child(last.min(rows.saturating_sub(1))).unwrap_or(0) as f64,
+            total: source.len as f64,
+            values: last as f64,
+            errors: *schema_errors,
+            done,
+        })
+    }
+
+    /// Compile a filter expression, replacing any already set.
+    ///
+    /// Separated from running it so a syntax error is reported the moment it is
+    /// typed, against an empty results list, rather than after a pass that was
+    /// never going to start.
+    ///
+    /// # Errors
+    ///
+    /// If the expression does not parse, or uses a JSONPath construct outside
+    /// the supported subset. The message names which, and where.
+    #[wasm_bindgen(js_name = filterSet)]
+    pub fn filter_set(&mut self, source: &str) -> Result<(), JsError> {
+        self.filter = Some(Filter::parse(source).map_err(|e| JsError::new(&e.to_string()))?);
+        Ok(())
+    }
+
+    /// Begin testing every record against the compiled filter.
+    ///
+    /// # Errors
+    ///
+    /// If no filter has been set.
+    #[wasm_bindgen(js_name = filterStart)]
+    pub fn filter_start(&mut self) -> Result<(), JsError> {
+        if self.filter.is_none() {
+            return Err(JsError::new("no filter has been set"));
+        }
+        self.filter_row = Some(0);
+        self.filter_matches = 0;
+        Ok(())
+    }
+
+    /// Test the next batch of records, and report the ones that matched.
+    ///
+    /// Reuses [`Found`], so a filter's results reach the UI down the same path a
+    /// find's do — the results list does not need to know which produced them.
+    ///
+    /// ## Records are read in windows, not one at a time
+    ///
+    /// The obvious implementation reads each record's own byte range, which is
+    /// what schema checking does and what this did first. It costs 23 MB/s on
+    /// the 500 MB fixture, against 467 MB/s for indexing the same file — and the
+    /// difference is not parsing. It is 1.77 million reads of ~280 bytes, each
+    /// one a `readSync` in Node and a `blob.slice()` plus a `FileReaderSync` in
+    /// a Worker, where the second allocates a fresh `ArrayBuffer` every time.
+    ///
+    /// So a window covering many records is read once and each record is tested
+    /// against a subslice of it. The peak is one window rather than one record,
+    /// which is a bounded amount larger and still nothing next to the file.
+    ///
+    /// This is the same lesson as C54 read the other way round: there, widening
+    /// the *indexing* window changed nothing, because indexing already read in
+    /// megabytes and the cost scaled with bytes. Here the cost scaled with
+    /// calls, because there were six orders of magnitude more of them.
+    ///
+    /// # Errors
+    ///
+    /// If the host's reader fails. A record that does not parse is not an error
+    /// of this call — it simply does not match.
+    #[wasm_bindgen(js_name = filterStep)]
+    pub fn filter_step(&mut self) -> Result<Found, JsError> {
+        let Document {
+            source,
+            build,
+            filter,
+            filter_row,
+            filter_matches,
+            row_options,
+            ..
+        } = self;
+
+        let (Some(filter), Some(row)) = (filter.as_ref(), *filter_row) else {
+            return Ok(Found {
+                rows: Vec::new(),
+                matches: *filter_matches,
+                pending: 0,
+                scanned: source.len as f64,
+                done: true,
+                limited: false,
+            });
+        };
+
+        let table = build.table();
+        let total = table.len();
+        let cap = u64::from(row_options.row_budget) * 64;
+
+        // One matcher for the whole batch, not one per record: it owns the
+        // lexer, the path stack and a slot per referenced path, and rebuilding
+        // those two thousand times a step is the allocation this avoids.
+        let mut matcher = filter.matcher();
+        let mut rows = Vec::new();
+        let mut at = row;
+        let mut tested = 0usize;
+
+        while at < total && tested < FILTER_BATCH {
+            let Some(base) = table.child(at) else {
+                at += 1;
+                continue;
+            };
+
+            // How many records fit in one window. Always at least one, so a
+            // record larger than the window is still tested — clipped to `cap`,
+            // exactly as a single-record read would have clipped it.
+            let mut upto = at + 1;
+            while upto < total
+                && tested + (upto - at) < FILTER_BATCH
+                && table
+                    .child(upto)
+                    .is_some_and(|start| start - base < FILTER_WINDOW)
+            {
+                upto += 1;
+            }
+
+            // Read before borrowing: `source.len` is behind the same borrow the
+            // window holds, so every offset this loop needs is settled first.
+            let end_of_file = source.len;
+            let stop = table.child(upto).unwrap_or(end_of_file);
+            let span = (stop - base).min(FILTER_WINDOW.max(cap));
+            let window = source.read(base, clamp_u32(span as usize)).map_err(to_js)?;
+
+            for index in at..upto {
+                let Some(start) = table.child(index) else {
+                    continue;
+                };
+                let from = (start - base) as usize;
+                let to = table
+                    .child(index + 1)
+                    .unwrap_or(end_of_file)
+                    .min(start.saturating_add(cap))
+                    .saturating_sub(base) as usize;
+                let Some(record) = window.get(from..to.min(window.len())) else {
+                    continue;
+                };
+
+                if matcher.matches(record) {
+                    *filter_matches += 1;
+                    if (*filter_matches as usize) <= FILTER_MATCH_LIMIT {
+                        rows.push(index as f64);
+                    }
+                }
+            }
+
+            tested += upto - at;
+            at = upto;
+        }
+
+        // Unlike find, the limit caps what is *listed*, not what is counted:
+        // testing a record costs the same either way, so "2,000 of 41,988" is
+        // free to be true where find would have had to stop scanning.
+        let done = at >= total;
+        *filter_row = if done { None } else { Some(at) };
+
+        Ok(Found {
+            rows,
+            matches: *filter_matches,
+            pending: 0,
+            scanned: table.child(at).unwrap_or(source.len) as f64,
+            done,
+            limited: (*filter_matches as usize) > FILTER_MATCH_LIMIT,
+        })
+    }
+
+    /// Abandon the filter pass in progress.
+    #[wasm_bindgen(js_name = filterStop)]
+    pub fn filter_stop(&mut self) {
+        self.filter = None;
+        self.filter_row = None;
+        self.filter_matches = 0;
     }
 
     /// Which root row contains byte `offset`, if any.

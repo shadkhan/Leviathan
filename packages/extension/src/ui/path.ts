@@ -15,7 +15,7 @@
 export type Step = { index: number } | { key: string };
 
 /** Characters that end an unquoted segment. */
-const TERMINATORS = new Set(['.', '[', ']']);
+const TERMINATORS = new Set([".", "[", "]"]);
 
 /**
  * Parse `$.orders[3]["odd key"].id` into steps.
@@ -27,20 +27,20 @@ const TERMINATORS = new Set(['.', '[', ']']);
  * reading it as a number instead.
  */
 export function parsePath(text: string): Step[] | undefined {
-  const source = text.trim().replace(/^\$/, '');
+  const source = text.trim().replace(/^\$/, "");
   const steps: Step[] = [];
   let at = 0;
 
   while (at < source.length) {
     const char = source[at];
 
-    if (char === '.') {
+    if (char === ".") {
       at++;
       const start = at;
       while (at < source.length && !TERMINATORS.has(source[at] as string)) {
         at++;
       }
-      if (at === start || source[at] === ']') {
+      if (at === start || source[at] === "]") {
         // `..`, a trailing dot, or a stray `]`. The generator only ever emits a
         // dotted segment for an identifier-shaped key — anything else goes in
         // brackets — so a `]` here means the path is damaged, and guessing at a
@@ -51,8 +51,8 @@ export function parsePath(text: string): Step[] | undefined {
       continue;
     }
 
-    if (char === '[') {
-      const close = source.indexOf(']', at);
+    if (char === "[") {
+      const close = source.indexOf("]", at);
       if (close < 0) {
         return undefined;
       }
@@ -77,7 +77,7 @@ export function parsePath(text: string): Step[] | undefined {
       while (at < source.length && !TERMINATORS.has(source[at] as string)) {
         at++;
       }
-      if (at === start || source[at] === ']') {
+      if (at === start || source[at] === "]") {
         return undefined;
       }
       steps.push({ key: source.slice(start, at) });
@@ -98,14 +98,18 @@ export function parsePath(text: string): Step[] | undefined {
  */
 function readQuoted(inner: string): string | undefined {
   const quote = inner[0];
-  if ((quote !== '"' && quote !== "'") || inner.length < 2 || inner.at(-1) !== quote) {
+  if (
+    (quote !== '"' && quote !== "'") ||
+    inner.length < 2 ||
+    inner.at(-1) !== quote
+  ) {
     return undefined;
   }
 
   const body = inner.slice(1, -1);
-  let out = '';
+  let out = "";
   for (let at = 0; at < body.length; at++) {
-    if (body[at] !== '\\') {
+    if (body[at] !== "\\") {
       out += body[at];
       continue;
     }
@@ -114,7 +118,7 @@ function readQuoted(inner: string): string | undefined {
     if (escaped === undefined) {
       return undefined; // a trailing backslash
     }
-    out += escaped === 'n' ? '\n' : escaped === 't' ? '\t' : escaped;
+    out += escaped === "n" ? "\n" : escaped === "t" ? "\t" : escaped;
   }
   return out;
 }

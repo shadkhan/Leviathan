@@ -30,6 +30,9 @@
 //! - `find` — scan the whole file for a literal string that is deliberately
 //!   *absent*, so every byte is read. A needle that hit early would measure how
 //!   fast the scan can stop, which is a property of the fixture.
+//! - `filter` — evaluate a two-condition filter expression against every record,
+//!   in the same windowed shape the Worker uses. Reports matched *and* tested,
+//!   so a pass that skipped records cannot be read as a whole-file rate.
 //!
 //! `index` is the only workload whose *path* depends on the file: NDJSON scans
 //! for newlines and never parses, a single document is walked. The two are
@@ -135,8 +138,8 @@ impl Run {
 /// and reading them top to bottom says what fraction of the possible the engine
 /// achieved. A bare MB/s says nothing; "62 % of memory bandwidth" says whether
 /// there is headroom left worth chasing.
-pub const WORKLOADS: [&str; 9] = [
-    "read", "scan", "sniff", "lex", "walk", "index", "rows", "expand", "find",
+pub const WORKLOADS: [&str; 10] = [
+    "read", "scan", "sniff", "lex", "walk", "index", "rows", "expand", "find", "filter",
 ];
 
 /// Run every workload in `workloads` against `path`.
@@ -171,6 +174,7 @@ pub fn run_file(path: &Path, workloads: &[&'static str], chunk: usize) -> io::Re
             "rows" => rows(&name, path, chunk)?,
             "expand" => expand(&name, path)?,
             "find" => find(&name, path, chunk)?,
+            "filter" => filter(&name, path, chunk)?,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -609,6 +613,15 @@ fn expand(name: &str, path: &Path) -> io::Result<Run> {
 /// measure how quickly the scan can stop.
 const NEEDLE: &str = "leviathan-does-not-occur-here";
 
+/// The expression the `filter` workload evaluates.
+///
+/// Two conditions over two fields at different depths, which is the shape of a
+/// real question ("slow errors") and costs more than a single equality. Unlike
+/// [`NEEDLE`] it deliberately *does* match: the whole file is tested either way,
+/// so a selective expression would measure the same walk while hiding whether
+/// the results are right.
+const FILTER: &str = r#"@.level == "error" && @.latency_ms > 1000"#;
+
 /// Scan the whole file for a literal string — what the find box does.
 ///
 /// A throughput, and one of the few workloads where that unit is unambiguous:
@@ -649,6 +662,101 @@ fn find(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
         reps: 1,
         peak_rss: sys::peak_rss(),
         observed: format!("{matches} matches, {batches} batch(es)"),
+    })
+}
+
+/// Test every record against a filter expression, the way `filterStep` does.
+///
+/// Reads in windows covering many records rather than one range per record, and
+/// holds one `Matcher` for the whole pass — the two changes that took this from
+/// 23 MB/s to 57 MB/s (C60, C61). Benchmarking the naive shape instead would
+/// have published a number the product does not have.
+fn filter(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
+    use leviathan_core::ByteRange as _;
+
+    let table = build_table(path, chunk)?;
+    let mut source = crate::file_source::FileSource::open(path)?;
+
+    let expression = leviathan_core::Filter::parse(FILTER)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    if table.is_empty() {
+        return Ok(Run {
+            fixture: name.to_string(),
+            workload: "filter",
+            bytes: 0,
+            metric: Metric::Aborted,
+            wall: Duration::ZERO,
+            reps: 0,
+            peak_rss: sys::peak_rss(),
+            observed: "no indexable rows".to_string(),
+        });
+    }
+
+    const WINDOW: u64 = 1 << 20;
+    let total = table.len();
+    let end_of_file = source.len_hint().unwrap_or(u64::MAX);
+
+    let mut matcher = expression.matcher();
+    let mut matches = 0u64;
+    let mut tested = 0u64;
+    let mut reads = 0u64;
+
+    let began = Instant::now();
+    let mut at = 0usize;
+    while at < total {
+        let Some(base) = table.child(at) else {
+            at += 1;
+            continue;
+        };
+        let mut upto = at + 1;
+        while upto < total && table.child(upto).is_some_and(|start| start - base < WINDOW) {
+            upto += 1;
+        }
+
+        let stop = table.child(upto).unwrap_or(end_of_file);
+        let span = u32::try_from(stop - base).unwrap_or(u32::MAX);
+        let window = source
+            .read(base, span)
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .to_vec();
+        reads += 1;
+
+        for index in at..upto {
+            let Some(start) = table.child(index) else {
+                continue;
+            };
+            let from = (start - base) as usize;
+            let to = (table.child(index + 1).unwrap_or(end_of_file) - base) as usize;
+            let Some(record) = window.get(from..to.min(window.len())) else {
+                continue;
+            };
+            tested += 1;
+            if matcher.matches(record) {
+                matches += 1;
+            }
+        }
+        at = upto;
+    }
+    let wall = began.elapsed();
+
+    // A pass that skipped records has not answered the question, and dividing
+    // the file by its elapsed time would be the C58 mistake again.
+    let metric = if tested == total as u64 {
+        Metric::Throughput
+    } else {
+        Metric::Aborted
+    };
+
+    Ok(Run {
+        fixture: name.to_string(),
+        workload: "filter",
+        bytes: end_of_file.min(source.len_hint().unwrap_or(0)),
+        metric,
+        wall,
+        reps: 1,
+        peak_rss: sys::peak_rss(),
+        observed: format!("{matches} matched of {tested} tested, {reads} read(s)"),
     })
 }
 
@@ -1403,6 +1511,32 @@ mod tests {
             runs[0].throughput().is_some(),
             "a completed scan has a rate"
         );
+    }
+
+    #[test]
+    fn filter_tests_every_record_or_refuses_to_report_a_rate() {
+        // The C58 guard, in the place a rate is computed rather than in a
+        // comment: a pass that skipped records is `Aborted`, and `Aborted` has
+        // no throughput. Three records, one of which matches.
+        let (_dir, path) = fixture(
+            br#"{"level":"info","latency_ms":5000}
+{"level":"error","latency_ms":5000}
+{"level":"error","latency_ms":1}
+"#,
+        );
+        let runs = run_file(&path, &["filter"], DEFAULT_CHUNK).unwrap();
+
+        assert_eq!(
+            runs[0].metric,
+            Metric::Throughput,
+            "every record was tested"
+        );
+        assert!(
+            runs[0].observed.starts_with("1 matched of 3 tested"),
+            "{}",
+            runs[0].observed
+        );
+        assert!(runs[0].throughput().is_some(), "a complete pass has a rate");
     }
 
     #[test]

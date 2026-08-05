@@ -14,24 +14,31 @@
  * looks like, start to finish.
  */
 
-import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const pkg = resolve(here, '../src/wasm');
+const pkg = resolve(here, "../src/wasm");
 
 // `pathToFileURL`, not a bare path: a dynamic import of `D:\...` is an
 // unsupported URL scheme on Windows, and this repo is developed there.
-const { default: init, Document, coreVersion, echo, rowLayoutVersion, sniffFormat } = await import(
-  pathToFileURL(resolve(pkg, 'leviathan_wasm.js')).href
-);
+const {
+  default: init,
+  Document,
+  coreVersion,
+  echo,
+  rowLayoutVersion,
+  sniffFormat,
+} = await import(pathToFileURL(resolve(pkg, "leviathan_wasm.js")).href);
 
 // In a browser this is a URL and the glue streams it. In Node there is no
 // fetch of a file:// URL, so the bytes are passed directly — the same entry
 // point, which is the reason the package is usable in both.
-await init({ module_or_path: await readFile(resolve(pkg, 'leviathan_wasm_bg.wasm')) });
+await init({
+  module_or_path: await readFile(resolve(pkg, "leviathan_wasm_bg.wasm")),
+});
 
 const checks = [];
 const check = (name, fn) => {
@@ -44,11 +51,11 @@ const check = (name, fn) => {
   }
 };
 
-check('coreVersion is semver', () => {
+check("coreVersion is semver", () => {
   assert.match(coreVersion(), /^\d+\.\d+\.\d+/);
 });
 
-check('echo round-trips the u32 range', () => {
+check("echo round-trips the u32 range", () => {
   for (const value of [0, 1, 42, 2 ** 31, 4294967295]) {
     assert.equal(echo(value), value);
   }
@@ -56,26 +63,39 @@ check('echo round-trips the u32 range', () => {
 
 const utf8 = new TextEncoder();
 
-check('sniffFormat only returns values the TS union declares', () => {
+check("sniffFormat only returns values the TS union declares", () => {
   // Kept in step by hand with `Format` in src/protocol and
   // `leviathan_core::Format::as_str`. Three places, four values, one test.
-  const declared = new Set(['single-document', 'ndjson', 'empty', 'unknown']);
-  for (const input of ['{"a":1}', '{"a":1}\n{"a":2}\n', '   ', '<html>', '2026-07-27 INFO up']) {
-    assert.ok(declared.has(sniffFormat(utf8.encode(input))), `undeclared for ${input}`);
+  const declared = new Set(["single-document", "ndjson", "empty", "unknown"]);
+  for (const input of [
+    '{"a":1}',
+    '{"a":1}\n{"a":2}\n',
+    "   ",
+    "<html>",
+    "2026-07-27 INFO up",
+  ]) {
+    assert.ok(
+      declared.has(sniffFormat(utf8.encode(input))),
+      `undeclared for ${input}`,
+    );
   }
 });
 
-check('sniffFormat agrees with the core test suite', () => {
+check("sniffFormat agrees with the core test suite", () => {
   const cases = [
-    ['{"a":1}', 'single-document'],
-    ['[1,2,3]', 'single-document'],
-    ['{"a":1}\n{"a":2}\n', 'ndjson'],
-    ['', 'empty'],
-    ['<html>', 'unknown'],
-    ['2026-07-27 INFO started', 'unknown'],
+    ['{"a":1}', "single-document"],
+    ["[1,2,3]", "single-document"],
+    ['{"a":1}\n{"a":2}\n', "ndjson"],
+    ["", "empty"],
+    ["<html>", "unknown"],
+    ["2026-07-27 INFO started", "unknown"],
   ];
   for (const [input, expected] of cases) {
-    assert.equal(sniffFormat(utf8.encode(input)), expected, `for ${JSON.stringify(input)}`);
+    assert.equal(
+      sniffFormat(utf8.encode(input)),
+      expected,
+      `for ${JSON.stringify(input)}`,
+    );
   }
 });
 
@@ -128,15 +148,37 @@ function open(text) {
  * `leviathan-wasm/src/pack.rs`, which is the specification.
  */
 function unpack(packed) {
-  const view = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
-  const u64 = (at) => view.getUint32(at, true) + view.getUint32(at + 4, true) * 2 ** 32;
+  const view = new DataView(
+    packed.buffer,
+    packed.byteOffset,
+    packed.byteLength,
+  );
+  const u64 = (at) =>
+    view.getUint32(at, true) + view.getUint32(at + 4, true) * 2 ** 32;
 
-  assert.equal(view.getUint32(0, true), rowLayoutVersion(), 'layout version in the header');
+  assert.equal(
+    view.getUint32(0, true),
+    rowLayoutVersion(),
+    "layout version in the header",
+  );
   const count = view.getUint32(4, true);
   const strings = view.getUint32(8, true);
-  assert.equal(packed.byteLength, 16 + count * 40 + strings, 'buffer length matches its header');
+  assert.equal(
+    packed.byteLength,
+    16 + count * 40 + strings,
+    "buffer length matches its header",
+  );
 
-  const kinds = ['object', 'array', 'string', 'number', 'true', 'false', 'null', 'invalid'];
+  const kinds = [
+    "object",
+    "array",
+    "string",
+    "number",
+    "true",
+    "false",
+    "null",
+    "invalid",
+  ];
   const decoder = new TextDecoder();
   const rows = [];
   let cursor = 16 + count * 40;
@@ -148,7 +190,9 @@ function unpack(packed) {
     const previewLength = view.getUint32(at + 36, true);
     const key = decoder.decode(packed.subarray(cursor, cursor + keyLength));
     cursor += keyLength;
-    const preview = decoder.decode(packed.subarray(cursor, cursor + previewLength));
+    const preview = decoder.decode(
+      packed.subarray(cursor, cursor + previewLength),
+    );
     cursor += previewLength;
 
     rows.push({
@@ -162,56 +206,65 @@ function unpack(packed) {
     });
   }
 
-  assert.equal(cursor, packed.byteLength, 'every string byte is claimed by a row');
+  assert.equal(
+    cursor,
+    packed.byteLength,
+    "every string byte is claimed by a row",
+  );
   return rows;
 }
 
-check('an NDJSON document indexes to one row per record', () => {
+check("an NDJSON document indexes to one row per record", () => {
   const { document } = open('{"a":1}\n{"a":2}\n{"a":3}\n');
-  assert.equal(document.format, 'ndjson');
+  assert.equal(document.format, "ndjson");
   assert.equal(document.rowCount(null), 3);
   document.free();
 });
 
-check('rows carry keys, previews and offsets back across the boundary', () => {
-  const { document } = open('{"name":"leviathan","size":500,"ok":true,"tags":[1,2,3]}');
+check("rows carry keys, previews and offsets back across the boundary", () => {
+  const { document } = open(
+    '{"name":"leviathan","size":500,"ok":true,"tags":[1,2,3]}',
+  );
   const rows = unpack(document.rows(null, 0, 10));
 
   assert.equal(rows.length, 4);
   assert.deepEqual(
     rows.map((row) => row.key),
-    ['name', 'size', 'ok', 'tags'],
+    ["name", "size", "ok", "tags"],
   );
-  assert.equal(rows[0].kind, 'string');
-  assert.equal(rows[0].preview, 'leviathan');
-  assert.equal(rows[1].preview, '500');
-  assert.equal(rows[2].kind, 'true');
-  assert.equal(rows[3].kind, 'array');
+  assert.equal(rows[0].kind, "string");
+  assert.equal(rows[0].preview, "leviathan");
+  assert.equal(rows[1].preview, "500");
+  assert.equal(rows[2].kind, "true");
+  assert.equal(rows[3].kind, "array");
   assert.equal(rows[3].children, 3);
   assert.ok(rows[3].childrenExact);
   assert.ok(rows[3].expandable);
   document.free();
 });
 
-check('a container expands to its children, addressed by byte offset', () => {
+check("a container expands to its children, addressed by byte offset", () => {
   const { document } = open('[[10,20,30],{"deep":true}]');
   const root = unpack(document.rows(null, 0, 10));
   assert.equal(root.length, 2);
 
   const step = document.expandStep(root[0].offset);
-  assert.ok(step.done && step.complete, 'a small container expands in one step');
+  assert.ok(
+    step.done && step.complete,
+    "a small container expands in one step",
+  );
   assert.equal(step.children, 3);
   step.free();
 
   const children = unpack(document.rows(root[0].offset, 0, 10));
   assert.deepEqual(
     children.map((row) => row.preview),
-    ['10', '20', '30'],
+    ["10", "20", "30"],
   );
   document.free();
 });
 
-check('a partial index is already browsable', () => {
+check("a partial index is already browsable", () => {
   // The property the whole design is for: rows before the file is finished.
   // Deliberately larger than one batch (4 MB) — a smaller input finishes in a
   // single step and would assert nothing at all.
@@ -223,27 +276,31 @@ check('a partial index is already browsable', () => {
   const finished = first.done;
   first.free();
 
-  assert.ok(rowsSoFar > 0, 'the first batch found rows');
-  assert.ok(!finished, 'and the file is not finished');
-  assert.equal(unpack(document.rows(null, 0, 5)).length, 5, 'which are readable now');
-  document.free();
-});
-
-check('a truncated document keeps the rows it found', () => {
-  // C6: the file that is already damaged is the one the user most needs open.
-  const { document } = open('[1,2,3,4');
-  assert.equal(document.rowCount(null), 4);
-  assert.deepEqual(
-    unpack(document.rows(null, 0, 10)).map((row) => row.preview),
-    ['1', '2', '3', '4'],
+  assert.ok(rowsSoFar > 0, "the first batch found rows");
+  assert.ok(!finished, "and the file is not finished");
+  assert.equal(
+    unpack(document.rows(null, 0, 5)).length,
+    5,
+    "which are readable now",
   );
   document.free();
 });
 
-check('the engine pulls ranges rather than being handed the file', () => {
+check("a truncated document keeps the rows it found", () => {
+  // C6: the file that is already damaged is the one the user most needs open.
+  const { document } = open("[1,2,3,4");
+  assert.equal(document.rowCount(null), 4);
+  assert.deepEqual(
+    unpack(document.rows(null, 0, 10)).map((row) => row.preview),
+    ["1", "2", "3", "4"],
+  );
+  document.free();
+});
+
+check("the engine pulls ranges rather than being handed the file", () => {
   // If the engine ever stops asking, the memory model has gone with it.
   const { document, reader } = open('{"a":1}\n'.repeat(500));
-  assert.ok(reader.reads > 0, 'the engine asked the host for bytes');
+  assert.ok(reader.reads > 0, "the engine asked the host for bytes");
   document.free();
 });
 
@@ -265,79 +322,189 @@ function findAll(document, needle, caseSensitive = false) {
     };
     step.free();
     steps++;
-    assert.ok(steps < 10_000, 'findStep must terminate');
+    assert.ok(steps < 10_000, "findStep must terminate");
     if (last.done) {
       return { rows, steps, ...last };
     }
   }
 }
 
-check('a search finds matches and resolves them to rows', () => {
+check("a search finds matches and resolves them to rows", () => {
   const { document } = open(
     '{"id":1,"status":"ok"}\n{"id":2,"status":"error"}\n{"id":3,"status":"ok"}\n',
   );
-  const found = findAll(document, 'error');
+  const found = findAll(document, "error");
 
-  assert.equal(found.matches, 1, 'one match');
-  assert.deepEqual([...found.rows], [1], 'in record 1, not 0 or 2');
-  assert.equal(found.pending, 0, 'nothing beyond the indexed region');
-  assert.ok(!found.limited, 'the cap was not reached');
+  assert.equal(found.matches, 1, "one match");
+  assert.deepEqual([...found.rows], [1], "in record 1, not 0 or 2");
+  assert.equal(found.pending, 0, "nothing beyond the indexed region");
+  assert.ok(!found.limited, "the cap was not reached");
   document.free();
 });
 
-check('a search reads the file, not the row previews', () => {
+check("a search reads the file, not the row previews", () => {
   // The property C47 exists for. A preview is truncated (C33), so a needle
   // buried deep in a long record is exactly what a preview-based search would
   // miss — and would miss silently, reporting "no matches" for a string that
   // is in the file.
-  const buried = `{"pad":"${'x'.repeat(4000)}","needle":"buried-treasure"}\n`;
+  const buried = `{"pad":"${"x".repeat(4000)}","needle":"buried-treasure"}\n`;
   const { document } = open(`{"a":1}\n${buried}{"b":2}\n`);
 
-  const found = findAll(document, 'buried-treasure');
-  assert.equal(found.matches, 1, 'found 4 kB into a record');
+  const found = findAll(document, "buried-treasure");
+  assert.equal(found.matches, 1, "found 4 kB into a record");
   assert.deepEqual([...found.rows], [1]);
   document.free();
 });
 
-check('two hits in one record are two results but one row', () => {
+check("two hits in one record are two results but one row", () => {
   const { document } = open('{"a":"xx"}\n{"b":1}\n');
-  const found = findAll(document, 'x');
+  const found = findAll(document, "x");
   assert.equal(found.matches, 2);
-  assert.deepEqual([...found.rows], [0, 0], 'the same row, reported twice');
+  assert.deepEqual([...found.rows], [0, 0], "the same row, reported twice");
   document.free();
 });
 
-check('search is case-insensitive on request and exact otherwise', () => {
-  const { document } = open('{"v":"Leviathan"}\n{"v":"LEVIATHAN"}\n{"v":"leviathan"}\n');
+check("search is case-insensitive on request and exact otherwise", () => {
+  const { document } = open(
+    '{"v":"Leviathan"}\n{"v":"LEVIATHAN"}\n{"v":"leviathan"}\n',
+  );
 
-  assert.equal(findAll(document, 'leviathan', false).matches, 3, 'folded');
-  assert.equal(findAll(document, 'leviathan', true).matches, 1, 'exact');
+  assert.equal(findAll(document, "leviathan", false).matches, 3, "folded");
+  assert.equal(findAll(document, "leviathan", true).matches, 1, "exact");
   document.free();
 });
 
-check('a needle that is absent scans the whole file and finds nothing', () => {
+check("a needle that is absent scans the whole file and finds nothing", () => {
   const text = '{"a":1}\n'.repeat(2000);
   const { document } = open(text);
-  const found = findAll(document, 'not-in-this-file');
+  const found = findAll(document, "not-in-this-file");
 
   assert.equal(found.matches, 0);
   assert.equal(found.rows.length, 0);
-  assert.equal(found.scanned, utf8.encode(text).length, 'every byte was read');
+  assert.equal(found.scanned, utf8.encode(text).length, "every byte was read");
   document.free();
 });
 
-check('starting a new search discards the one before it', () => {
+check("starting a new search discards the one before it", () => {
   // What every keystroke in the find box does.
   const { document } = open('{"v":"alpha"}\n{"v":"beta"}\n');
-  document.findStart('alpha', false, undefined);
-  const superseded = findAll(document, 'beta');
+  document.findStart("alpha", false, undefined);
+  const superseded = findAll(document, "beta");
 
-  assert.equal(superseded.matches, 1, 'only the new needle is counted');
+  assert.equal(superseded.matches, 1, "only the new needle is counted");
   assert.deepEqual([...superseded.rows], [1]);
   document.free();
 });
 
-check('the row layout version is the one the extension bundle expects', () => {
+/** Drive a filter to completion, collecting the rows each step reports. */
+function filterAll(document, expression) {
+  document.filterSet(expression);
+  document.filterStart();
+  const rows = [];
+  let steps = 0;
+  let last;
+  for (;;) {
+    const step = document.filterStep();
+    rows.push(...step.rows);
+    last = { matches: step.matches, done: step.done, limited: step.limited };
+    step.free();
+    steps++;
+    assert.ok(steps < 10_000, "filterStep must terminate");
+    if (last.done) {
+      return { rows, steps, ...last };
+    }
+  }
+}
+
+const LOG = [
+  '{"id":1,"level":"info","latency_ms":12,"meta":{"region":"eu-west-1"}}',
+  '{"id":2,"level":"error","latency_ms":2400,"meta":{"region":"ap-south-1"}}',
+  '{"id":3,"level":"error","latency_ms":80,"meta":{"region":"eu-west-1"}}',
+  '{"id":4,"level":"warn","latency_ms":5000,"meta":{"region":"ap-south-1"}}',
+  "",
+].join("\n");
+
+check("a filter selects records by condition, not by text", () => {
+  const { document } = open(LOG);
+
+  // The distinction the whole feature rests on: searching for `error` would also
+  // return record 4 if the word appeared anywhere in it, and would miss nothing
+  // only by luck. This asks a question about a field.
+  const errors = filterAll(document, '@.level == "error"');
+  assert.deepEqual([...errors.rows], [1, 2], "the two error records, by index");
+  assert.equal(errors.matches, 2);
+  assert.equal(errors.limited, false);
+
+  document.free();
+});
+
+check("a filter compares numbers numerically", () => {
+  const { document } = open(LOG);
+  // `2400 > 999` is true; `"2400" > "999"` as text is false. A filter that got
+  // this wrong would look like it worked on most data.
+  assert.deepEqual([...filterAll(document, "@.latency_ms > 999").rows], [1, 3]);
+  assert.deepEqual([...filterAll(document, "@.latency_ms <= 80").rows], [0, 2]);
+  document.free();
+});
+
+check("conditions combine, and nested paths resolve", () => {
+  const { document } = open(LOG);
+
+  assert.deepEqual(
+    [...filterAll(document, '@.level == "error" && @.latency_ms > 999').rows],
+    [1],
+    "both conditions, one record",
+  );
+  assert.deepEqual(
+    [...filterAll(document, '@.meta.region == "ap-south-1" || @.id == 1').rows],
+    [0, 1, 3],
+  );
+  assert.deepEqual(
+    [...filterAll(document, '!(@.level == "info")').rows],
+    [1, 2, 3],
+  );
+  assert.deepEqual(
+    [...filterAll(document, "@.missing").rows],
+    [],
+    "existence of nothing",
+  );
+
+  document.free();
+});
+
+check("a filter that does not parse is refused, not guessed at", () => {
+  const { document } = open(LOG);
+
+  assert.throws(() => document.filterSet("@.level =="), /value/i);
+  assert.throws(() => document.filterSet('@..level == "error"'), /descendant/i);
+  assert.throws(() => document.filterSet("length(@.tags) > 1"), /function/i);
+
+  // And the refusal leaves nothing half-armed behind it.
+  assert.throws(() => document.filterStart(), /no filter/i);
+  document.free();
+});
+
+check("a filter yields between batches and survives a malformed record", () => {
+  // 5,000 records is three `filterStep` batches, which is what the Worker's
+  // yielding depends on; the broken one in the middle must not stop the pass.
+  const lines = [];
+  for (let i = 0; i < 5_000; i++) {
+    lines.push(i === 2_500 ? '{"n":' : `{"n":${i}}`);
+  }
+  const { document } = open(`${lines.join("\n")}\n`);
+
+  const run = filterAll(document, "@.n >= 4990");
+  assert.ok(run.steps >= 3, `expected several steps, got ${run.steps}`);
+  assert.equal(run.matches, 10, "the last ten records match");
+  assert.ok(
+    !run.rows.includes(2_500),
+    "the unparseable record simply does not match",
+  );
+
+  document.free();
+});
+
+check("the row layout version is the one the extension bundle expects", () => {
   // The bundle's copy lives in src/protocol/rows.ts. Two constants, one layout;
   // this is the seam where a stale `dist/` shows up as an error rather than as
   // wrong rows.
@@ -345,5 +512,5 @@ check('the row layout version is the one the extension bundle expects', () => {
 });
 
 console.log(`\nleviathan-wasm smoke test (engine ${coreVersion()})\n`);
-console.log(checks.join('\n'));
-console.log(process.exitCode ? '\nFAILED\n' : '\nall good\n');
+console.log(checks.join("\n"));
+console.log(process.exitCode ? "\nFAILED\n" : "\nall good\n");

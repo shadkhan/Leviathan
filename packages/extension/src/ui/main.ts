@@ -17,72 +17,82 @@
  * the store, and moves no DOM at all.
  */
 
-import { type FoundEvent, type Format, type WorkerEvent } from '../protocol/index.js';
-import { RowBlock, type Row } from '../protocol/rows.js';
-import { Engine, EngineError } from './engine.js';
-import { VirtualList } from './list.js';
-import { Search, describeSearch } from './search.js';
-import { BLOCK_ROWS, RowStore } from './store.js';
-import { parsePath, type Step } from './path.js';
-import { Tree, type Branch, type Located } from './tree.js';
+import {
+  searchModeOf,
+  type FoundEvent,
+  type Format,
+  type SearchMode,
+  type WorkerEvent,
+} from "../protocol/index.js";
+import { RowBlock, type Row } from "../protocol/rows.js";
+import { Engine, EngineError } from "./engine.js";
+import { VirtualList } from "./list.js";
+import { Search, describeSearch } from "./search.js";
+import { BLOCK_ROWS, RowStore } from "./store.js";
+import { parsePath, type Step } from "./path.js";
+import { Tree, type Branch, type Located } from "./tree.js";
 
 /** Look up a required element, failing loudly rather than at first null deref. */
 function el<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
   if (!found) {
-    throw new Error(`viewer.html is missing #${id} — the HTML and this bundle disagree.`);
+    throw new Error(
+      `viewer.html is missing #${id} — the HTML and this bundle disagree.`,
+    );
   }
   return found as T;
 }
 
-const statusDot = el('status').querySelector<HTMLElement>('.dot');
-const statusText = el('status-text');
-const engineVersion = el('engine-version');
+const statusDot = el("status").querySelector<HTMLElement>(".dot");
+const statusText = el("status-text");
+const engineVersion = el("engine-version");
 
-const fileInfo = el('file-info');
-const fileName = el('file-name');
-const fileFacts = el('file-facts');
+const fileInfo = el("file-info");
+const fileName = el("file-name");
+const fileFacts = el("file-facts");
 
-const pick = el<HTMLButtonElement>('pick');
-const pickEmpty = el<HTMLButtonElement>('pick-empty');
-const filePicker = el<HTMLInputElement>('file');
-const pickFolder = el<HTMLButtonElement>('pick-folder');
-const folderPicker = el<HTMLInputElement>('folder');
-const fileList = el('file-list');
-const drop = el('drop');
-const paste = el<HTMLTextAreaElement>('paste');
-const empty = el('empty');
+const pick = el<HTMLButtonElement>("pick");
+const pickEmpty = el<HTMLButtonElement>("pick-empty");
+const filePicker = el<HTMLInputElement>("file");
+const pickFolder = el<HTMLButtonElement>("pick-folder");
+const folderPicker = el<HTMLInputElement>("folder");
+const fileList = el("file-list");
+const drop = el("drop");
+const paste = el<HTMLTextAreaElement>("paste");
+const empty = el("empty");
 
-const crumbs = el('crumbs');
-const indexing = el('indexing');
-const progressFill = el('progress-fill');
-const indexState = el('index-state');
-const cancel = el<HTMLButtonElement>('cancel');
+const crumbs = el("crumbs");
+const indexing = el("indexing");
+const progressFill = el("progress-fill");
+const indexState = el("index-state");
+const cancel = el<HTMLButtonElement>("cancel");
 
-const gotoBar = el('goto-bar');
-const gotoInput = el<HTMLInputElement>('goto-input');
-const collapseAllButton = el<HTMLButtonElement>('collapse-all');
-const validateButton = el<HTMLButtonElement>('validate');
-const problems = el('problems');
-const problemsTitle = el('problems-title');
-const problemsState = el('problems-state');
-const problemsClose = el<HTMLButtonElement>('problems-close');
-const problemsList = el('problems-list');
-const findBar = el('find-bar');
-const findInput = el<HTMLInputElement>('find-input');
-const findStatus = el('find-status');
-const findFilter = el<HTMLButtonElement>('find-filter');
-const findPrev = el<HTMLButtonElement>('find-prev');
-const findNext = el<HTMLButtonElement>('find-next');
+const gotoBar = el("goto-bar");
+const gotoInput = el<HTMLInputElement>("goto-input");
+const collapseAllButton = el<HTMLButtonElement>("collapse-all");
+const validateButton = el<HTMLButtonElement>("validate");
+const pickSchema = el<HTMLButtonElement>("pick-schema");
+const schemaFile = el<HTMLInputElement>("schema-file");
+const problems = el("problems");
+const problemsTitle = el("problems-title");
+const problemsState = el("problems-state");
+const problemsClose = el<HTMLButtonElement>("problems-close");
+const problemsList = el("problems-list");
+const findBar = el("find-bar");
+const findInput = el<HTMLInputElement>("find-input");
+const findStatus = el("find-status");
+const findFilter = el<HTMLButtonElement>("find-filter");
+const findPrev = el<HTMLButtonElement>("find-prev");
+const findNext = el<HTMLButtonElement>("find-next");
 
-const viewport = el('viewport');
-const canvas = el('canvas');
+const viewport = el("viewport");
+const canvas = el("canvas");
 
-const usageInfo = el('usage');
-const selectionInfo = el('selection');
-const copyPath = el<HTMLButtonElement>('copy-path');
-const copyValue = el<HTMLButtonElement>('copy-value');
-const notice = el<HTMLOutputElement>('notice');
+const usageInfo = el("usage");
+const selectionInfo = el("selection");
+const copyPath = el<HTMLButtonElement>("copy-path");
+const copyValue = el<HTMLButtonElement>("copy-value");
+const notice = el<HTMLOutputElement>("notice");
 
 /**
  * Row height, taken from the stylesheet rather than duplicated here.
@@ -92,7 +102,9 @@ const notice = el<HTMLOutputElement>('notice');
  * looks like a rendering glitch and is actually a constant in two files.
  */
 const ROW_HEIGHT =
-  Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row-h')) || 22;
+  Number.parseFloat(
+    getComputedStyle(document.documentElement).getPropertyValue("--row-h"),
+  ) || 22;
 
 /**
  * How far ahead of the viewport a container is kept indexed.
@@ -105,37 +117,39 @@ const PREFETCH_ROWS = BLOCK_ROWS * 2;
 /** Bytes of a value the clipboard will take before it is cut short. */
 const COPY_LIMIT = 4 * 1024 * 1024;
 
-function setStatus(state: 'pending' | 'ready' | 'failed', text: string): void {
-  statusDot?.setAttribute('data-state', state);
+function setStatus(state: "pending" | "ready" | "failed", text: string): void {
+  statusDot?.setAttribute("data-state", state);
   statusText.textContent = text;
 }
 
-function say(state: 'ok' | 'err' | '', text: string): void {
-  notice.dataset['state'] = state;
+function say(state: "ok" | "err" | "", text: string): void {
+  notice.dataset["state"] = state;
   notice.textContent = text;
 }
 
 /** Render a thrown value in a way that names the layer that failed. */
 function describe(thrown: unknown): string {
   if (thrown instanceof EngineError) {
-    return thrown.cause === undefined ? thrown.message : `${thrown.message} (${thrown.cause})`;
+    return thrown.cause === undefined
+      ? thrown.message
+      : `${thrown.message} (${thrown.cause})`;
   }
   return thrown instanceof Error ? thrown.message : String(thrown);
 }
 
 /** How each detected format reads to someone who just dropped a file. */
 const FORMAT_LABEL: Record<Format, string> = {
-  'single-document': 'JSON document',
-  ndjson: 'NDJSON',
-  empty: 'empty',
-  unknown: 'not JSON',
+  "single-document": "JSON document",
+  ndjson: "NDJSON",
+  empty: "empty",
+  unknown: "not JSON",
 };
 
 /** Why indexing stopped early, said the way a user would say it. */
-const STOPPED: Record<'malformed' | 'cancelled' | 'error', string> = {
-  malformed: 'stopped at a syntax error',
-  cancelled: 'stopped',
-  error: 'unreadable',
+const STOPPED: Record<"malformed" | "cancelled" | "error", string> = {
+  malformed: "stopped at a syntax error",
+  cancelled: "stopped",
+  error: "unreadable",
 };
 
 /**
@@ -152,7 +166,7 @@ function grouped(value: number): string {
   if (digits.length <= 3) {
     return digits;
   }
-  let out = '';
+  let out = "";
   let cut = digits.length;
   while (cut > 3) {
     cut -= 3;
@@ -161,7 +175,7 @@ function grouped(value: number): string {
   return digits.slice(0, cut) + out;
 }
 
-const UNITS = ['B', 'kB', 'MB', 'GB', 'TB'];
+const UNITS = ["B", "kB", "MB", "GB", "TB"];
 
 function humanBytes(bytes: number): string {
   let value = bytes;
@@ -176,9 +190,9 @@ function humanBytes(bytes: number): string {
 
 // ---------------------------------------------------------------- the parts
 
-const worker = new Worker(new URL('worker.js', import.meta.url), {
-  type: 'module',
-  name: 'leviathan-engine',
+const worker = new Worker(new URL("worker.js", import.meta.url), {
+  type: "module",
+  name: "leviathan-engine",
 });
 
 const engine = new Engine(worker, onEvent);
@@ -197,10 +211,13 @@ const store = new RowStore(engine, {
   },
   incomplete: (container) => {
     const branch = tree.branchOf(container);
-    say('err', `A container ends early — showing the ${branch?.count ?? 0} children found.`);
+    say(
+      "err",
+      `A container ends early — showing the ${branch?.count ?? 0} children found.`,
+    );
   },
   failed: (thrown) => {
-    say('err', describe(thrown));
+    say("err", describe(thrown));
   },
 });
 
@@ -284,7 +301,12 @@ interface Parts {
 }
 
 /** Assign only when the value actually changed. */
-function set(part: Parts, slot: string, value: string, apply: (v: string) => void): void {
+function set(
+  part: Parts,
+  slot: string,
+  value: string,
+  apply: (v: string) => void,
+): void {
   if (part.last[slot] !== value) {
     part.last[slot] = value;
     apply(value);
@@ -302,27 +324,27 @@ function set(part: Parts, slot: string, value: string, apply: (v: string) => voi
 const parts = new WeakMap<HTMLElement, Parts>();
 
 function createRow(): HTMLElement {
-  const row = document.createElement('div');
-  row.className = 'tree-row';
-  row.setAttribute('role', 'treeitem');
+  const row = document.createElement("div");
+  row.className = "tree-row";
+  row.setAttribute("role", "treeitem");
 
-  const gutter = document.createElement('span');
-  gutter.className = 'gutter';
+  const gutter = document.createElement("span");
+  gutter.className = "gutter";
 
-  const twisty = document.createElement('button');
-  twisty.type = 'button';
-  twisty.className = 'twisty';
+  const twisty = document.createElement("button");
+  twisty.type = "button";
+  twisty.className = "twisty";
   twisty.tabIndex = -1;
-  twisty.setAttribute('aria-hidden', 'true');
+  twisty.setAttribute("aria-hidden", "true");
 
-  const key = document.createElement('span');
-  key.className = 'key';
+  const key = document.createElement("span");
+  key.className = "key";
 
-  const value = document.createElement('span');
-  value.className = 'val';
+  const value = document.createElement("span");
+  value.className = "val";
 
-  const note = document.createElement('span');
-  note.className = 'note';
+  const note = document.createElement("span");
+  note.className = "note";
 
   row.append(gutter, twisty, key, value, note);
   parts.set(row, { gutter, twisty, key, value, note, last: {} });
@@ -340,68 +362,75 @@ function paintRow(element: HTMLElement, flat: number): void {
   const row = store.rowAt(at.branch.container, index);
 
   const flatText = String(flat);
-  set(part, 'flat', flatText, (v) => {
-    element.dataset['flat'] = v;
+  set(part, "flat", flatText, (v) => {
+    element.dataset["flat"] = v;
     element.id = `row-${v}`;
   });
-  set(part, 'depth', String(at.depth), (v) => {
-    element.style.setProperty('--depth', v);
-    element.setAttribute('aria-level', String(at.depth + 1));
+  set(part, "depth", String(at.depth), (v) => {
+    element.style.setProperty("--depth", v);
+    element.setAttribute("aria-level", String(at.depth + 1));
   });
-  set(part, 'posinset', String(at.index + 1), (v) => element.setAttribute('aria-posinset', v));
-  set(part, 'setsize', String(at.branch.complete ? at.branch.count : -1), (v) =>
-    element.setAttribute('aria-setsize', v),
+  set(part, "posinset", String(at.index + 1), (v) =>
+    element.setAttribute("aria-posinset", v),
+  );
+  set(part, "setsize", String(at.branch.complete ? at.branch.count : -1), (v) =>
+    element.setAttribute("aria-setsize", v),
   );
 
   const selected = isSelected(at);
-  set(part, 'selected', selected ? 'true' : 'false', (v) =>
-    element.setAttribute('aria-selected', v),
+  set(part, "selected", selected ? "true" : "false", (v) =>
+    element.setAttribute("aria-selected", v),
   );
   if (selected) {
-    viewport.setAttribute('aria-activedescendant', element.id);
+    viewport.setAttribute("aria-activedescendant", element.id);
   }
 
   // Only root rows can carry a match: a hit is a byte offset, and the table it
   // is resolved against is tier 1 (`rows_of` in the core). A match inside a
   // nested value therefore marks the record that contains it, which is the row
   // the user is looking for anyway.
-  set(part, 'problem', at.branch.container === null && problemRows.has(index) ? 'true' : '', (v) => {
-    if (v === '') delete element.dataset['problem'];
-    else element.dataset['problem'] = v;
-  });
+  set(
+    part,
+    "problem",
+    at.branch.container === null && problemRows.has(index) ? "true" : "",
+    (v) => {
+      if (v === "") delete element.dataset["problem"];
+      else element.dataset["problem"] = v;
+    },
+  );
 
   const mark = at.branch.container === null ? search.mark(index) : undefined;
-  set(part, 'match', mark ?? '', (v) => {
-    if (v === '') {
-      delete element.dataset['match'];
+  set(part, "match", mark ?? "", (v) => {
+    if (v === "") {
+      delete element.dataset["match"];
     } else {
-      element.dataset['match'] = v === 'current' ? 'current' : 'true';
+      element.dataset["match"] = v === "current" ? "current" : "true";
     }
   });
 
-  set(part, 'gutter', grouped(index), (v) => {
+  set(part, "gutter", grouped(index), (v) => {
     part.gutter.textContent = v;
   });
 
   if (!row) {
     // The bytes have not arrived. The row still occupies its place, so nothing
     // moves when it does.
-    set(part, 'kind', 'pending', (v) => {
-      element.dataset['loading'] = 'true';
-      element.dataset['kind'] = v;
-      element.removeAttribute('aria-expanded');
+    set(part, "kind", "pending", (v) => {
+      element.dataset["loading"] = "true";
+      element.dataset["kind"] = v;
+      element.removeAttribute("aria-expanded");
     });
-    set(part, 'twisty', '', (v) => {
+    set(part, "twisty", "", (v) => {
       part.twisty.textContent = v;
-      part.twisty.removeAttribute('title');
+      part.twisty.removeAttribute("title");
     });
-    set(part, 'key', '', (v) => {
+    set(part, "key", "", (v) => {
       part.key.textContent = v;
     });
-    set(part, 'value', '…', (v) => {
+    set(part, "value", "…", (v) => {
       part.value.textContent = v;
     });
-    set(part, 'note', '', (v) => {
+    set(part, "note", "", (v) => {
       part.note.textContent = v;
     });
     keepIndexed(at);
@@ -410,37 +439,52 @@ function paintRow(element: HTMLElement, flat: number): void {
 
   const open = row.expandable ? tree.branchOf(row.offset) : undefined;
 
-  set(part, 'kind', row.kind, (v) => {
-    delete element.dataset['loading'];
-    element.dataset['kind'] = v;
+  set(part, "kind", row.kind, (v) => {
+    delete element.dataset["loading"];
+    element.dataset["kind"] = v;
   });
-  set(part, 'expanded', row.expandable ? (open ? 'true' : 'false') : '', (v) => {
-    if (v === '') {
-      element.removeAttribute('aria-expanded');
-    } else {
-      element.setAttribute('aria-expanded', v);
-    }
-  });
+  set(
+    part,
+    "expanded",
+    row.expandable ? (open ? "true" : "false") : "",
+    (v) => {
+      if (v === "") {
+        element.removeAttribute("aria-expanded");
+      } else {
+        element.setAttribute("aria-expanded", v);
+      }
+    },
+  );
   // U+2212 rather than a hyphen: a hyphen sits high and short next to a plus,
   // and the pair has to read as one control at 15 px.
-  set(part, 'twisty', row.expandable ? (open ? '−' : '+') : '', (v) => {
+  set(part, "twisty", row.expandable ? (open ? "−" : "+") : "", (v) => {
     part.twisty.textContent = v;
-    if (v === '') {
-      part.twisty.removeAttribute('title');
+    if (v === "") {
+      part.twisty.removeAttribute("title");
     } else {
-      part.twisty.title = v === '−' ? 'Collapse' : 'Expand';
+      part.twisty.title = v === "−" ? "Collapse" : "Expand";
     }
   });
 
-  set(part, 'key', row.key === null ? '' : `${JSON.stringify(row.key)}:`, (v) => {
-    part.key.textContent = v;
-  });
-  set(part, 'value', summarize(row), (v) => {
+  set(
+    part,
+    "key",
+    row.key === null ? "" : `${JSON.stringify(row.key)}:`,
+    (v) => {
+      part.key.textContent = v;
+    },
+  );
+  set(part, "value", summarize(row), (v) => {
     part.value.textContent = v;
   });
-  set(part, 'note', open && !open.complete ? 'indexing…' : countOf(row), (v) => {
-    part.note.textContent = v;
-  });
+  set(
+    part,
+    "note",
+    open && !open.complete ? "indexing…" : countOf(row),
+    (v) => {
+      part.note.textContent = v;
+    },
+  );
 
   keepIndexed(at);
 }
@@ -454,7 +498,7 @@ function paintRow(element: HTMLElement, flat: number): void {
  */
 function keepIndexed(at: Located): void {
   const container = at.branch.container;
-  if (typeof container === 'number' && !at.branch.complete) {
+  if (typeof container === "number" && !at.branch.complete) {
     if (at.index + PREFETCH_ROWS >= at.branch.count) {
       store.grow(container, at.index + PREFETCH_ROWS);
     }
@@ -471,8 +515,8 @@ function keepIndexed(at: Located): void {
  * note, where it is still visible but no longer the only thing there.
  */
 function summarize(row: Row): string {
-  if (row.kind === 'object' || row.kind === 'array') {
-    const [open, close] = row.kind === 'object' ? ['{', '}'] : ['[', ']'];
+  if (row.kind === "object" || row.kind === "array") {
+    const [open, close] = row.kind === "object" ? ["{", "}"] : ["[", "]"];
     if (row.children === 0) {
       return `${open}${close}`;
     }
@@ -484,15 +528,15 @@ function summarize(row: Row): string {
 
 /** The item count for a container, shown dimmed at the end of the row. */
 function countOf(row: Row): string {
-  if (row.kind !== 'object' && row.kind !== 'array') {
-    return '';
+  if (row.kind !== "object" && row.kind !== "array") {
+    return "";
   }
   if (row.children === 0) {
-    return 'empty';
+    return "empty";
   }
   // An inexact count is the budget having run out, not a mystery — C33.
-  const count = `${grouped(row.children)}${row.childrenExact ? '' : '+'}`;
-  return `${count} ${row.children === 1 ? 'item' : 'items'}`;
+  const count = `${grouped(row.children)}${row.childrenExact ? "" : "+"}`;
+  return `${count} ${row.children === 1 ? "item" : "items"}`;
 }
 
 // -------------------------------------------------------------- structure
@@ -514,7 +558,10 @@ let fileBytes = 0;
  */
 function renderUsage(usage: { index: number; heap: number }): void {
   usageInfo.hidden = false;
-  const share = fileBytes > 0 ? ` · ${((usage.index / fileBytes) * 100).toFixed(1)}% of file` : '';
+  const share =
+    fileBytes > 0
+      ? ` · ${((usage.index / fileBytes) * 100).toFixed(1)}% of file`
+      : "";
   usageInfo.textContent = `index ${humanBytes(usage.index)} · heap ${humanBytes(usage.heap)}${share}`;
   usageInfo.title =
     `Index: ${usage.index.toLocaleString()} bytes of node offsets, tier 1 plus resident expansions.\n` +
@@ -536,7 +583,7 @@ function applyRootCount(): void {
   } else {
     tree.setCount(tree.root, rootRows, rootComplete);
   }
-  viewport.dataset['filtered'] = filtered() ? 'true' : 'false';
+  viewport.dataset["filtered"] = filtered() ? "true" : "false";
 }
 
 /**
@@ -567,7 +614,11 @@ function sync(): void {
 }
 
 function isSelected(at: Located): boolean {
-  return selection !== undefined && selection.branch === at.branch && selection.index === at.index;
+  return (
+    selection !== undefined &&
+    selection.branch === at.branch &&
+    selection.index === at.index
+  );
 }
 
 /** Open or close the container at a flat row index. */
@@ -630,7 +681,9 @@ function move(delta: number): void {
   if (tree.size === 0) {
     return;
   }
-  const from = selection ? tree.flatIndexOf(selection.branch, selection.index) : -1;
+  const from = selection
+    ? tree.flatIndexOf(selection.branch, selection.index)
+    : -1;
   const to = Math.max(0, Math.min(tree.size - 1, from + delta));
   select(tree.locate(to));
 }
@@ -655,7 +708,7 @@ async function rowFor(branch: Branch, index: number): Promise<Row | undefined> {
   if (cached) {
     return cached;
   }
-  const { packed } = await engine.call('rows', {
+  const { packed } = await engine.call("rows", {
     container: branch.container,
     start: index,
     count: 1,
@@ -669,7 +722,9 @@ function segment(row: Row | undefined, index: number): string {
   if (!row || row.key === null) {
     return `[${index}]`;
   }
-  return /^[A-Za-z_$][\w$]*$/.test(row.key) ? `.${row.key}` : `[${JSON.stringify(row.key)}]`;
+  return /^[A-Za-z_$][\w$]*$/.test(row.key)
+    ? `.${row.key}`
+    : `[${JSON.stringify(row.key)}]`;
 }
 
 /** The chain of (branch, index) from the root down to a selection. */
@@ -695,7 +750,7 @@ async function pathOf(of: Selection): Promise<string> {
       segment(await rowFor(step.branch, step.index), recordIndex(step)),
     ),
   );
-  return `$${steps.join('')}`;
+  return `$${steps.join("")}`;
 }
 
 function renderCrumbs(): void {
@@ -705,9 +760,9 @@ function renderCrumbs(): void {
   }
 
   const chain = ancestry(selection);
-  const root = document.createElement('span');
-  root.className = 'sep';
-  root.textContent = '$';
+  const root = document.createElement("span");
+  root.className = "sep";
+  root.textContent = "$";
   crumbs.append(root);
 
   for (const [depth, step] of chain.entries()) {
@@ -718,17 +773,17 @@ function renderCrumbs(): void {
     const last = depth === chain.length - 1;
 
     if (last) {
-      const here = document.createElement('span');
-      here.className = 'here';
+      const here = document.createElement("span");
+      here.className = "here";
       here.textContent = label;
       crumbs.append(here);
       continue;
     }
 
-    const button = document.createElement('button');
-    button.type = 'button';
+    const button = document.createElement("button");
+    button.type = "button";
     button.textContent = label;
-    button.addEventListener('click', () => {
+    button.addEventListener("click", () => {
       select(step);
     });
     crumbs.append(button);
@@ -738,27 +793,29 @@ function renderCrumbs(): void {
 function renderSelectionInfo(): void {
   selectionInfo.replaceChildren();
   if (!selection) {
-    const hint = document.createElement('span');
-    hint.className = 'hint';
-    hint.textContent = 'Select a row to see its path and offset.';
+    const hint = document.createElement("span");
+    hint.className = "hint";
+    hint.textContent = "Select a row to see its path and offset.";
     selectionInfo.append(hint);
     return;
   }
 
   const row = rowAtPosition(selection);
-  const path = document.createElement('span');
-  path.className = 'path';
+  const path = document.createElement("span");
+  path.className = "path";
   path.textContent = `$${ancestry(selection)
     .map((step) => segment(rowAtPosition(step), recordIndex(step)))
-    .join('')}`;
+    .join("")}`;
 
-  const facts = document.createElement('span');
-  facts.className = 'facts';
+  const facts = document.createElement("span");
+  facts.className = "facts";
   facts.textContent = row
     ? `${row.kind} · byte ${row.valueStart.toLocaleString()}${
-        row.valueEnd === null ? '' : ` · ${humanBytes(row.valueEnd - row.valueStart)}`
+        row.valueEnd === null
+          ? ""
+          : ` · ${humanBytes(row.valueEnd - row.valueStart)}`
       }`
-    : 'loading…';
+    : "loading…";
 
   selectionInfo.append(path, facts);
 }
@@ -768,20 +825,20 @@ function renderSelectionInfo(): void {
 async function toClipboard(text: string, what: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
-    say('ok', `${what} copied — ${text.length.toLocaleString()} characters`);
+    say("ok", `${what} copied — ${text.length.toLocaleString()} characters`);
   } catch (thrown) {
-    say('err', `Could not copy: ${describe(thrown)}`);
+    say("err", `Could not copy: ${describe(thrown)}`);
   }
 }
 
-copyPath.addEventListener('click', () => {
+copyPath.addEventListener("click", () => {
   if (!selection) {
     return;
   }
-  void pathOf(selection).then((path) => toClipboard(path, 'Path'));
+  void pathOf(selection).then((path) => toClipboard(path, "Path"));
 });
 
-copyValue.addEventListener('click', () => {
+copyValue.addEventListener("click", () => {
   void copySelectedValue();
 });
 
@@ -799,36 +856,36 @@ async function copySelectedValue(): Promise<void> {
   }
   const row = await rowFor(selection.branch, selection.index);
   if (!row) {
-    say('err', 'That row is not loaded yet.');
+    say("err", "That row is not loaded yet.");
     return;
   }
 
   try {
-    const { text, truncated } = await engine.call('text', {
+    const { text, truncated } = await engine.call("text", {
       start: row.valueStart,
       end: row.valueEnd,
       limit: COPY_LIMIT,
     });
-    await toClipboard(text, 'Value');
+    await toClipboard(text, "Value");
     if (truncated) {
-      say('err', `Value copied, cut at ${humanBytes(COPY_LIMIT)}.`);
+      say("err", `Value copied, cut at ${humanBytes(COPY_LIMIT)}.`);
     }
   } catch (thrown) {
-    say('err', describe(thrown));
+    say("err", describe(thrown));
   }
 }
 
 // ------------------------------------------------------------- interaction
 
-viewport.addEventListener('mousedown', (event) => {
+viewport.addEventListener("mousedown", (event) => {
   const target = event.target as HTMLElement;
-  const rowElement = target.closest<HTMLElement>('.tree-row');
-  const flat = Number(rowElement?.dataset['flat']);
+  const rowElement = target.closest<HTMLElement>(".tree-row");
+  const flat = Number(rowElement?.dataset["flat"]);
   if (!rowElement || Number.isNaN(flat)) {
     return;
   }
 
-  if (target.classList.contains('twisty')) {
+  if (target.classList.contains("twisty")) {
     event.preventDefault();
     toggle(flat);
     selectFlat(flat);
@@ -837,21 +894,23 @@ viewport.addEventListener('mousedown', (event) => {
   selectFlat(flat);
 });
 
-viewport.addEventListener('dblclick', (event) => {
-  const rowElement = (event.target as HTMLElement).closest<HTMLElement>('.tree-row');
-  const flat = Number(rowElement?.dataset['flat']);
+viewport.addEventListener("dblclick", (event) => {
+  const rowElement = (event.target as HTMLElement).closest<HTMLElement>(
+    ".tree-row",
+  );
+  const flat = Number(rowElement?.dataset["flat"]);
   if (rowElement && !Number.isNaN(flat)) {
     toggle(flat);
   }
 });
 
-viewport.addEventListener('keydown', (event) => {
+viewport.addEventListener("keydown", (event) => {
   if (event.altKey || event.ctrlKey || event.metaKey) {
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'c') {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
       event.preventDefault();
       if (event.shiftKey) {
         if (selection) {
-          void pathOf(selection).then((path) => toClipboard(path, 'Path'));
+          void pathOf(selection).then((path) => toClipboard(path, "Path"));
         }
       } else {
         void copySelectedValue();
@@ -860,28 +919,30 @@ viewport.addEventListener('keydown', (event) => {
     return;
   }
 
-  const flat = selection ? tree.flatIndexOf(selection.branch, selection.index) : 0;
+  const flat = selection
+    ? tree.flatIndexOf(selection.branch, selection.index)
+    : 0;
 
   switch (event.key) {
-    case 'ArrowDown':
+    case "ArrowDown":
       move(1);
       break;
-    case 'ArrowUp':
+    case "ArrowUp":
       move(-1);
       break;
-    case 'PageDown':
+    case "PageDown":
       move(list.pageSize);
       break;
-    case 'PageUp':
+    case "PageUp":
       move(-list.pageSize);
       break;
-    case 'Home':
+    case "Home":
       selectFlat(0);
       break;
-    case 'End':
+    case "End":
       selectFlat(tree.size - 1);
       break;
-    case 'ArrowRight': {
+    case "ArrowRight": {
       if (!selection) {
         selectFlat(0);
         break;
@@ -894,7 +955,7 @@ viewport.addEventListener('keydown', (event) => {
       }
       break;
     }
-    case 'ArrowLeft': {
+    case "ArrowLeft": {
       if (!selection) {
         selectFlat(0);
         break;
@@ -903,12 +964,15 @@ viewport.addEventListener('keydown', (event) => {
       if (row?.expandable && tree.branchOf(row.offset)) {
         toggle(flat);
       } else if (selection.branch.parent) {
-        select({ branch: selection.branch.parent, index: selection.branch.indexInParent });
+        select({
+          branch: selection.branch.parent,
+          index: selection.branch.indexInParent,
+        });
       }
       break;
     }
-    case 'Enter':
-    case ' ':
+    case "Enter":
+    case " ":
       toggle(flat);
       break;
     default:
@@ -936,7 +1000,7 @@ function resetProblems(): void {
 }
 
 /** One instalment of validation results. */
-function onValidated(event: Extract<WorkerEvent, { kind: 'validated' }>): void {
+function onValidated(event: Extract<WorkerEvent, { kind: "validated" }>): void {
   if (event.pass < validating) {
     return; // A superseded pass still reporting.
   }
@@ -944,7 +1008,7 @@ function onValidated(event: Extract<WorkerEvent, { kind: 'validated' }>): void {
   problems.hidden = false;
 
   if (event.error) {
-    say('err', describe(new EngineError(event.error)));
+    say("err", describe(new EngineError(event.error)));
   }
 
   for (const problem of event.problems) {
@@ -955,25 +1019,25 @@ function onValidated(event: Extract<WorkerEvent, { kind: 'validated' }>): void {
       continue;
     }
 
-    const item = document.createElement('li');
-    const button = document.createElement('button');
-    button.type = 'button';
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
 
-    const where = document.createElement('span');
-    where.className = 'where';
+    const where = document.createElement("span");
+    where.className = "where";
     where.textContent = `${grouped(problem.line)}:${grouped(problem.column)}`;
 
-    const what = document.createElement('span');
-    what.className = 'what';
+    const what = document.createElement("span");
+    what.className = "what";
     what.textContent = problem.message;
 
     button.append(where, what);
-    button.addEventListener('click', () => {
+    button.addEventListener("click", () => {
       // Requirement 8: an error location you can go to. The row was resolved
       // by the engine, where the index is; if the byte fell before the first
       // row there is nothing to select, and the offset is still shown.
       if (problem.row === null) {
-        say('err', `byte ${grouped(problem.offset)} is before the first row`);
+        say("err", `byte ${grouped(problem.offset)} is before the first row`);
         return;
       }
       setFiltering(false);
@@ -985,12 +1049,14 @@ function onValidated(event: Extract<WorkerEvent, { kind: 'validated' }>): void {
     problemsList.append(item);
   }
 
-  const checked = event.bytes > 0 ? Math.round((event.checked / event.bytes) * 100) : 100;
-  const capped = event.total > problemsList.childElementCount ? ' (first 500 shown)' : '';
+  const checked =
+    event.bytes > 0 ? Math.round((event.checked / event.bytes) * 100) : 100;
+  const capped =
+    event.total > problemsList.childElementCount ? " (first 500 shown)" : "";
   problemsTitle.textContent =
     event.total === 0 && event.done
-      ? 'No syntax errors'
-      : `${grouped(event.total)} ${event.total === 1 ? 'problem' : 'problems'}`;
+      ? "No syntax errors"
+      : `${grouped(event.total)} ${event.total === 1 ? "problem" : "problems"}`;
   problemsState.textContent = event.done
     ? `${grouped(event.values)} values checked${capped}`
     : `checking… ${checked}%`;
@@ -998,19 +1064,54 @@ function onValidated(event: Extract<WorkerEvent, { kind: 'validated' }>): void {
   list.refresh();
 }
 
-validateButton.addEventListener('click', () => {
+validateButton.addEventListener("click", () => {
   resetProblems();
   problems.hidden = false;
-  problemsTitle.textContent = 'Checking…';
-  problemsState.textContent = '';
-  engine.call('validate', {}).catch((thrown: unknown) => {
-    say('err', describe(thrown));
+  problemsTitle.textContent = "Checking…";
+  problemsState.textContent = "";
+  engine.call("validate", {}).catch((thrown: unknown) => {
+    say("err", describe(thrown));
   });
 });
 
-problemsClose.addEventListener('click', () => {
+pickSchema.addEventListener("click", () => {
+  schemaFile.click();
+});
+
+schemaFile.addEventListener("change", () => {
+  const chosen = schemaFile.files?.[0];
+  if (!chosen) {
+    return;
+  }
+  resetProblems();
+  problems.hidden = false;
+  problemsTitle.textContent = `Checking against ${chosen.name}…`;
+  problemsState.textContent = "";
+
+  // Read locally and hand over the text. A schema is small — kilobytes — which
+  // is why it may be held whole where a document may not, and it is read here
+  // rather than fetched because a remote `$ref` would need a host permission
+  // the manifest deliberately does not request.
+  chosen
+    .text()
+    .then((source) => engine.call("schema", { source }))
+    .then(({ unsupported }) => {
+      if (unsupported.length > 0) {
+        say(
+          "err",
+          `${chosen.name}: ${unsupported.join(", ")} ${unsupported.length === 1 ? "is" : "are"} not checked by this validator.`,
+        );
+      }
+    })
+    .catch((thrown: unknown) => {
+      problems.hidden = true;
+      say("err", describe(thrown));
+    });
+});
+
+problemsClose.addEventListener("click", () => {
   problems.hidden = true;
-  void engine.call('validateStop', {}).catch(() => {
+  void engine.call("validateStop", {}).catch(() => {
     // Nothing to stop is not a failure.
   });
 });
@@ -1028,13 +1129,20 @@ const PATH_SCAN_LIMIT = 200_000;
  * to materialize rows until one matches. Bounded by {@link PATH_SCAN_LIMIT} so
  * a wrong path against a five-million-element array stops rather than hangs.
  */
-async function resolveStep(branch: Branch, step: Step): Promise<number | undefined> {
-  if ('index' in step) {
+async function resolveStep(
+  branch: Branch,
+  step: Step,
+): Promise<number | undefined> {
+  if ("index" in step) {
     return step.index < branch.count ? step.index : undefined;
   }
 
-  for (let index = 0; index < Math.min(branch.count, PATH_SCAN_LIMIT); index += BLOCK_ROWS) {
-    const { packed } = await engine.call('rows', {
+  for (
+    let index = 0;
+    index < Math.min(branch.count, PATH_SCAN_LIMIT);
+    index += BLOCK_ROWS
+  ) {
+    const { packed } = await engine.call("rows", {
       container: branch.container,
       start: index,
       count: BLOCK_ROWS,
@@ -1090,10 +1198,18 @@ async function goToPath(steps: Step[]): Promise<boolean> {
       branch = tree.open(at, row.offset, extent.count, extent.complete);
       store.grow(row.offset, PREFETCH_ROWS);
       // The next step needs children to look at, so wait for the first batch.
-      for (let spin = 0; spin < 200 && store.extentOf(row.offset).count === 0; spin++) {
+      for (
+        let spin = 0;
+        spin < 200 && store.extentOf(row.offset).count === 0;
+        spin++
+      ) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
-      tree.setCount(branch, store.extentOf(row.offset).count, store.extentOf(row.offset).complete);
+      tree.setCount(
+        branch,
+        store.extentOf(row.offset).count,
+        store.extentOf(row.offset).complete,
+      );
     }
     sync();
   }
@@ -1103,17 +1219,17 @@ async function goToPath(steps: Step[]): Promise<boolean> {
 /** Interpret whatever is in the box and go there. */
 async function goTo(text: string): Promise<boolean> {
   const trimmed = text.trim();
-  if (trimmed === '') {
+  if (trimmed === "") {
     return false;
   }
 
   // `@` means a byte offset — the form an error message or a hex editor gives.
-  if (trimmed.startsWith('@')) {
-    const offset = Number(trimmed.slice(1).replace(/[_,\s]/g, ''));
+  if (trimmed.startsWith("@")) {
+    const offset = Number(trimmed.slice(1).replace(/[_,\s]/g, ""));
     if (!Number.isFinite(offset) || offset < 0) {
       return false;
     }
-    const { row } = await engine.call('locate', { offset });
+    const { row } = await engine.call("locate", { offset });
     if (row === null) {
       return false;
     }
@@ -1124,7 +1240,7 @@ async function goTo(text: string): Promise<boolean> {
 
   // A bare number is a row.
   if (/^\d[\d,_\s]*$/.test(trimmed)) {
-    const row = Number(trimmed.replace(/[_,\s]/g, ''));
+    const row = Number(trimmed.replace(/[_,\s]/g, ""));
     if (!Number.isFinite(row) || row < 0 || row >= tree.root.count) {
       return false;
     }
@@ -1137,11 +1253,11 @@ async function goTo(text: string): Promise<boolean> {
   return steps ? goToPath(steps) : false;
 }
 
-gotoInput.addEventListener('keydown', (event) => {
-  if (event.key !== 'Enter') {
-    if (event.key === 'Escape') {
-      gotoInput.value = '';
-      delete gotoInput.dataset['state'];
+gotoInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") {
+    if (event.key === "Escape") {
+      gotoInput.value = "";
+      delete gotoInput.dataset["state"];
       viewport.focus();
     }
     return;
@@ -1150,26 +1266,35 @@ gotoInput.addEventListener('keydown', (event) => {
   const text = gotoInput.value;
   void goTo(text)
     .then((found) => {
-      gotoInput.dataset['state'] = found ? '' : 'bad';
-      say(found ? 'ok' : 'err', found ? `went to ${text.trim()}` : `no such row or path: ${text}`);
+      gotoInput.dataset["state"] = found ? "" : "bad";
+      say(
+        found ? "ok" : "err",
+        found ? `went to ${text.trim()}` : `no such row or path: ${text}`,
+      );
       if (found) {
         viewport.focus();
       }
     })
     .catch((thrown: unknown) => {
-      gotoInput.dataset['state'] = 'bad';
-      say('err', describe(thrown));
+      gotoInput.dataset["state"] = "bad";
+      say("err", describe(thrown));
     });
 });
 
-collapseAllButton.addEventListener('click', () => {
+collapseAllButton.addEventListener("click", () => {
   collapseAll();
   list.reset();
   sync();
-  say('ok', 'collapsed everything');
+  say("ok", "collapsed everything");
 });
 
 // ------------------------------------------------------------------- find
+
+/** Which engine the current box contents reach. Drives the wording, not just the call. */
+let searchMode: SearchMode = "literal";
+
+/** A filter that would not compile, shown in place of a result count. */
+let syntaxError = "";
 
 /** Turn filtering on or off, and put the tree back in a consistent state. */
 function setFiltering(on: boolean): void {
@@ -1177,7 +1302,7 @@ function setFiltering(on: boolean): void {
     return;
   }
   filtering = on;
-  findFilter.setAttribute('aria-pressed', on ? 'true' : 'false');
+  findFilter.setAttribute("aria-pressed", on ? "true" : "false");
   // Root positions change meaning, so anything open is hanging from an index
   // that no longer refers to what it did.
   collapseAll();
@@ -1189,6 +1314,7 @@ function setFiltering(on: boolean): void {
 function resetSearch(): void {
   const wasFiltered = filtered();
   search.reset();
+  syntaxError = "";
   if (wasFiltered) {
     // The filtered view is emptying, so every open branch's position is stale.
     collapseAll();
@@ -1201,13 +1327,22 @@ function resetSearch(): void {
 /** Start scanning for what is in the box, or clear if it is empty. */
 function runSearch(): void {
   const needle = findInput.value;
+  searchMode = searchModeOf(needle);
+  syntaxError = "";
 
   if (needle.length === 0) {
     resetSearch();
-    void engine.call('findStop', {}).catch(() => {
+    void engine.call("findStop", {}).catch(() => {
       // Nothing to stop is the common case and not worth saying.
     });
     return;
+  }
+
+  // A filter's whole output is "these records matched", so the filtered view is
+  // not an option alongside it — it *is* it. Turning it on here means the answer
+  // is on screen rather than scattered through 1.7 million rows as highlights.
+  if (searchMode === "filter") {
+    setFiltering(true);
   }
 
   search.begin();
@@ -1215,11 +1350,25 @@ function runSearch(): void {
   list.refresh();
   // Case-insensitive always, for now: it is what a find box is expected to do,
   // and a toggle is a control to explain in a toolbar that has to stay legible.
-  engine.call('find', { needle, caseSensitive: false }).catch((thrown: unknown) => {
-    search.fail();
-    say('err', describe(thrown));
-    renderFind();
-  });
+  // (A filter ignores it: `== "Error"` means what it says.)
+  engine.call("find", { needle, caseSensitive: false, mode: searchMode }).then(
+    ({ error }) => {
+      if (error === null) {
+        return;
+      }
+      // Not a toast: a half-typed expression is wrong for as long as it takes to
+      // finish typing it, and three toasts a second is how a good error becomes
+      // noise. It sits next to the box until the box is right.
+      syntaxError = error;
+      search.fail();
+      renderFind();
+    },
+    (thrown: unknown) => {
+      search.fail();
+      say("err", describe(thrown));
+      renderFind();
+    },
+  );
 }
 
 /** One instalment of results from the Worker. */
@@ -1230,7 +1379,7 @@ function onFound(event: FoundEvent): void {
   }
 
   if (event.error) {
-    say('err', describe(new EngineError(event.error)));
+    say("err", describe(new EngineError(event.error)));
   }
 
   // Rows appended to the filtered view make the tree taller; nothing already in
@@ -1262,28 +1411,35 @@ function goToMatch(n: number): void {
 }
 
 function renderFind(): void {
-  findInput.dataset['scanning'] = search.scanning ? 'true' : 'false';
+  findInput.dataset["scanning"] = search.scanning ? "true" : "false";
+  findInput.dataset["mode"] = searchMode;
   findPrev.disabled = search.size === 0;
   findNext.disabled = search.size === 0;
 
-  findStatus.textContent = describeSearch(search, findInput.value);
+  if (syntaxError !== "") {
+    findStatus.textContent = syntaxError;
+    findStatus.dataset["state"] = "error";
+    return;
+  }
+
+  findStatus.textContent = describeSearch(search, findInput.value, searchMode);
   if (findInput.value.length > 0 && search.matches === 0 && !search.scanning) {
-    findStatus.dataset['state'] = 'none';
+    findStatus.dataset["state"] = "none";
   } else {
-    delete findStatus.dataset['state'];
+    delete findStatus.dataset["state"];
   }
 }
 
 let findTimer: number | undefined;
-findInput.addEventListener('input', () => {
+findInput.addEventListener("input", () => {
   clearTimeout(findTimer);
   // Long enough that typing a word is one scan rather than five, short enough
   // that it feels like it reacted to the last keystroke.
   findTimer = self.setTimeout(runSearch, 200);
 });
 
-findInput.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') {
+findInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
     event.preventDefault();
     clearTimeout(findTimer);
     if (search.size === 0) {
@@ -1293,53 +1449,53 @@ findInput.addEventListener('keydown', (event) => {
     }
     return;
   }
-  if (event.key === 'Escape') {
+  if (event.key === "Escape") {
     event.preventDefault();
-    findInput.value = '';
+    findInput.value = "";
     resetSearch();
-    void engine.call('findStop', {}).catch(() => {
+    void engine.call("findStop", {}).catch(() => {
       // Stopping a scan that has already finished is not a failure.
     });
     viewport.focus();
   }
 });
 
-findFilter.addEventListener('click', () => {
+findFilter.addEventListener("click", () => {
   setFiltering(!filtering);
 });
 
-findNext.addEventListener('click', () => {
+findNext.addEventListener("click", () => {
   goToMatch(search.at + 1);
 });
-findPrev.addEventListener('click', () => {
+findPrev.addEventListener("click", () => {
   goToMatch(search.at - 1);
 });
 
 // Ctrl/Cmd+F anywhere on the page, including from inside the tree — the whole
 // point is that it is reachable without leaving the keyboard.
-document.addEventListener('keydown', (event) => {
+document.addEventListener("keydown", (event) => {
   if (findBar.hidden) {
     return;
   }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
     event.preventDefault();
     findInput.focus();
     findInput.select();
     return;
   }
-  if (event.altKey && event.key.toLowerCase() === 'f') {
+  if (event.altKey && event.key.toLowerCase() === "f") {
     event.preventDefault();
     setFiltering(!filtering);
     return;
   }
-  if (event.altKey && event.key.toLowerCase() === 'c') {
+  if (event.altKey && event.key.toLowerCase() === "c") {
     event.preventDefault();
     collapseAll();
     list.reset();
     sync();
     return;
   }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'g') {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "g") {
     event.preventDefault();
     gotoInput.focus();
     gotoInput.select();
@@ -1350,7 +1506,7 @@ document.addEventListener('keydown', (event) => {
 
 /** Hand a file to the engine and show its root. */
 async function openFile(source: File): Promise<void> {
-  say('', `opening ${source.name}…`);
+  say("", `opening ${source.name}…`);
   selection = undefined;
   copyPath.disabled = true;
   copyValue.disabled = true;
@@ -1358,7 +1514,7 @@ async function openFile(source: File): Promise<void> {
   store.clear();
   list.reset();
   list.setCount(0);
-  findInput.value = '';
+  findInput.value = "";
   resetSearch();
   resetProblems();
   validating = 0;
@@ -1366,7 +1522,7 @@ async function openFile(source: File): Promise<void> {
   renderSelectionInfo();
 
   try {
-    const { format, size } = await engine.call('open', { file: source });
+    const { format, size } = await engine.call("open", { file: source });
 
     fileInfo.hidden = false;
     fileName.textContent = source.name;
@@ -1378,58 +1534,59 @@ async function openFile(source: File): Promise<void> {
     findBar.hidden = false;
     gotoBar.hidden = false;
     viewport.focus();
-    say('', '');
+    say("", "");
 
-    if (format === 'unknown' || format === 'empty') {
-      say('err', `Nothing to show — this file is ${FORMAT_LABEL[format]}.`);
+    if (format === "unknown" || format === "empty") {
+      say("err", `Nothing to show — this file is ${FORMAT_LABEL[format]}.`);
     }
   } catch (thrown) {
-    say('err', describe(thrown));
+    say("err", describe(thrown));
   }
 }
 
 function onEvent(event: WorkerEvent): void {
-  if (event.kind === 'ready') {
-    setStatus('ready', 'Engine ready');
+  if (event.kind === "ready") {
+    setStatus("ready", "Engine ready");
     engineVersion.textContent = `engine ${event.core} · protocol ${event.protocol}`;
     return;
   }
 
-  if (event.kind === 'fatal') {
-    setStatus('failed', 'Engine failed to start');
-    say('err', describe(new EngineError(event.error)));
+  if (event.kind === "fatal") {
+    setStatus("failed", "Engine failed to start");
+    say("err", describe(new EngineError(event.error)));
     return;
   }
 
-  if (event.kind === 'found') {
+  if (event.kind === "found") {
     onFound(event);
     return;
   }
 
-  if (event.kind === 'validated') {
+  if (event.kind === "validated") {
     onValidated(event);
     return;
   }
 
-  const percent = event.total === 0 ? 100 : (event.consumed / event.total) * 100;
+  const percent =
+    event.total === 0 ? 100 : (event.consumed / event.total) * 100;
   progressFill.style.width = `${Math.min(100, percent).toFixed(1)}%`;
   busy = !event.done;
   cancel.disabled = event.done;
-  viewport.setAttribute('aria-busy', busy ? 'true' : 'false');
+  viewport.setAttribute("aria-busy", busy ? "true" : "false");
 
   const rows = `${event.rows.toLocaleString()} rows`;
   if (!event.done) {
-    progressFill.dataset['state'] = '';
+    progressFill.dataset["state"] = "";
     indexState.textContent = `${humanBytes(event.consumed)} · ${rows}`;
   } else if (event.stopped) {
-    progressFill.dataset['state'] = 'stopped';
+    progressFill.dataset["state"] = "stopped";
     indexState.textContent = `${STOPPED[event.stopped]} · ${rows}`;
     if (event.error) {
-      say('err', describe(new EngineError(event.error)));
+      say("err", describe(new EngineError(event.error)));
     }
   } else {
-    progressFill.dataset['state'] = 'done';
-    progressFill.style.width = '100%';
+    progressFill.dataset["state"] = "done";
+    progressFill.style.width = "100%";
     indexState.textContent = rows;
   }
 
@@ -1445,24 +1602,24 @@ function onEvent(event: WorkerEvent): void {
 // Confirms the loaded `.wasm` matches this bundle. Also the first message sent,
 // which is what triggers instantiation in the Worker.
 engine.checkVersion().catch((thrown: unknown) => {
-  setStatus('failed', 'Engine failed to start');
-  say('err', describe(thrown));
+  setStatus("failed", "Engine failed to start");
+  say("err", describe(thrown));
 });
 
-cancel.addEventListener('click', () => {
+cancel.addEventListener("click", () => {
   cancel.disabled = true;
-  void engine.call('cancel', {}).catch(() => {
+  void engine.call("cancel", {}).catch(() => {
     // The final progress event reports the outcome; nothing to add here.
   });
 });
 
 for (const button of [pick, pickEmpty]) {
-  button.addEventListener('click', () => {
+  button.addEventListener("click", () => {
     filePicker.click();
   });
 }
 
-pickFolder.addEventListener('click', () => {
+pickFolder.addEventListener("click", () => {
   folderPicker.click();
 });
 
@@ -1486,7 +1643,10 @@ function offerFolder(files: File[]): void {
 
   if (candidates.length === 0) {
     fileList.hidden = true;
-    say('err', `No .json, .ndjson or .jsonl files in that folder (${files.length} files seen).`);
+    say(
+      "err",
+      `No .json, .ndjson or .jsonl files in that folder (${files.length} files seen).`,
+    );
     return;
   }
   if (candidates.length === 1) {
@@ -1496,18 +1656,18 @@ function offerFolder(files: File[]): void {
   }
 
   for (const file of candidates) {
-    const item = document.createElement('li');
-    const button = document.createElement('button');
-    button.type = 'button';
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
 
-    const name = document.createElement('span');
+    const name = document.createElement("span");
     name.textContent = file.name;
-    const size = document.createElement('span');
-    size.className = 'size';
+    const size = document.createElement("span");
+    size.className = "size";
     size.textContent = humanBytes(file.size);
 
     button.append(name, size);
-    button.addEventListener('click', () => {
+    button.addEventListener("click", () => {
       void openFile(file);
     });
     item.append(button);
@@ -1515,32 +1675,32 @@ function offerFolder(files: File[]): void {
   }
 
   fileList.hidden = false;
-  say('ok', `${candidates.length} JSON files — choose one.`);
+  say("ok", `${candidates.length} JSON files — choose one.`);
 }
 
-folderPicker.addEventListener('change', () => {
+folderPicker.addEventListener("change", () => {
   offerFolder([...(folderPicker.files ?? [])]);
 });
 
-filePicker.addEventListener('change', () => {
+filePicker.addEventListener("change", () => {
   const chosen = filePicker.files?.[0];
   if (chosen) {
     void openFile(chosen);
   }
 });
 
-drop.addEventListener('click', (event) => {
+drop.addEventListener("click", (event) => {
   // The drop zone is itself a big click target, but it now contains real
   // controls — the folder button, and a list of files to choose from. A click
   // that landed on one of those has already been handled; opening the file
   // picker on top of it would replace the user's actual choice with a dialog.
-  if (!(event.target as HTMLElement).closest('button')) {
+  if (!(event.target as HTMLElement).closest("button")) {
     filePicker.click();
   }
 });
 
-drop.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' || event.key === ' ') {
+drop.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
     filePicker.click();
   }
@@ -1549,18 +1709,18 @@ drop.addEventListener('keydown', (event) => {
 // Drops land anywhere on the page, not just on the empty state: once a file is
 // open the drop zone is not on screen, and "drag another file in" is the most
 // natural way to open the next one.
-document.addEventListener('dragover', (event) => {
+document.addEventListener("dragover", (event) => {
   event.preventDefault();
-  drop.dataset['over'] = 'true';
+  drop.dataset["over"] = "true";
 });
 
-for (const type of ['dragleave', 'drop'] as const) {
+for (const type of ["dragleave", "drop"] as const) {
   document.addEventListener(type, () => {
-    delete drop.dataset['over'];
+    delete drop.dataset["over"];
   });
 }
 
-document.addEventListener('drop', (event) => {
+document.addEventListener("drop", (event) => {
   event.preventDefault();
   const dropped = event.dataTransfer?.files[0];
   if (dropped) {
@@ -1573,12 +1733,14 @@ document.addEventListener('drop', (event) => {
 // second set of bugs, and this way paste is tested by everything file is.
 // Debounced so typing does not open a document per keystroke.
 let pasteTimer: number | undefined;
-paste.addEventListener('input', () => {
+paste.addEventListener("input", () => {
   clearTimeout(pasteTimer);
   pasteTimer = self.setTimeout(() => {
     const text = paste.value;
     if (text.length > 0) {
-      void openFile(new File([text], 'pasted.json', { type: 'application/json' }));
+      void openFile(
+        new File([text], "pasted.json", { type: "application/json" }),
+      );
     }
   }, 150);
 });

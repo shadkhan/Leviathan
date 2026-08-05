@@ -274,6 +274,13 @@ footer.bar {
   font-family: var(--mono);
   font-size: 12px;
   padding: 3px 8px;
+  transition: width 120ms ease-out;
+}
+
+/* A filter expression is several times longer than a search term, and typing one
+   into a box that shows six characters of it is how typos survive. */
+.find input[data-mode="filter"] {
+  width: 42ch;
 }
 
 /* A search scanning a 500 MB file is a running process, and the input is where
@@ -293,6 +300,16 @@ footer.bar {
 
 .find-status[data-state="none"] {
   color: var(--warn);
+}
+
+/* A half-typed filter is wrong for as long as it takes to finish typing it, so
+   this has to be readable without being alarming — and long enough to hold the
+   whole message, which names the character it stopped at. */
+.find-status[data-state="error"] {
+  color: var(--err);
+  max-width: 46ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .find button {
@@ -679,7 +696,9 @@ footer.bar {
   color: var(--text-dim);
   cursor: pointer;
   text-align: center;
-  transition: border-color 0.12s, color 0.12s;
+  transition:
+    border-color 0.12s,
+    color 0.12s;
 }
 
 .drop[data-over="true"] {

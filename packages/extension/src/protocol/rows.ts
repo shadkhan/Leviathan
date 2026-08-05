@@ -36,25 +36,25 @@ const UNKNOWN_END = Number.MAX_SAFE_INTEGER;
 
 /** What kind of value a row holds. Mirrors `leviathan_core::ValueKind`. */
 export type RowKind =
-  | 'object'
-  | 'array'
-  | 'string'
-  | 'number'
-  | 'true'
-  | 'false'
-  | 'null'
-  | 'invalid';
+  | "object"
+  | "array"
+  | "string"
+  | "number"
+  | "true"
+  | "false"
+  | "null"
+  | "invalid";
 
 /** Indexed by the discriminant written in `pack.rs`. Order is the contract. */
 const KINDS: readonly RowKind[] = [
-  'object',
-  'array',
-  'string',
-  'number',
-  'true',
-  'false',
-  'null',
-  'invalid',
+  "object",
+  "array",
+  "string",
+  "number",
+  "true",
+  "false",
+  "null",
+  "invalid",
 ];
 
 const FLAG_COUNT_EXACT = 1 << 0;
@@ -116,7 +116,7 @@ export class RowBlock {
     this.#view = new DataView(buffer);
 
     if (buffer.byteLength < HEADER_BYTES) {
-      throw new Error('Row buffer is too short to contain a header.');
+      throw new Error("Row buffer is too short to contain a header.");
     }
 
     const version = this.#view.getUint32(0, true);
@@ -144,7 +144,9 @@ export class RowBlock {
   /** Decode row `index`, including its strings. Cached after the first call. */
   row(index: number): Row {
     if (index < 0 || index >= this.#count) {
-      throw new RangeError(`Row ${index} is outside a block of ${this.#count}.`);
+      throw new RangeError(
+        `Row ${index} is outside a block of ${this.#count}.`,
+      );
     }
 
     const cache = (this.#decoded ??= new Array<Row | undefined>(this.#count));
@@ -173,7 +175,7 @@ export class RowBlock {
       offset: u64(view, at),
       valueStart: u64(view, at + 8),
       valueEnd: valueEnd >= UNKNOWN_END ? null : valueEnd,
-      kind: KINDS[view.getUint8(at + 32)] ?? 'invalid',
+      kind: KINDS[view.getUint8(at + 32)] ?? "invalid",
       key: (flags & FLAG_HAS_KEY) === 0 ? null : this.#text(keyAt, keyLength),
       preview: this.#text(previewAt, previewLength),
       truncated: (flags & FLAG_TRUNCATED) !== 0,
@@ -217,7 +219,9 @@ export class RowBlock {
   }
 
   #text(at: number, length: number): string {
-    return length === 0 ? '' : DECODER.decode(this.#bytes.subarray(at, at + length));
+    return length === 0
+      ? ""
+      : DECODER.decode(this.#bytes.subarray(at, at + length));
   }
 }
 
@@ -232,5 +236,7 @@ const DECODER = new TextDecoder();
  * to buy.
  */
 function u64(view: DataView, at: number): number {
-  return view.getUint32(at, true) + view.getUint32(at + 4, true) * 0x1_0000_0000;
+  return (
+    view.getUint32(at, true) + view.getUint32(at + 4, true) * 0x1_0000_0000
+  );
 }

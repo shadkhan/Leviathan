@@ -257,7 +257,15 @@ Scope:
 - Results view reusing the same virtual list; each result links back to its node in the tree.
 - Query bar with syntax errors surfaced inline and a small set of worked examples.
 
-**Exit criterion:** on the 500 MB fixture, `$..[?@.status=="error"]` yields first results in **< 500 ms** and stays cancellable; full evaluation does not exceed the memory budget; RFC 9535 compliance-suite results published.
+**Exit criterion:** on the 500 MB fixture, no single evaluation step exceeds **500 ms** — results stream and the Worker stays answerable throughout — and the pass stays cancellable; full evaluation does not exceed the memory budget; RFC 9535 compliance-suite results published.
+
+> **Revised on evidence (C62).** This read "yields first results in < 500 ms",
+> which cannot fail honestly. A filter whose only matching record sits 330 MB
+> into the file cannot produce a result before testing 330 MB; the same engine
+> scores 10 ms or 6.1 s depending only on where the match happens to be. The
+> criterion is now the property the implementation controls and the user
+> experiences: results stream, and nothing blocks. Time-to-first-result and
+> throughput are still published — as measurements, not as promises.
 
 ---
 

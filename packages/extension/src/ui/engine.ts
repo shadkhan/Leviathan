@@ -18,14 +18,17 @@ import {
   type RequestEnvelope,
   type Result,
   type WorkerEvent,
-} from '../protocol/index.js';
+} from "../protocol/index.js";
 
 /** A failure that crossed the boundary, rethrown on the UI side with its cause. */
 export class EngineError extends Error {
-  override readonly name = 'EngineError';
+  override readonly name = "EngineError";
 
   constructor(error: ProtocolError) {
-    super(error.message, error.cause === undefined ? undefined : { cause: error.cause });
+    super(
+      error.message,
+      error.cause === undefined ? undefined : { cause: error.cause },
+    );
   }
 }
 
@@ -51,7 +54,7 @@ export class Engine {
         // A fatal event means the engine will never answer anything. Failing
         // the outstanding calls is the difference between an error message and
         // a spinner that turns forever.
-        if (data.kind === 'fatal') {
+        if (data.kind === "fatal") {
           this.#failAll(data.error);
         }
         onEvent(data);
@@ -74,7 +77,7 @@ export class Engine {
     // in the bundle, or an import that 404s. Without this it fails silently.
     this.#worker.onerror = (event: ErrorEvent): void => {
       this.#failAll({
-        message: 'The Leviathan worker crashed.',
+        message: "The Leviathan worker crashed.",
         cause: event.message,
       });
     };
@@ -86,7 +89,7 @@ export class Engine {
     const request: RequestEnvelope<M> = { id, method, params };
 
     return new Promise<Result<M>>((resolve, reject) => {
-      this.#pending.set(id, { resolve: resolve as Pending['resolve'], reject });
+      this.#pending.set(id, { resolve: resolve as Pending["resolve"], reject });
       this.#worker.postMessage(request, transferables(params));
     });
   }
@@ -98,11 +101,11 @@ export class Engine {
    * confusing bug in this project. This turns it into one clear sentence.
    */
   async checkVersion(): Promise<{ core: string; protocol: number }> {
-    const version = await this.call('version', {});
+    const version = await this.call("version", {});
     if (version.protocol !== PROTOCOL_VERSION) {
       throw new EngineError({
         message: `Protocol mismatch: the UI speaks v${PROTOCOL_VERSION}, the worker speaks v${version.protocol}.`,
-        cause: 'Rebuild the extension with `pnpm build`.',
+        cause: "Rebuild the extension with `pnpm build`.",
       });
     }
     return version;

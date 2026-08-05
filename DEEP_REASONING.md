@@ -1401,11 +1401,163 @@ that would have made a 250 KB crate the wrong answer too.
 *Rules out:* an off-the-shelf schema validator, at any size; validating anything
 by first materializing it.
 
+### C58 — The seventh time, and the harness caught it before I did — **validated**
+
+M3's schema criterion is "50 MB against a non-trivial schema in under 5 s". The
+first run said **0.11 s, 457 MB/s** — a number I was one paste away from
+publishing.
+
+It was a fiction, and the tell was in the same output: `problems 1188` against a
+1 000-error cap and `steps 3`. The pass had **aborted at the error limit** after
+about 6 000 of 177 906 records, and the harness divided the whole file by the
+time it took to check three per cent of it. The cause was mundane — my schema
+listed four log levels and the fixture has five, so a fifth of the records
+failed an `enum` and tripped the cap.
+
+This is the seventh instance of one mistake: C14 (timing resolution), C15 (early
+exit), C23 (aborted run), C49 (page cache), C52 (stale UI state), C54 (a remedy
+that changed nothing), and now an aborted pass. The rule from C49 —
+*before publishing a rate, name what else could have produced it* — has been
+written down for two days and still did not stop it, which is the argument for
+mechanism over discipline: the harness now **refuses to report a rate unless
+every record was checked**, and prints why instead.
+
+The real number, once the schema matched the data and all 177 906 records were
+checked: **2.78 s**, 64 000 records/s, 18 MB/s — inside the criterion with room
+to spare, and roughly 25× slower than the byte scan, which is what parsing every
+record against ten constraints costs.
+
+Worth separating: the *engine* was never wrong here. Every failure in this
+sequence has been a measurement failure, which is its own category and deserves
+its own defences.
+
+---
+
+## 2026-08-05 — M4: one box, two engines
+
+### C59 — The syntax says which engine, so there is no mode to forget — **assumed**
+
+Find and filter answer different questions. "Where does `ap-south-1` occur" is
+what you ask a file whose shape you do not know; "which records have
+`@.status == "error" && @.latency_ms > 1000`" is what you ask once you do. The
+obvious UI is two boxes, or one box and a toggle.
+
+Both are worse. Two boxes doubles a toolbar that has to stay legible on a
+laptop; a toggle is a piece of state that is always wrong the first time you
+type, because you were looking at the box and not at the toggle.
+
+So the *string* decides. A query beginning with `@` or `$` goes to the filter
+parser; anything else is a literal search. The rule is deliberately narrow in
+one direction and total in the other: every character that plausibly starts
+something a person means literally must stay literal, and anything that even
+looks like an expression must reach the parser.
+
+The load-bearing part is what happens when a filter does **not** compile: it
+stays a filter and reports the syntax error. Falling back to a literal search
+would be the worst of both — `@.statu == "x"` would silently become a search for
+the text `@.statu == "x"`, find nothing, and leave the user believing the file
+had no matching records. A tool that answers a question you did not ask is worse
+than one that says it did not understand.
+
+The same reasoning governs the *parser*: `..`, `*`, slices and the RFC 9535
+function extensions are rejected by name rather than approximated. A subset that
+refuses is honest; a subset that quietly reinterprets `$..a == 1` is a bug that
+looks like a feature.
+
+*Rules out:* a mode toggle; a search box that guesses; silently degrading an
+unsupported query into a supported one.
+
+### C60 — It was the reads, not the parse — **validated**
+
+The first filter pass over the 500 MB fixture ran at **23 MB/s** — 22 seconds —
+against indexing's 467 MB/s for the same file. The natural suspicion was the
+per-record parse: a full lex and grammar walk of every record is real work, and
+schema checking (18 MB/s, C58) had set the expectation that this family of
+operation is simply slow.
+
+It was not the parse. It was **1.77 million reads of about 280 bytes**, one per
+record, because the driver read each record's own byte range — which is what
+schema checking does and what looked obviously correct. In Node each is a
+`readSync`; in a Worker each is a `blob.slice()` plus a `FileReaderSync` that
+allocates a fresh `ArrayBuffer`. Reading a 1 MB window covering ~3 700 records
+and slicing each out of it took the pass to **40 MB/s**, a 1.7× improvement from
+deleting six orders of magnitude of calls.
+
+This is C54 read the other way round, and the pair is the useful thing. There, a
+4 MB indexing window bought nothing, because indexing already read in megabytes
+and its cost scaled with **bytes**. Here the cost scaled with **calls**, because
+there were 1.77 million of them. Neither "bigger reads are faster" nor "read
+size does not matter" is the lesson; the lesson is that the two regimes look
+identical from the source and are told apart only by counting.
+
+*Rules out:* per-record reads in any pass that visits every record. Schema
+checking has the same shape and is owed the same fix.
+
+### C61 — A record-testing loop must own its scratch — **validated**
+
+With the reads fixed, the remaining cost was allocation. Testing one record built
+a lexer, a grammar walk, four vectors and a `String` for **every object key** —
+so a 1.77 M-record file allocated roughly 17 million strings for keys, almost
+none of which the query had asked about.
+
+Two changes, both mechanical. A `Matcher` owns the scratch and clears it between
+records instead of rebuilding it. And the current path holds keys as *ranges into
+the record* rather than as `String`s, so comparing "is this the key the query
+wants" is a byte comparison against the query's own bytes, with unescaping
+reserved for the rare key that actually contains a backslash.
+
+**40 → 58 MB/s**, and 23 → 58 MB/s overall: 22 s to 8.7 s on the 500 MB fixture.
+Neither change touched a single decision about JSON.
+
+*Rules out:* allocating per record in any pass over a file; materializing a
+string to discard it.
+
+### C62 — A criterion that cannot fail honestly is not a criterion — **revised**
+
+SPEC's M4 exit criterion read "first results in **< 500 ms**". Measured against
+five queries, four returned first results in 10–21 ms and one took **6.1 s**.
+
+The 6.1 s query was `@.id == 1234567`, whose single matching record sits 330 MB
+into the file. There is no result to show before 330 MB have been tested; at
+58 MB/s that is 5.7 seconds of arithmetic. No engine change moves it, and the
+number is not evidence of anything about the engine — the *same* engine reports
+"MET" or "MISSED" depending only on where in the file the first match happens to
+be.
+
+So the criterion is replaced by the one the user actually experiences: **the
+longest single step must stay under 500 ms**, which is the claim that results
+stream and the Worker never stops answering. Measured: **52 ms** worst case
+across the five queries. Time-to-first-result and total throughput are still
+reported — they are useful — but they are reported, not asserted, because they
+are properties of the query and the file rather than of the code.
+
+The general form, and the reason this is worth writing down: a criterion whose
+result depends on something the code does not control cannot distinguish a good
+implementation from a bad one. That it *sounds* like a user-facing promise is
+exactly what makes it dangerous — it would have been quoted.
+
+*Rules out:* exit criteria stated over inputs the implementation does not
+control; publishing time-to-first-result as a headline number.
+
 ---
 
 ## Log of revisions
 
 *(Append here as concepts are validated or revised. Format: date — concept id — what changed — the number that changed it.)*
+
+- **2026-08-05 — C54 — completed by its opposite.** C54 recorded a rejected
+  hypothesis: a wider indexing window changed nothing. C60 is the same change in
+  a different regime, where it was worth 1.7×. The pair is more useful than
+  either — the two regimes are indistinguishable from the source and are told
+  apart only by counting calls.
+- **2026-08-05 — C58 — the defence held.** The filter harness refuses to print a
+  rate unless every record was tested, carried over from the schema harness. No
+  eighth instance this milestone; the mechanism, not the discipline, is what
+  changed.
+- **2026-08-05 — C1 — validated once more, at query time.** A filter tests
+  1.77 M records at 58 MB/s while holding one 1 MB window, because the index
+  gives it record boundaries and the bytes stay in the file. The alternative —
+  a `Value` per record — is the same thing C57 ruled out for schemas.
 
 - **2026-08-02 — the kernel's high-water mark is not a high-water mark.** CI went
   red on `peak_rss_never_decreases`, on Linux only. Linux computes `VmHWM` as

@@ -39,9 +39,9 @@
         <input
           type="search"
           id="find-input"
-          placeholder="Find in file…"
-          aria-label="Find text in file"
-          title="Literal text, case-insensitive. Searches the file itself, so matches are shown on the row that contains them."
+          placeholder="Find text, or @.field == &quot;value&quot;…"
+          aria-label="Find text, or filter records by condition"
+          title="Type text to search the file itself, case-insensitively — matches are shown on the row that contains them.&#10;&#10;Type an expression beginning with @ to filter records instead:&#10;  @.status == &quot;error&quot;&#10;  @.latency_ms > 1000 && @.level != &quot;debug&quot;&#10;  @.meta.region == &quot;ap-south-1&quot; || !@.ok&#10;  @.tags[0] == &quot;auth&quot;"
           spellcheck="false"
           autocomplete="off"
         />
@@ -85,6 +85,14 @@
         >
           Validate
         </button>
+        <button
+          type="button"
+          id="pick-schema"
+          title="Check every record against a JSON Schema. The schema is read locally — nothing is fetched."
+        >
+          Schema…
+        </button>
+        <input type="file" id="schema-file" accept=".json,application/json" hidden />
       </div>
 
       <nav class="crumbs" id="crumbs" aria-label="Path to the selected row"></nav>
