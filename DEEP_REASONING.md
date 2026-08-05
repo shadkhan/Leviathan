@@ -1539,12 +1539,87 @@ exactly what makes it dangerous — it would have been quoted.
 *Rules out:* exit criteria stated over inputs the implementation does not
 control; publishing time-to-first-result as a headline number.
 
+### C63 — The suite found six bugs, and one of them was in a comment — **validated**
+
+The RFC 9535 compliance suite ran for the first time and reported **six
+failures** out of 139 in-scope cases. Every one was real.
+
+Five were the same bug: the number-literal parser handed its text to Rust's
+`f64::from_str`, which accepts `-.1`, `00`, `01` and `1.`. JSON accepts none of
+them, so the engine was compiling comparisons against numbers no document could
+ever contain. Fixed with four lines of JSON's own grammar — and the fix had a bug
+of its own that the suite caught on the re-run, because the fraction's
+trailing-digit loop sat outside its branch and re-admitted `00`.
+
+The sixth is the one worth the entry. `@.a != null` was excluding records that
+have no `a` at all. RFC 9535 §2.3.5.2 makes an absent member **Nothing**, and
+Nothing is not equal to `null` — so `!=` against it is *true*: the member really
+is not null, it is not there. The engine returned false, the unit test asserted
+false, and the code comment said:
+
+> `// RFC 9535: a comparison with a path that does not exist is false —`
+> `// including !=, which is why this is not op == Ne.`
+
+A confident citation of the specification, for the opposite of what the
+specification says. Nothing in the repository could have caught it: the test
+agreed with the code, the comment agreed with the test, and all three were
+wrong together. That is the failure mode an external suite exists for, and it is
+why "we wrote tests for it" is not the same claim as "we checked it against the
+standard".
+
+The general form: **self-consistency is not correctness, and a citation is not a
+check.** Every layer here was internally coherent. The only thing that could
+break the tie was a document written by people who were not me.
+
+*Rules out:* trusting a specification claim in a comment without a suite behind
+it; `f64::from_str` as a stand-in for JSON's number grammar.
+
+### C64 — Publish the partition, not the pass rate — **assumed**
+
+Leviathan implements a filter subset, so most of the 703-case suite tests
+something it deliberately does not do. Two numbers were available and both are
+misleading. "133 of 703" scores the engine against features it never claimed.
+"133 of 133 attempted" is the number every partial implementation quotes, and the
+denominator is chosen after the results are in.
+
+So the report partitions the *whole* population and names every bucket: 133 in
+scope and passing, 93 invalid selectors correctly refused, and 477 out of scope
+broken down by which construct — 214 path expressions, 91 slices, 73 functions,
+65 expression forms, 23 descendants, 11 wildcards. The size of the subset is a
+number instead of an adjective, and a reader can decide whether it covers their
+question without taking a word for it.
+
+Two properties are asserted rather than counted, because they are the ones that
+could make the feature harmful:
+
+- No invalid selector is ever accepted (93 of 93).
+- Nothing unsupported is silently reinterpreted — every out-of-scope case
+  produces an error naming the construct, which is C59's promise verified rather
+  than asserted.
+
+Only an in-scope failure, or an accepted invalid selector, turns CI red.
+Out-of-scope cases are counted and never scored: gating on the parts of a
+specification a subset does not implement would make the gate meaningless in
+both directions.
+
+*Rules out:* a pass rate with a denominator chosen after the run; treating
+"unimplemented" and "wrong" as the same colour.
+
 ---
 
 ## Log of revisions
 
 *(Append here as concepts are validated or revised. Format: date — concept id — what changed — the number that changed it.)*
 
+- **2026-08-05 — C59 — verified, not asserted.** "Unsupported constructs are
+  named rather than misread" was a design claim with four unit tests behind it.
+  The compliance run checks it on **477 cases**, by reading the parser's own
+  message for each — the claim is now measured on a corpus nobody here wrote.
+- **2026-08-05 — the sixth measurement lesson is not about measurement.** C14,
+  C15, C23, C49, C52, C54 and C58 were all instruments lying about the engine.
+  C63 is the engine, the test and the comment lying together, and only an
+  outside document could tell. Different failure, different defence: external
+  suites, not better harnesses.
 - **2026-08-05 — C54 — completed by its opposite.** C54 recorded a rejected
   hypothesis: a wider indexing window changed nothing. C60 is the same change in
   a different regime, where it was worth 1.7×. The pair is more useful than

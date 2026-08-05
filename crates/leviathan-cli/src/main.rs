@@ -18,9 +18,11 @@
 mod bench;
 mod cli;
 mod conformance;
+mod cts;
 mod file_source;
 mod fixtures;
 mod fuzz;
+mod json;
 mod sys;
 
 use std::io::Read;
@@ -43,7 +45,8 @@ COMMANDS:
     fixtures <KIND>         Generate a test fixture
     fixtures list           List the fixture kinds
     bench [FILE...]         Benchmark against fixtures
-    conformance [DIR]       Run a JSONTestSuite corpus (default: fixtures/generated/JSONTestSuite)
+    conformance [DIR]       Run a JSONTestSuite corpus (RFC 8259; default: fixtures/generated/JSONTestSuite)
+    cts [FILE]              Run the JSONPath compliance suite (RFC 9535; default: fixtures/generated/cts.json)
     fuzz                    Fuzz the lexer and grammar walk for panics and disagreements
     help                    Print this message
 
@@ -112,6 +115,7 @@ fn run(command: &str, rest: &[String]) -> Result<String, String> {
         "fixtures" => fixtures_command(rest),
         "bench" => bench_command(rest),
         "conformance" => conformance_command(rest),
+        "cts" => cts_command(rest),
         "fuzz" => fuzz_command(rest),
         "help" | "--help" | "-h" => Ok(USAGE.to_string()),
         other => Err(format!("unknown command: {other}\n\n{USAGE}")),
@@ -150,6 +154,30 @@ fn conformance_command(rest: &[String]) -> Result<String, String> {
         Ok(report)
     } else {
         Err(format!("{report}\nconformance failed"))
+    }
+}
+
+/// Run the RFC 9535 compliance test suite and print the support table.
+///
+/// Fails only on an **in-scope** case being wrong, or on an invalid selector
+/// being accepted. Out-of-scope cases are counted, not scored — scoring the
+/// parts of a specification a subset does not implement would turn a published
+/// support table into a grade.
+fn cts_command(rest: &[String]) -> Result<String, String> {
+    let args = Args::parse(rest)?;
+    let root = args.positional(0).map_or_else(
+        || PathBuf::from("fixtures/generated/cts.json"),
+        PathBuf::from,
+    );
+
+    let (report, passed) = cts::run(&root).map_err(|e| e.to_string())?;
+    if passed {
+        Ok(report)
+    } else {
+        Err(format!(
+            "{report}
+RFC 9535 conformance failed"
+        ))
     }
 }
 

@@ -187,9 +187,16 @@ impl Filter {
             Expr::Not(inner) => !self.evaluate(inner, found),
             Expr::Exists(path) => found[*path].is_some(),
             Expr::Compare { path, op, value } => match &found[*path] {
-                // RFC 9535: a comparison with a path that does not exist is
-                // false — including `!=`, which is why this is not `op == Ne`.
-                None => false,
+                // A path that does not exist yields *Nothing*, which RFC 9535
+                // §2.3.5.2 treats as its own value rather than as an absence.
+                // Nothing equals nothing but Nothing, so `@.missing != null` is
+                // **true** — the member really is not null, it is not there.
+                //
+                // This engine had it as "any comparison with a missing path is
+                // false", with a comment citing the RFC for the opposite of what
+                // the RFC says. The compliance suite caught it. Orderings stay
+                // false: Nothing is unordered, not smaller.
+                None => *op == Op::Ne,
                 Some(actual) => compare(actual, *op, value),
             },
         }
@@ -644,6 +651,13 @@ impl Parser {
                     self.at += 1;
                 }
                 let text: String = self.chars[start..self.at].iter().collect();
+                // Checked against JSON's number grammar, not Rust's. Rust
+                // accepts `-.1`, `00`, `01` and `1.`; RFC 9535 does not, and
+                // accepting a number nobody could have written in the document
+                // is accepting a query that cannot mean what it looks like.
+                if !is_json_number(&text) {
+                    return Err(self.error("not a JSON number"));
+                }
                 text.parse()
                     .map(Value::Number)
                     .map_err(|_| self.error("not a number"))
@@ -667,6 +681,46 @@ impl Parser {
             }
         }
     }
+}
+
+/// Whether `text` is a number as JSON — and therefore RFC 9535 — defines one.
+///
+/// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`. Deliberately its own
+/// four lines rather than a call into the lexer: the lexer is a resumable
+/// byte-at-a-time machine built for streaming a 500 MB file, and reaching for it
+/// to check eight characters of a query would be the more surprising code.
+fn is_json_number(text: &str) -> bool {
+    let mut chars = text.chars().peekable();
+    chars.next_if_eq(&'-');
+
+    // Integer part: `0` alone, or a non-zero digit and friends. `01` is not a
+    // number, which is the case the compliance suite caught.
+    match chars.next() {
+        Some('0') => {}
+        Some(c) if c.is_ascii_digit() => while chars.next_if(char::is_ascii_digit).is_some() {},
+        _ => return false,
+    }
+
+    // Fraction: a point must be followed by at least one digit. The trailing
+    // loop lives *inside* the branch — outside it, it silently re-admitted the
+    // `00` this function was written to reject.
+    if chars.next_if_eq(&'.').is_some() {
+        if chars.next_if(char::is_ascii_digit).is_none() {
+            return false;
+        }
+        while chars.next_if(char::is_ascii_digit).is_some() {}
+    }
+
+    // Exponent, same rule.
+    if chars.next_if(|c| *c == 'e' || *c == 'E').is_some() {
+        chars.next_if(|c| *c == '+' || *c == '-');
+        if chars.next_if(char::is_ascii_digit).is_none() {
+            return false;
+        }
+        while chars.next_if(char::is_ascii_digit).is_some() {}
+    }
+
+    chars.next().is_none()
 }
 
 /// `1000 < @.x` means the same as `@.x > 1000`.
@@ -758,12 +812,58 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_path_compares_false_including_with_not_equal() {
-        // RFC 9535: a comparison against something absent is false, and that
-        // includes `!=` — which surprises people, so it has a test.
+    fn a_missing_path_is_nothing_which_is_unequal_to_every_value() {
+        // RFC 9535 §2.3.5.2. This test asserted the *opposite* until the
+        // compliance suite disagreed with it: an absent member is *Nothing*,
+        // and Nothing equals nothing but itself, so `!=` against it is true.
         assert!(!matches(r#"@.missing == "x""#));
-        assert!(!matches(r#"@.missing != "x""#));
-        assert!(matches(r#"!(@.missing != "x")"#));
+        assert!(matches(r#"@.missing != "x""#));
+
+        // The case that makes it concrete, and the one the suite failed on:
+        // `@.a != null` selects a record with no `a` at all, because `a` really
+        // is not null — it is not there.
+        assert!(matches("@.missing != null"));
+        assert!(!matches("@.missing == null"));
+        assert!(matches("@.nil == null"), "present-and-null equals null");
+        assert!(!matches("@.nil != null"));
+
+        // Orderings stay false: Nothing is unordered, not smaller than things.
+        assert!(!matches("@.missing < 1"));
+        assert!(!matches("@.missing > 1"));
+        assert!(!matches("@.missing <= 1"));
+        assert!(!matches("@.missing >= 1"));
+    }
+
+    #[test]
+    fn a_number_literal_must_be_a_json_number() {
+        // Rust's `f64::from_str` accepts all of these; JSON does not, and a
+        // query comparing against a number the document could never contain
+        // cannot mean what it appears to.
+        for bad in [
+            "@.a == -.1",
+            "@.a == 00",
+            "@.a == 01",
+            "@.a == 1.",
+            "@.a == 1e",
+        ] {
+            let error = Filter::parse(bad).unwrap_err();
+            assert!(
+                error.message.contains("number"),
+                "{bad} should be refused: {error}"
+            );
+        }
+        for good in [
+            "@.a == 0",
+            "@.a == -0",
+            "@.a == 1",
+            "@.a == -1.5",
+            "@.a == 1e3",
+            "@.a == 1E-3",
+            "@.a == 1.5e+10",
+            "@.a == 10",
+        ] {
+            assert!(Filter::parse(good).is_ok(), "{good} should parse");
+        }
     }
 
     #[test]

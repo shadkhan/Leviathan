@@ -10,18 +10,18 @@ No freezing, no upload, no server.
 [![CI](https://github.com/shadkhan/leviathan/actions/workflows/ci.yml/badge.svg)](https://github.com/shadkhan/leviathan/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/core-rust%20%E2%86%92%20wasm-orange.svg)](crates/leviathan-core)
-[![Tests](https://img.shields.io/badge/tests-333%20rust%20%C2%B7%2030%20ui%20%C2%B7%2022%20wasm-green.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-349%20rust%20%C2%B7%2030%20ui%20%C2%B7%2022%20wasm-green.svg)](#testing)
 
 </div>
 
 > [!WARNING]
-> **Status: M4 in progress.** The engine, the viewer, validation and filtering
+> **Status: M5 next.** The engine, the viewer, validation and filtering
 > all run: a 500 MB NDJSON file paints its first rows in **141 ms**, indexes at
 > **140 MB/s** in WASM, scrolls at a median **16.6 ms** per frame with zero long
 > tasks, and answers `@.level == "error"` over 1.77 M records in **8.7 s** while
 > staying interactive throughout. One criterion is not met — 0.7 % of frames
-> exceed 32 ms ([details](#numbers)). Dedup and export are not built, and the
-> RFC 9535 compliance run is outstanding. See the [roadmap](#roadmap).
+> exceed 32 ms ([details](#numbers)). Dedup and export are not built.
+> See the [roadmap](#roadmap).
 
 ---
 
@@ -241,12 +241,59 @@ than by convention:
 
 | | |
 |---|---|
-| [JSONTestSuite](https://github.com/nst/JSONTestSuite) | **95/95** must-accept · **185/188** must-reject — [3 documented deviations](docs/adr/ADR-001-parser-strategy.md) |
+| [JSONTestSuite](https://github.com/nst/JSONTestSuite) (RFC 8259) | **95/95** must-accept · **185/188** must-reject — [3 documented deviations](docs/adr/ADR-001-parser-strategy.md) |
+| [JSONPath CTS](https://github.com/jsonpath-standard/jsonpath-compliance-test-suite) (RFC 9535) | **133/133** in scope · **93/93** invalid selectors refused — [support table below](#what-the-filter-supports) |
 | Fuzzing | **1,969,106,501 cases** in 30 min — 0 panics, 0 chunk-size disagreements |
 | Determinism | The same fixture always yields 108,133,846 tokens and 1,772,686 records, at every chunk size |
 
 The fuzzer checks *chunk invariance*, not just crashes: a resumable lexer's real
 failure is giving different answers depending on where the boundary falls.
+
+### What the filter supports
+
+Type a condition into the find box and it filters records instead of searching
+text — `@` or `$` at the start is what tells the two apart, so there is no mode
+to toggle:
+
+```
+@.status == "error" && @.latency_ms > 1000
+@.meta.region == "ap-south-1" || !@.ok
+@.tags[0] == "auth"
+@.user.email != null
+```
+
+This is a **subset of RFC 9535**, and the size of the subset is a number rather
+than an adjective. Run `leviathan cts` against the [official compliance
+suite](https://github.com/jsonpath-standard/jsonpath-compliance-test-suite) —
+703 cases, pinned in CI:
+
+| | Cases | |
+|---|---:|---|
+| **In scope** — a root filter within the expression subset | **133** | all pass ✅ |
+| **Correctly rejected** — RFC 9535 says invalid, Leviathan refuses | **93** | all refused ✅ |
+| Out of scope — path expressions (`$.a.b[0]`) | 214 | |
+| Out of scope — slices (`[1:3]`) | 91 | |
+| Out of scope — function extensions (`length()`, `match()`, …) | 73 | |
+| Out of scope — expression forms not implemented | 65 | |
+| Out of scope — descendants (`..`) | 23 | |
+| Out of scope — wildcards (`*`) | 11 | |
+
+Two properties are worth more than the pass count:
+
+- **An invalid selector is never accepted.** All 93 are refused. Leviathan
+  rejects a superset of what the RFC rejects — that is what a subset means — and
+  this is the direction that matters, because accepting an invalid query means
+  answering a question nobody asked.
+- **Nothing unsupported is silently reinterpreted.** Every one of the 477
+  out-of-scope cases produces an error *naming* the construct. `$..a == 1` is
+  refused with "descendant segments (`..`) are not supported by this subset",
+  not quietly evaluated as something else.
+
+The suite earned its keep immediately: it found **six real bugs** on the first
+run, including `@.a != null` wrongly excluding records with no `a` at all —
+RFC 9535 §2.3.5.2 makes an absent member *Nothing*, and Nothing is not equal to
+`null`. The engine had it backwards, and so did the test asserting it, with a
+comment citing the RFC for the opposite of what it says.
 
 ## Quick start
 
@@ -306,7 +353,7 @@ CLI, and (v2) an MCP server.
 | **M1** | Streaming lexer + node index ← *the make-or-break phase* | ✅ measured, conformant, fuzzed |
 | **M2** | Virtual tree, navigation, find + filter, trust indicators | ✅ scope complete · measured, with 1 published miss |
 | **M3** | Validation: byte-accurate errors, jump-to-position, JSON Schema | ✅ measured — 50 MB schema-checked in 2.78 s |
-| **M4** | Query: JSONPath filters over the index | 🔷 engine + UI done, measured · RFC 9535 suite outstanding |
+| **M4** | Query: JSONPath filters over the index | ✅ measured · 133/133 in-scope CTS cases, 93/93 invalid refused |
 | **M5** | Dedup: duplicate keys and elements | ⬜ |
 | **M6** | Export: JSON / NDJSON / CSV, streamed | ⬜ |
 | **M7** | Publish: crates.io + npm + Chrome Web Store | ⬜ |

@@ -75,6 +75,24 @@ jobs:
       - name: Conformance (RFC 8259)
         run: cargo run --release --package leviathan-cli -- conformance
 
+      # M4 exit criterion. Pinned for the same reason as the corpus above, and
+      # to the release the table in the README was measured against — a support
+      # table that silently drifts from the suite it cites is worse than none.
+      - name: Fetch the RFC 9535 compliance suite
+        env:
+          CTS_SHA: 7be7c1fc28057c91e8eefaf197060fba7ed43acd
+        run: |
+          mkdir -p fixtures/generated
+          curl -sSLf "https://raw.githubusercontent.com/jsonpath-standard/jsonpath-compliance-test-suite/$CTS_SHA/cts.json" \
+            -o fixtures/generated/cts.json
+
+      # Fails on an in-scope case being wrong, or on an invalid selector being
+      # accepted. Out-of-scope cases are counted, never scored: grading a subset
+      # against the parts of a specification it does not implement would make
+      # the number meaningless in both directions.
+      - name: Conformance (RFC 9535)
+        run: cargo run --release --package leviathan-cli -- cts
+
       # M1 exit criterion 4. The seed varies per run so CI explores new ground
       # over time; the report prints it, so any failure is reproducible with
       # `leviathan fuzz --seed <n>`.
