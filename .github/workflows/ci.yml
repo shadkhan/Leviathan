@@ -93,6 +93,19 @@ jobs:
       - name: Conformance (RFC 9535)
         run: cargo run --release --package leviathan-cli -- cts
 
+      # M6 / requirement 11. Small fixtures, generated here rather than
+      # committed: the claim is about the converter, and a 50 MB fixture proves
+      # nothing a 2 MB one does not.
+      - name: Round trip (requirement 11)
+        run: |
+          cargo run --release --package leviathan-cli -- fixtures ndjson --size 2MB
+          cargo run --release --package leviathan-cli -- fixtures array --size 2MB
+          cargo run --release --package leviathan-cli -- fixtures nested --size 2MB
+          cargo run --release --package leviathan-cli -- fixtures dupkeys --size 2MB
+          cargo run --release --package leviathan-cli -- fixtures badutf8 --size 1MB
+          cargo run --release --package leviathan-cli -- fixtures truncated --size 1MB
+          cargo run --release --package leviathan-cli -- roundtrip fixtures/generated/*.ndjson fixtures/generated/*.json
+
       # M1 exit criterion 4. The seed varies per run so CI explores new ground
       # over time; the report prints it, so any failure is reproducible with
       # `leviathan fuzz --seed <n>`.

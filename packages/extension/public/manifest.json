@@ -4,8 +4,20 @@
   "version": "0.1.0",
   "description": "A JSON viewer that survives large files. Streams and indexes multi-gigabyte JSON and NDJSON entirely on your machine.",
   "minimum_chrome_version": "111",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "action": {
-    "default_title": "Open Leviathan"
+    "default_title": "Open Leviathan",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
   },
   "background": {
     "service_worker": "background.js",

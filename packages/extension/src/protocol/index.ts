@@ -80,6 +80,16 @@ export function searchModeOf(query: string): SearchMode {
   return start.startsWith("@") || start.startsWith("$") ? "filter" : "literal";
 }
 
+/**
+ * What an export can be written as.
+ *
+ * `json` and `ndjson` re-emit the source's own tokens with the whitespace
+ * dropped, so what comes out re-parses to exactly what went in — requirement 11
+ * held by construction rather than by a converter that is tested hard. `csv` is
+ * lossy by nature and says so.
+ */
+export type ExportFormat = "json" | "json-pretty" | "ndjson" | "csv";
+
 /** A failure, flattened for structured-clone transport across the boundary. */
 export interface ProtocolError {
   /** Human-readable, already suitable for display. */
@@ -276,6 +286,58 @@ export interface Calls {
   schema: {
     params: { source: string };
     result: { unsupported: string[] };
+  };
+
+  /**
+   * Look for duplicate object keys and, optionally, duplicate array elements.
+   *
+   * Results arrive as `validated` events, like well-formedness and schema
+   * checking — a duplicate is a finding about the file with a place in it, which
+   * is what that panel is for, and three passes sharing one report is three
+   * fewer things for the UI to know about.
+   *
+   * `elements` is opt-in because it is the expensive half: checking keys hashes
+   * each name, checking elements hashes every subtree and holds a frame that
+   * grows with the container.
+   */
+  dedup: {
+    params: { keys: boolean; elements: boolean };
+    result: Record<string, never>;
+  };
+
+  /**
+   * Which export formats exist, so the UI does not hardcode the engine's list.
+   */
+  exportFormats: {
+    params: Record<string, never>;
+    result: { formats: ExportFormat[] };
+  };
+
+  /**
+   * Convert the next batch of records for an export.
+   *
+   * Deliberately request/response rather than an event stream: the UI has to
+   * *write* each chunk to disk and wait for that write before asking for more,
+   * or a fast converter would outrun a slow disk and the 500 MB export would
+   * queue up in memory — the exact failure the streaming write exists to
+   * prevent. Backpressure needs a round trip, so it gets one.
+   *
+   * `start` begins a new export; omitting it continues the one in progress.
+   */
+  exportStep: {
+    params: { start?: { format: ExportFormat; rows: number[] } };
+    result: {
+      chunk: ArrayBuffer;
+      records: number;
+      done: boolean;
+      truncated: boolean;
+    };
+  };
+
+  /** Abandon the export in progress. Idempotent. */
+  exportStop: {
+    params: Record<string, never>;
+    result: Record<string, never>;
   };
 
   /** Close the current file and release every index built over it. */

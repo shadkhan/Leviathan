@@ -93,6 +93,26 @@
           Schema…
         </button>
         <input type="file" id="schema-file" accept=".json,application/json" hidden />
+        <select id="export-format" aria-label="Export format" title="What to write">
+          <option value="ndjson">NDJSON</option>
+          <option value="json">JSON (minified)</option>
+          <option value="json-pretty">JSON (indented)</option>
+          <option value="csv">CSV</option>
+        </select>
+        <button
+          type="button"
+          id="export"
+          title="Write the file to disk, streamed — never assembled in memory.&#10;With a filter active, only the matching records are written."
+        >
+          Export…
+        </button>
+        <button
+          type="button"
+          id="dedup"
+          title="Find repeated keys within an object — valid JSON that every parser resolves differently.&#10;Hold Shift to also compare whole records for repeats, which is slower."
+        >
+          Duplicates
+        </button>
       </div>
 
       <nav class="crumbs" id="crumbs" aria-label="Path to the selected row"></nav>

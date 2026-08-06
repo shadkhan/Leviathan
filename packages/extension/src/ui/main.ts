@@ -19,6 +19,7 @@
 
 import {
   searchModeOf,
+  type ExportFormat,
   type FoundEvent,
   type Format,
   type SearchMode,
@@ -78,6 +79,9 @@ const problemsTitle = el("problems-title");
 const problemsState = el("problems-state");
 const problemsClose = el<HTMLButtonElement>("problems-close");
 const problemsList = el("problems-list");
+const dedupButton = el<HTMLButtonElement>("dedup");
+const exportButton = el<HTMLButtonElement>("export");
+const exportFormat = el<HTMLSelectElement>("export-format");
 const findBar = el("find-bar");
 const findInput = el<HTMLInputElement>("find-input");
 const findStatus = el("find-status");
@@ -990,6 +994,16 @@ let problemRows = new Set<number>();
 /** Which pass the UI is listening to. Same discipline as search (C48). */
 let validating = 0;
 
+/**
+ * Which pass the problems panel is currently reporting.
+ *
+ * Three passes share one panel — well-formedness, schema, duplicates — because
+ * all three produce findings with a place in the file. They do *not* share
+ * wording: "No syntax errors" over a duplicate-key run would be a true sentence
+ * about a question nobody asked.
+ */
+let passKind: "validate" | "schema" | "dedup" = "validate";
+
 /** How many problems the list will hold before it stops growing. */
 const PROBLEM_ROWS = 500;
 
@@ -1025,7 +1039,12 @@ function onValidated(event: Extract<WorkerEvent, { kind: "validated" }>): void {
 
     const where = document.createElement("span");
     where.className = "where";
-    where.textContent = `${grouped(problem.line)}:${grouped(problem.column)}`;
+    // A duplicate is a fact about two byte offsets and has no line of its own,
+    // so it reports one rather than inventing `0:0`.
+    where.textContent =
+      problem.line === 0
+        ? `@${grouped(problem.offset)}`
+        : `${grouped(problem.line)}:${grouped(problem.column)}`;
 
     const what = document.createElement("span");
     what.className = "what";
@@ -1053,23 +1072,46 @@ function onValidated(event: Extract<WorkerEvent, { kind: "validated" }>): void {
     event.bytes > 0 ? Math.round((event.checked / event.bytes) * 100) : 100;
   const capped =
     event.total > problemsList.childElementCount ? " (first 500 shown)" : "";
-  problemsTitle.textContent =
-    event.total === 0 && event.done
-      ? "No syntax errors"
+  const nothing = passKind === "dedup" ? "No duplicates" : "No syntax errors";
+  const some =
+    passKind === "dedup"
+      ? `${grouped(event.total)} ${event.total === 1 ? "duplicate" : "duplicates"}`
       : `${grouped(event.total)} ${event.total === 1 ? "problem" : "problems"}`;
+  problemsTitle.textContent = event.total === 0 && event.done ? nothing : some;
+
+  const examined =
+    passKind === "dedup" ? "keys and elements checked" : "values checked";
   problemsState.textContent = event.done
-    ? `${grouped(event.values)} values checked${capped}`
+    ? `${grouped(event.values)} ${examined}${capped}`
     : `checking… ${checked}%`;
 
   list.refresh();
 }
 
 validateButton.addEventListener("click", () => {
+  passKind = "validate";
   resetProblems();
   problems.hidden = false;
   problemsTitle.textContent = "Checking…";
   problemsState.textContent = "";
   engine.call("validate", {}).catch((thrown: unknown) => {
+    say("err", describe(thrown));
+  });
+});
+
+dedupButton.addEventListener("click", (event) => {
+  // Shift adds element comparison. A modifier rather than a second button
+  // because it is the same question asked more thoroughly, and the toolbar has
+  // to stay legible; the title attribute says so.
+  const elements = event.shiftKey;
+  passKind = "dedup";
+  resetProblems();
+  problems.hidden = false;
+  problemsTitle.textContent = elements
+    ? "Looking for repeated keys and records…"
+    : "Looking for repeated keys…";
+  problemsState.textContent = "";
+  engine.call("dedup", { keys: true, elements }).catch((thrown: unknown) => {
     say("err", describe(thrown));
   });
 });
@@ -1083,6 +1125,7 @@ schemaFile.addEventListener("change", () => {
   if (!chosen) {
     return;
   }
+  passKind = "schema";
   resetProblems();
   problems.hidden = false;
   problemsTitle.textContent = `Checking against ${chosen.name}…`;
@@ -1114,6 +1157,113 @@ problemsClose.addEventListener("click", () => {
   void engine.call("validateStop", {}).catch(() => {
     // Nothing to stop is not a failure.
   });
+});
+
+// -------------------------------------------------------------- export
+
+/** Whether an export is running, so a second click cannot start a second one. */
+let exporting = false;
+
+/**
+ * Write the document to disk, a batch at a time.
+ *
+ * The loop is `convert → await write → convert`, and the `await` is the whole
+ * design. Converting is fast and writing is not; without waiting for the write,
+ * a 500 MB export would convert faster than the disk accepts and queue the
+ * difference in memory — which is the failure the streaming write exists to
+ * prevent, arrived at by a different route.
+ *
+ * With a filter active this writes the matching records only, because that is
+ * what is on screen and what the user just asked a question about.
+ */
+async function runExport(): Promise<void> {
+  if (exporting) {
+    return;
+  }
+  const format = exportFormat.value as ExportFormat;
+  const rows = filtered() ? [...search.matchedRows] : [];
+
+  const picker = (
+    window as unknown as {
+      showSaveFilePicker?: (options: unknown) => Promise<FileSystemFileHandle>;
+    }
+  ).showSaveFilePicker;
+  if (!picker) {
+    say("err", "this browser cannot save files directly");
+    return;
+  }
+
+  const extension =
+    format === "csv" ? "csv" : format === "ndjson" ? "ndjson" : "json";
+  const base = openName.replace(/\.(json|ndjson|jsonl)$/i, "");
+  const suffix = rows.length > 0 ? "-filtered" : "";
+
+  let handle: FileSystemFileHandle;
+  try {
+    handle = await picker({
+      suggestedName: `${base}${suffix}.${extension}`,
+      types: [
+        {
+          description: format.toUpperCase(),
+          accept: { "text/plain": [`.${extension}`] },
+        },
+      ],
+    });
+  } catch {
+    return; // The picker was dismissed. Not an error, and not worth saying.
+  }
+
+  exporting = true;
+  exportButton.disabled = true;
+  const writable = await handle.createWritable();
+
+  try {
+    let start: { format: ExportFormat; rows: number[] } | undefined = {
+      format,
+      rows,
+    };
+    let truncated = false;
+    for (;;) {
+      const step = await engine.call("exportStep", start ? { start } : {});
+      start = undefined;
+      truncated ||= step.truncated;
+
+      if (step.chunk.byteLength > 0) {
+        await writable.write(step.chunk);
+      }
+      if (step.done) {
+        await writable.close();
+        const what = rows.length > 0 ? "filtered records" : "records";
+        say(
+          "ok",
+          `exported ${grouped(step.records)} ${what} to ${handle.name}`,
+        );
+        if (truncated) {
+          // Never silent: an export that claims to be complete and is not is
+          // the kind of thing that costs someone a day.
+          say(
+            "err",
+            "some values were larger than the read limit and were cut short",
+          );
+        }
+        break;
+      }
+      say("", `exporting… ${grouped(step.records)} records`);
+    }
+  } catch (thrown) {
+    await writable.abort().catch(() => {
+      // The stream is already gone; the original failure is the one to report.
+    });
+    void engine.call("exportStop", {}).catch(() => {});
+    say("err", describe(thrown));
+  } finally {
+    exporting = false;
+    exportButton.disabled = false;
+  }
+}
+
+exportButton.addEventListener("click", () => {
+  void runExport();
 });
 
 // ---------------------------------------------------------------- go to
@@ -1505,8 +1655,12 @@ document.addEventListener("keydown", (event) => {
 // ------------------------------------------------------------------ files
 
 /** Hand a file to the engine and show its root. */
+/** The open file's name, for suggesting an export name. */
+let openName = "leviathan";
+
 async function openFile(source: File): Promise<void> {
   say("", `opening ${source.name}…`);
+  openName = source.name;
   selection = undefined;
   copyPath.disabled = true;
   copyValue.disabled = true;

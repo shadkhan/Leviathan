@@ -39,6 +39,7 @@ import {
   type FromWorker,
   type Method,
   type Params,
+  type Problem,
   type ProgressEvent,
   type RequestEnvelope,
   type SearchMode,
@@ -293,6 +294,47 @@ const handlers: Handlers = {
     };
   },
 
+  dedup: ({ keys, elements }) => {
+    const document = requireOpen();
+    document.dedupStart(keys, elements);
+    void dedupToEnd(document, ++pass);
+    return {};
+  },
+
+  exportFormats: () => ({
+    formats: ["json", "json-pretty", "ndjson", "csv"],
+  }),
+
+  exportStep: ({ start }) => {
+    const document = requireOpen();
+    if (start) {
+      document.exportStart(start.format, new Float64Array(start.rows));
+    }
+    const step = document.exportStep();
+    try {
+      // The chunk is copied out of WASM memory by wasm-bindgen already, so this
+      // buffer is ours to transfer rather than copy again.
+      // `slice` on a `Uint8Array` gives a copy with its own `ArrayBuffer`,
+      // which is what the transfer list needs. Reaching through `.buffer` types
+      // as `ArrayBuffer | SharedArrayBuffer` and would be a view into WASM
+      // memory besides — the thing C5 says never to hand out.
+      const chunk = step.chunk.slice();
+      return {
+        chunk: chunk.buffer as ArrayBuffer,
+        records: step.records,
+        done: step.done,
+        truncated: step.truncated,
+      };
+    } finally {
+      step.free();
+    }
+  },
+
+  exportStop: () => {
+    open?.exportStop();
+    return {};
+  },
+
   close: () => {
     closeCurrent();
     return {};
@@ -366,6 +408,87 @@ async function checkToEnd(
         error: toProtocolError(
           thrown,
           "Validation stopped: the file could not be read.",
+        ),
+      });
+      return;
+    }
+
+    if (done) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  }
+}
+
+/**
+ * Walk the file for duplicates, posting them as they are found.
+ *
+ * The same loop shape as {@link checkToEnd}, reporting into the same `validated`
+ * event: a duplicate is a finding with a location, which is what that event
+ * carries. The repeat's offset is the one reported, because that is the member
+ * you would delete; the first occurrence is named in the message so both are
+ * reachable.
+ */
+async function dedupToEnd(document: Document, id: number): Promise<void> {
+  for (;;) {
+    if (document !== open || id !== pass) {
+      return; // Superseded, stopped, or the file was closed.
+    }
+
+    let done: boolean;
+    try {
+      const step = document.dedupStep();
+      try {
+        done = step.done;
+        const positions = step.positions;
+        const messages = step.messages === "" ? [] : step.messages.split("");
+        const problems: Problem[] = messages.map((entry, at) => {
+          const [kind, what] = entry.split("");
+          const first = positions[at * 4] ?? 0;
+          const second = positions[at * 4 + 2] ?? 0;
+          const row = positions[at * 4 + 3] ?? -1;
+          const named = kind === "key" ? `key "${what}"` : `element ${what}`;
+          return {
+            offset: second,
+            // A duplicate has no line of its own to report: it is a fact about
+            // two places, and both are byte offsets. Zero means "no line", and
+            // the renderer shows the offset instead.
+            line: 0,
+            column: 0,
+            row: row < 0 ? null : row,
+            message: `duplicate ${named} — first at byte ${first.toLocaleString()}`,
+          };
+        });
+
+        emit({
+          kind: "validated",
+          pass: id,
+          problems,
+          total: step.found,
+          checked: step.walked,
+          bytes: step.total,
+          values: step.keys + step.elements,
+          done,
+        });
+      } finally {
+        step.free();
+      }
+    } catch (thrown) {
+      emit({
+        kind: "validated",
+        pass: id,
+        problems: [],
+        total: 0,
+        checked: 0,
+        bytes: document.size,
+        values: 0,
+        done: true,
+        error: toProtocolError(
+          thrown,
+          "The duplicate check stopped: the file could not be read.",
         ),
       });
       return;

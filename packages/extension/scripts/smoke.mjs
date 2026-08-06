@@ -504,6 +504,277 @@ check("a filter yields between batches and survives a malformed record", () => {
   document.free();
 });
 
+/** Drive a duplicate pass to completion, collecting what it reports. */
+function dedupAll(document, { keys = true, elements = false } = {}) {
+  document.dedupStart(keys, elements);
+  const found = [];
+  let steps = 0;
+  let last;
+  for (;;) {
+    const step = document.dedupStep();
+    const messages = step.messages === "" ? [] : step.messages.split("");
+    messages.forEach((entry, at) => {
+      const [kind, what] = entry.split("");
+      found.push({
+        kind,
+        what,
+        first: step.positions[at * 4],
+        firstRow: step.positions[at * 4 + 1],
+        second: step.positions[at * 4 + 2],
+        secondRow: step.positions[at * 4 + 3],
+      });
+    });
+    last = { total: step.found, done: step.done, capped: step.capped };
+    step.free();
+    steps++;
+    assert.ok(steps < 10_000, "dedupStep must terminate");
+    if (last.done) {
+      return { found, steps, ...last };
+    }
+  }
+}
+
+check("a repeated key is reported with both of its locations", () => {
+  // Valid JSON that every parser resolves differently, and the only thing in
+  // this product that says so.
+  const { document } = open('{"id":1,"name":"a","id":2}');
+  const run = dedupAll(document);
+
+  assert.equal(run.total, 1);
+  assert.equal(run.found.length, 1);
+  assert.equal(run.found[0].kind, "key");
+  assert.equal(run.found[0].what, "id");
+  assert.equal(run.found[0].first, 1, "the first `id`");
+  assert.equal(run.found[0].second, 19, "and the repeat");
+  document.free();
+});
+
+check("the same key in different records is not a duplicate", () => {
+  // Every record in a log has an `id`. Reporting that would make the feature
+  // useless on exactly the files it exists for.
+  const { document } = open('{"id":1}\n{"id":2}\n{"id":3}\n');
+  assert.equal(dedupAll(document).total, 0);
+  document.free();
+});
+
+check("duplicate offsets resolve to rows the tree can be sent to", () => {
+  const { document } = open('{"a":1}\n{"b":2,"b":3}\n{"c":4}\n');
+  const run = dedupAll(document);
+
+  assert.equal(run.total, 1);
+  assert.equal(run.found[0].what, "b");
+  assert.equal(run.found[0].secondRow, 1, "the middle record");
+  assert.equal(run.found[0].firstRow, 1, "both occurrences are in it");
+  document.free();
+});
+
+check("element checking is opt-in, and finds repeated records", () => {
+  const text = '{"a":1}\n{"b":2}\n{"a":1}\n';
+
+  const { document: keysOnly } = open(text);
+  assert.equal(
+    dedupAll(keysOnly).total,
+    0,
+    "off by default — it is the slow half",
+  );
+  keysOnly.free();
+
+  const { document } = open(text);
+  const run = dedupAll(document, { elements: true });
+  assert.equal(run.total, 1);
+  assert.equal(run.found[0].kind, "element");
+  assert.equal(run.found[0].second, 16, "the third record repeats the first");
+  document.free();
+});
+
+check("a duplicate pass yields between batches on a large file", () => {
+  // Larger than one 8 MiB batch, deliberately: a pass that finishes in a single
+  // step proves nothing about yielding, and 20 000 records (500 KB) did exactly
+  // that. Each record repeats a key, so the expected count is known exactly.
+  const RECORDS = 400_000;
+  const lines = [];
+  for (let i = 0; i < RECORDS; i++) {
+    lines.push(`{"id":${i},"dup":1,"dup":2}`);
+  }
+  const { document } = open(`${lines.join("\n")}\n`);
+
+  const run = dedupAll(document);
+  assert.equal(run.total, RECORDS, "one repeat per record, counted exactly");
+  assert.ok(run.steps > 1, `expected several steps, got ${run.steps}`);
+  assert.ok(
+    run.found.length < run.total,
+    "and the listing is capped while the count is not",
+  );
+  document.free();
+});
+
+/** Drive an export to completion, returning the concatenated bytes. */
+function exportAll(document, format, rows = []) {
+  document.exportStart(format, new Float64Array(rows));
+  const parts = [];
+  let steps = 0;
+  let last;
+  for (;;) {
+    const step = document.exportStep();
+    parts.push(step.chunk.slice());
+    last = {
+      records: step.records,
+      done: step.done,
+      truncated: step.truncated,
+    };
+    step.free();
+    steps++;
+    assert.ok(steps < 10_000, "exportStep must terminate");
+    if (last.done) {
+      const total = parts.reduce((n, part) => n + part.length, 0);
+      const bytes = new Uint8Array(total);
+      let at = 0;
+      for (const part of parts) {
+        bytes.set(part, at);
+        at += part.length;
+      }
+      return { text: new TextDecoder().decode(bytes), steps, ...last };
+    }
+  }
+}
+
+check("an export re-parses to exactly what went in", () => {
+  // Requirement 11, checked rather than asserted — and checked on the values a
+  // float round-trip would quietly change.
+  const source = [
+    '{"n":1.0000000000000002,"big":10000000000000000000}',
+    '{"s":"\\u0041","raw":"A","esc":"\\/"}',
+    '{"deep":{"a":[1,2,{"b":null}]},"t":true}',
+    "",
+  ].join("\n");
+
+  const { document } = open(source);
+  const run = exportAll(document, "ndjson");
+
+  assert.equal(run.records, 3);
+  assert.equal(run.truncated, false);
+  assert.equal(
+    run.text,
+    source,
+    "byte-identical: the source was already minified",
+  );
+  document.free();
+});
+
+check("whitespace is the only thing minifying removes", () => {
+  const { document } = open('{ "a" : 1 , "b" : [ 2 , 3 ] }\n');
+  assert.equal(exportAll(document, "ndjson").text, '{"a":1,"b":[2,3]}\n');
+  document.free();
+});
+
+check(
+  "json wraps the records, pretty prints them, and still round-trips",
+  () => {
+    const { document } = open('{"a":1}\n{"b":[2]}\n');
+
+    assert.equal(exportAll(document, "json").text, '[{"a":1},{"b":[2]}]');
+
+    const pretty = exportAll(document, "json-pretty").text;
+    assert.ok(pretty.includes('"a": 1'), pretty);
+    assert.ok(pretty.includes("\n  {"), pretty);
+    // Same document, differently spaced: re-minifying gets back to the other one.
+    assert.equal(
+      JSON.stringify(JSON.parse(pretty)),
+      '[{"a":1},{"b":[2]}]',
+      pretty,
+    );
+    document.free();
+  },
+);
+
+check(
+  "csv discovers columns across every record before writing a header",
+  () => {
+    // The column that first appears last still belongs in the header, which is
+    // why discovery is its own pass and why `exportStep` drives both.
+    const { document } = open(
+      '{"a":1}\n{"a":2,"meta":{"r":"eu"}}\n{"tags":["x","y"]}\n',
+    );
+    const run = exportAll(document, "csv");
+    const lines = run.text.split("\r\n");
+
+    assert.equal(lines[0], "a,meta.r,tags");
+    assert.equal(lines[1], "1,,");
+    assert.equal(lines[2], "2,eu,");
+    assert.equal(
+      lines[3],
+      ',,"[""x"",""y""]"',
+      "an array is one cell, not many",
+    );
+    document.free();
+  },
+);
+
+check("a single document exports as itself, not as its members", () => {
+  // The bug this test exists for: a root *object*'s tier-1 rows are its
+  // members, so exporting them as a sequence wrote `"a":1` per line and dropped
+  // the braces entirely. Its rows are only records when the root is an array.
+  const { document } = open('{ "a" : 1 , "b" : [ 2 , 3 ] }');
+  assert.equal(exportAll(document, "ndjson").text, '{"a":1,"b":[2,3]}\n');
+  assert.equal(
+    exportAll(document, "json").text,
+    '{"a":1,"b":[2,3]}',
+    "and it is not wrapped in an array it never had",
+  );
+  document.free();
+});
+
+check("a root array exports one element per line as NDJSON", () => {
+  // The conversion that is actually useful, and the reason the root's kind is
+  // consulted rather than assumed.
+  const { document } = open('[{"a":1},{"a":2},{"a":3}]');
+  assert.equal(
+    exportAll(document, "ndjson").text,
+    '{"a":1}\n{"a":2}\n{"a":3}\n',
+  );
+  assert.equal(
+    exportAll(document, "json").text,
+    '[{"a":1},{"a":2},{"a":3}]',
+    "and back to the array it came from",
+  );
+  document.free();
+});
+
+check("an export can be restricted to chosen rows", () => {
+  // What "export the current filter result" is built on.
+  const { document } = open('{"n":0}\n{"n":1}\n{"n":2}\n{"n":3}\n');
+  const run = exportAll(document, "ndjson", [1, 3]);
+
+  assert.equal(run.records, 2);
+  assert.equal(run.text, '{"n":1}\n{"n":3}\n');
+  document.free();
+});
+
+check("a large export arrives in batches rather than all at once", () => {
+  // The property the streaming write depends on: if this came back in one
+  // chunk, a 500 MB export would be assembled in memory before a byte reached
+  // the disk.
+  const lines = [];
+  for (let i = 0; i < 5_000; i++) {
+    lines.push(`{"id":${i}}`);
+  }
+  const { document } = open(`${lines.join("\n")}\n`);
+
+  const run = exportAll(document, "ndjson");
+  assert.equal(run.records, 5_000);
+  assert.ok(run.steps > 2, `expected several steps, got ${run.steps}`);
+  document.free();
+});
+
+check("an unknown export format is refused rather than guessed", () => {
+  const { document } = open('{"a":1}\n');
+  assert.throws(
+    () => document.exportStart("yaml", new Float64Array(0)),
+    /yaml/,
+  );
+  document.free();
+});
+
 check("the row layout version is the one the extension bundle expects", () => {
   // The bundle's copy lives in src/protocol/rows.ts. Two constants, one layout;
   // this is the seam where a stale `dist/` shows up as an error rather than as

@@ -35,9 +35,9 @@
 mod pack;
 
 use leviathan_core::{
-    Build, BuildOptions, Built, ByteRange, ExpandOptions, ExpansionCache, Filter, Find,
-    FindOptions, FindStop, Format, RowOptions, Schema, SourceError, Stopped, Validate,
-    ValidateOptions, materialize, rows_of, sniff_format,
+    Build, BuildOptions, Built, ByteRange, Dedup, DedupOptions, ExpandOptions, ExpansionCache,
+    Export, ExportFormat, Filter, Find, FindOptions, FindStop, Format, RowOptions, Schema,
+    SourceError, Stopped, Validate, ValidateOptions, materialize, rows_of, sniff_format,
 };
 use wasm_bindgen::prelude::*;
 
@@ -53,6 +53,9 @@ const SCHEMA_BATCH: usize = 2_000;
 /// is wrong has as many problems as it has records, and nobody reads the
 /// thousandth.
 const SCHEMA_ERROR_LIMIT: usize = 1_000;
+
+/// Records converted per `exportStep`, so the Worker yields and can write.
+const EXPORT_BATCH: usize = 2_000;
 
 /// Records tested per `filterStep`, so the Worker yields between batches.
 const FILTER_BATCH: usize = 2_000;
@@ -412,6 +415,165 @@ impl Validated {
     }
 }
 
+/// How far a duplicate pass has got, and what it found.
+///
+/// Four doubles per duplicate and one joined string, for the same reason
+/// validation uses that shape (C43): a config file with a thousand repeated keys
+/// would otherwise build a thousand JS objects inside a pass the user is
+/// watching.
+#[wasm_bindgen]
+pub struct Deduped {
+    positions: Vec<f64>,
+    messages: String,
+    walked: f64,
+    total: f64,
+    found: u32,
+    keys: f64,
+    elements: f64,
+    done: bool,
+    capped: bool,
+}
+
+impl Deduped {
+    fn empty() -> Self {
+        Self {
+            positions: Vec::new(),
+            messages: String::new(),
+            walked: 0.0,
+            total: 0.0,
+            found: 0,
+            keys: 0.0,
+            elements: 0.0,
+            done: true,
+            capped: false,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl Deduped {
+    /// Four doubles per duplicate found by *this* step: the first occurrence's
+    /// byte offset and row, then the repeat's byte offset and row. `-1` for a
+    /// byte that precedes the first row.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn positions(&self) -> Vec<f64> {
+        self.positions.clone()
+    }
+
+    /// The same duplicates' descriptions, separated by U+0001.
+    ///
+    /// Each is the kind — `key` or `element` — then U+0002, then the name or a
+    /// short rendering of the value.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn messages(&self) -> String {
+        self.messages.clone()
+    }
+
+    /// Bytes walked so far.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn walked(&self) -> f64 {
+        self.walked
+    }
+
+    /// Bytes in the file.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn total(&self) -> f64 {
+        self.total
+    }
+
+    /// Every repeat found, including those past the report limit.
+    ///
+    /// Counting is free; proving one costs two reads. So a file with two million
+    /// duplicate keys reports two million and lists the first thousand, rather
+    /// than choosing between a truthful count and a usable one.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn found(&self) -> u32 {
+        self.found
+    }
+
+    /// Object keys examined.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn keys(&self) -> f64 {
+        self.keys
+    }
+
+    /// Array elements examined.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn elements(&self) -> f64 {
+        self.elements
+    }
+
+    /// Whether the pass has finished.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
+    /// Whether a container was too large to track fully, so "no duplicates" is
+    /// not a claim the pass can make about it.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn capped(&self) -> bool {
+        self.capped
+    }
+}
+
+/// One instalment of an export.
+///
+/// The bytes cross as a `Vec<u8>` the host writes and drops. Nothing accumulates
+/// on either side of the boundary — a 500 MB export is 500 MB of writes and a
+/// few hundred kilobytes of peak memory, which is the entire point of doing it
+/// this way rather than building a string and calling `Blob`.
+#[wasm_bindgen]
+pub struct Exported {
+    chunk: Vec<u8>,
+    records: f64,
+    done: bool,
+    truncated: bool,
+}
+
+#[wasm_bindgen]
+impl Exported {
+    /// The bytes to write for this step.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn chunk(&self) -> Vec<u8> {
+        self.chunk.clone()
+    }
+
+    /// Records converted so far.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn records(&self) -> f64 {
+        self.records
+    }
+
+    /// Whether the export has finished.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
+    /// Whether any record was too large to read whole and was cut short.
+    ///
+    /// A truncated export that claims to be complete is the kind of thing that
+    /// costs someone a day, so it is a field rather than a silence.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
 /// One open file, and every index built over it.
 ///
 /// Owns the tier-1 index, the tier-2 expansion cache, and the host's reader.
@@ -441,6 +603,20 @@ pub struct Document {
     /// The next row a filter pass will test, if one is running.
     filter_row: Option<usize>,
     filter_matches: u32,
+    dedup: Option<Dedup>,
+    dedup_options: DedupOptions,
+    /// Duplicates already handed to the host, so each step reports only new ones.
+    deduped: usize,
+    export: Option<Export>,
+    /// Which rows the export covers: `None` for all of them.
+    export_rows: Option<Vec<usize>>,
+    /// The next row to convert, and whether the header has been written.
+    export_at: usize,
+    export_opened: bool,
+    /// The next row to examine for CSV columns, while discovery is running.
+    export_discovering: Option<usize>,
+    /// The whole document as one record, when its rows are not records.
+    export_whole: Option<(u64, u64)>,
 }
 
 #[wasm_bindgen]
@@ -507,6 +683,15 @@ impl Document {
             filter: None,
             filter_row: None,
             filter_matches: 0,
+            dedup: None,
+            dedup_options: DedupOptions::default(),
+            deduped: 0,
+            export: None,
+            export_rows: None,
+            export_at: 0,
+            export_opened: false,
+            export_discovering: None,
+            export_whole: None,
         })
     }
 
@@ -1119,6 +1304,262 @@ impl Document {
         self.filter = None;
         self.filter_row = None;
         self.filter_matches = 0;
+    }
+
+    /// Begin looking for duplicates.
+    ///
+    /// `elements` is the expensive half and is opt-in (SPEC M5): checking keys
+    /// costs a hash of each name, while checking elements costs a hash of every
+    /// subtree and a frame that grows with the container.
+    #[wasm_bindgen(js_name = dedupStart)]
+    pub fn dedup_start(&mut self, keys: bool, elements: bool) {
+        self.dedup = Some(Dedup::new(self.build.format()));
+        self.dedup_options = DedupOptions {
+            keys,
+            elements,
+            ..DedupOptions::default()
+        };
+        self.deduped = 0;
+    }
+
+    /// Walk the next batch, and report the duplicates it found.
+    ///
+    /// Only duplicates new to *this* step are returned, so a host appends rather
+    /// than replacing a growing list. Each offset is resolved to a row here,
+    /// where the index is, rather than in a second round trip.
+    ///
+    /// # Errors
+    ///
+    /// If the host's reader fails.
+    #[wasm_bindgen(js_name = dedupStep)]
+    pub fn dedup_step(&mut self) -> Result<Deduped, JsError> {
+        let Document {
+            source,
+            build,
+            dedup,
+            dedup_options,
+            deduped,
+            ..
+        } = self;
+
+        let Some(pass) = dedup.as_mut() else {
+            return Ok(Deduped::empty());
+        };
+
+        pass.advance(source, dedup_options).map_err(to_js)?;
+
+        let all = pass.duplicates();
+        let table = build.table();
+        let mut positions = Vec::new();
+        let mut messages = String::new();
+        for duplicate in &all[(*deduped).min(all.len())..] {
+            if !messages.is_empty() {
+                messages.push('\u{1}');
+            }
+            messages.push_str(duplicate.kind.as_str());
+            messages.push('\u{2}');
+            messages.push_str(&duplicate.what);
+            for offset in [duplicate.first, duplicate.second] {
+                positions.push(offset as f64);
+                positions.push(table.locate(offset).map_or(-1.0, |row| row as f64));
+            }
+        }
+        *deduped = all.len();
+
+        Ok(Deduped {
+            positions,
+            messages,
+            walked: pass.walked() as f64,
+            total: source.len as f64,
+            found: clamp_u32(usize::try_from(pass.total()).unwrap_or(usize::MAX)),
+            keys: pass.keys_checked() as f64,
+            elements: pass.elements_checked() as f64,
+            done: pass.is_done(),
+            capped: pass.capped(),
+        })
+    }
+
+    /// Abandon the duplicate pass in progress.
+    #[wasm_bindgen(js_name = dedupStop)]
+    pub fn dedup_stop(&mut self) {
+        self.dedup = None;
+        self.deduped = 0;
+    }
+
+    /// Begin an export.
+    ///
+    /// `format` is one of `json`, `json-pretty`, `ndjson`, `csv`. `rows` selects
+    /// which root rows to write — an empty array means all of them, and the
+    /// filter's result is what a host passes here.
+    ///
+    /// CSV runs a discovery pass first, because a column that first appears in
+    /// record 900 000 still belongs in the header. `exportStep` drives both
+    /// phases; a host cannot forget the first one, because there is no way to
+    /// ask for the second on its own.
+    ///
+    /// # Errors
+    ///
+    /// If `format` is not one of the four.
+    #[wasm_bindgen(js_name = exportStart)]
+    pub fn export_start(&mut self, format: &str, rows: Vec<f64>) -> Result<(), JsError> {
+        let format = match format {
+            "json" => ExportFormat::Json,
+            "json-pretty" => ExportFormat::JsonPretty,
+            "ndjson" => ExportFormat::Ndjson,
+            "csv" => ExportFormat::Csv,
+            other => return Err(JsError::new(&format!("unknown export format: {other}"))),
+        };
+
+        self.export_rows = if rows.is_empty() {
+            None
+        } else {
+            Some(rows.iter().map(|row| *row as usize).collect())
+        };
+
+        // A single document whose root is an **object** has *members* as its
+        // tier-1 rows, not records — exporting those as a sequence would write
+        // `"a":1` per line and drop the braces, which is what the first version
+        // did. Its rows are only records when the root is an array.
+        //
+        // The root's kind comes from its first byte, which is one read of a few
+        // bytes rather than a second index.
+        self.export_whole =
+            if self.export_rows.is_none() && self.build.format() == Format::SingleDocument {
+                let head = self.source.read(0, 64).map_err(to_js)?;
+                let first = head.iter().find(|b| !b.is_ascii_whitespace()).copied();
+                (first != Some(b'[')).then_some((0, self.source.len))
+            } else {
+                None
+            };
+
+        self.export_at = 0;
+        self.export_opened = false;
+        self.export_discovering = format.needs_columns().then_some(0);
+        // A whole document is one value, not a sequence, so JSON output must not
+        // wrap it: a file holding `{"a":1}` exports as `{"a":1}`.
+        self.export = Some(Export::new(format).wrapped(self.export_whole.is_none()));
+        Ok(())
+    }
+
+    /// Convert the next batch, and return the bytes to write.
+    ///
+    /// # Errors
+    ///
+    /// If the host's reader fails.
+    #[wasm_bindgen(js_name = exportStep)]
+    pub fn export_step(&mut self) -> Result<Exported, JsError> {
+        let Document {
+            source,
+            build,
+            export,
+            export_rows,
+            export_at,
+            export_opened,
+            export_discovering,
+            export_whole,
+            row_options,
+            ..
+        } = self;
+
+        let Some(writer) = export.as_mut() else {
+            return Ok(Exported {
+                chunk: Vec::new(),
+                records: 0.0,
+                done: true,
+                truncated: false,
+            });
+        };
+
+        let table = build.table();
+        let whole = *export_whole;
+        let count = match (whole, export_rows.as_ref()) {
+            (Some(_), _) => 1,
+            (None, Some(chosen)) => chosen.len(),
+            (None, None) => table.len(),
+        };
+        let row_of = |at: usize| -> Option<usize> {
+            match export_rows.as_ref() {
+                Some(chosen) => chosen.get(at).copied(),
+                None => (at < table.len()).then_some(at),
+            }
+        };
+        // Settled before the source is borrowed for reading, for the same
+        // reason `filterStep` settles it: `source.len` lives behind the same
+        // borrow the reader takes.
+        let end_of_file = source.len;
+        let cap = u64::from(row_options.row_budget) * 64;
+        let extent = |row: usize| -> Option<(u64, u64)> {
+            if let Some(span) = whole {
+                return Some(span);
+            }
+            let start = table.child(row)?;
+            let end = table
+                .child(row + 1)
+                .unwrap_or(end_of_file)
+                .min(start.saturating_add(cap));
+            Some((start, end))
+        };
+
+        // Phase one: CSV column discovery, which reads every record and writes
+        // nothing. Reported as progress rather than as a stall.
+        if let Some(at) = *export_discovering {
+            let last = (at + EXPORT_BATCH).min(count);
+            for index in at..last {
+                let span = if whole.is_some() {
+                    whole
+                } else {
+                    row_of(index).and_then(extent)
+                };
+                if let Some((start, end)) = span {
+                    writer.discover(source, start, end).map_err(to_js)?;
+                }
+            }
+            *export_discovering = if last >= count { None } else { Some(last) };
+            return Ok(Exported {
+                chunk: Vec::new(),
+                records: last as f64,
+                done: false,
+                truncated: writer.truncated(),
+            });
+        }
+
+        let mut chunk = Vec::new();
+        if !*export_opened {
+            chunk.extend_from_slice(writer.open());
+            *export_opened = true;
+        }
+
+        let last = (*export_at + EXPORT_BATCH).min(count);
+        for index in *export_at..last {
+            let span = if whole.is_some() {
+                whole
+            } else {
+                row_of(index).and_then(extent)
+            };
+            if let Some((start, end)) = span {
+                chunk.extend_from_slice(writer.push(source, start, end).map_err(to_js)?);
+            }
+        }
+        *export_at = last;
+
+        let done = last >= count;
+        if done {
+            chunk.extend_from_slice(writer.close());
+        }
+
+        Ok(Exported {
+            chunk,
+            records: writer.written() as f64,
+            done,
+            truncated: writer.truncated(),
+        })
+    }
+
+    /// Abandon the export in progress.
+    #[wasm_bindgen(js_name = exportStop)]
+    pub fn export_stop(&mut self) {
+        self.export = None;
+        self.export_rows = None;
     }
 
     /// Which root row contains byte `offset`, if any.

@@ -1607,10 +1607,223 @@ both directions.
 
 ---
 
+## 2026-08-05 — M5: the duplicate nobody else reports
+
+### C65 — "Computed during indexing" was impossible, and the best result is why — **revised**
+
+SPEC's M5 scope said element dedup would be "computed during indexing so it
+costs one pass", and its exit criterion budgeted **< 20 % of index time**. Both
+are now wrong, and they are wrong because of the thing this product is proudest
+of.
+
+NDJSON tier-1 indexing does not parse. It scans for newlines at 1.3 GB/s and
+records where each line starts (C3, C21) — that is the whole reason a 500 MB
+file opens in under a second. A structural hash of a record requires *parsing*
+that record. There is no version of "fold the hash into the index build" that
+does not mean parsing every record during indexing, which would make opening a
+file 17× slower to serve a feature most people never press.
+
+Measured: indexing 0.38 s, dedup 6.5 s. **+1 620 %** against a 20 % budget, and
+no implementation moves it.
+
+So the criterion is restated against the thing it was really protecting. The
+scope line said "hashing behind a feature flag so the cost is opt-in on huge
+files" — the number that matters is what turning the flag *on* costs, not what
+the whole pass costs. Element dedup adds **1.5 %** to the duplicate pass and
+**34.6 MB** to memory, against budgets of 20 % and 64 MB.
+
+This is C62's shape a second time, from a different cause. C62's criterion was
+unmeasurable because it depended on the input; this one was unachievable because
+it assumed an implementation that a *different* good decision ruled out. The
+common lesson is narrower than "criteria go stale": **a criterion written before
+the design it constrains will sometimes be measuring an architecture that no
+longer exists**, and the honest move is to name what it was protecting and
+re-state it there.
+
+*Rules out:* budgeting a parsing pass against a non-parsing one; treating an
+early criterion as evidence about a design that postdates it.
+
+### C66 — The same read bug, in a second place, three weeks apart — **validated**
+
+The first duplicate pass ran at **1.7 MB/s** — 30 seconds for a 50 MB file,
+against 39 ms to index it. Every answer it gave was correct: 2 135 763
+duplicates on a fixture whose construction guarantees exactly 305 109 × 7.
+
+The cause was the read loop. It read a 256 KiB window, found the first newline,
+consumed the ~165 bytes before it, advanced the cursor by one record, and read
+another 256 KiB window. A 50 MB file cost **78 GB** of reading. Consuming every
+record in the window instead: 2.7 s. Then hashing tokens straight out of the
+carry buffer rather than copying each into a fresh `Vec<u8>` — ten million
+allocations — took it to **0.99 s**. Thirty times faster, no behaviour changed.
+
+This is exactly C60, six days later, in a module written after it. Two things
+are worth extracting:
+
+- **No test could have caught either.** Both versions produced every correct
+  answer; only a benchmark next to a reference workload showed the gap. The
+  reference is what did the work — "dedup is 30 s" means nothing, "dedup is 30 s
+  and `walk` over the same file is 0.36 s" means everything. This is what the
+  ceiling rows in the bench harness are for (C16), and the first time they have
+  caught a defect rather than contextualized a number.
+- **Knowing the lesson did not prevent it.** C60 is written down, in this file,
+  with the word "reads" in the heading. The mistake recurred anyway, because the
+  per-record loop is what the *streaming* shape naturally suggests and the cost
+  is invisible at the call site. Mechanism beats discipline again: the fix is
+  that `dupkeys` now sits next to `walk` and `index` in the benchmark table, so
+  a regression shows as a ratio rather than as a number nobody compares.
+
+*Rules out:* a read per record, anywhere; reviewing a streaming loop without a
+throughput number next to a reference workload.
+
+### C67 — A count and a proof have different prices — **assumed**
+
+Verifying a duplicate means re-reading both members and comparing them, because
+a 64-bit hash collision over a million records is unlikely and unlikely is not a
+basis for telling someone their export is broken. But a file *can* have two
+million duplicates, and proving two million of them costs four million reads —
+the first run of the benchmark hung for ten minutes doing exactly that.
+
+Counting, though, is free: it falls out of the sort that finds them. So the two
+are separated. `total()` counts every repeat and is exact by structural hash;
+`duplicates()` lists the first thousand and every one of those is verified byte
+for byte. A file with two million duplicate keys reports two million and lists a
+thousand, rather than choosing between a truthful count and a usable one.
+
+The general shape: when verification costs more than detection, report both
+numbers and say which is which. The failure mode this avoids is the one where a
+tool silently caps its count to keep its promise of exactness, and tells you
+"1,000 duplicates" about a file that has two million.
+
+*Rules out:* capping a count to preserve a verification guarantee; reporting an
+unverified match as a fact.
+
+---
+
+## 2026-08-05 — M6: the export that does not convert
+
+### C68 — Round-trip fidelity by not converting — **validated**
+
+Requirement 11 says what comes out must re-parse to the same thing. The obvious
+way to get there is to write a careful converter and test it hard. Every JSON
+tool that does this has the same bug list: `1.0000000000000002` comes back as
+`1.0000000000000002` but `1e400` becomes `Infinity`, `10000000000000000000`
+comes back as `10000000000000000000` in one language and `1e19` in another,
+`A` silently becomes `A`, and `-0` becomes `0`.
+
+None of those are hard to fix individually. All of them exist because a value
+was parsed and then rendered — and the render is a *different program* from the
+parse, so the two only agree where someone made them.
+
+So this does not parse. Minified output is **the source's own tokens, in order,
+with the whitespace between them dropped**. There is no float formatter, no
+escape normalizer, no integer path. A number is emitted as the bytes the file
+spelled it with, because those bytes are what is copied.
+
+The property that falls out: for an already-minified file, export is the
+identity function. The 500 MB fixture goes in at 500 000 190 bytes and comes out
+at 500 000 190 bytes, and `leviathan roundtrip` proves token equality across all
+seven fixtures plus idempotence.
+
+Worth noting what this cost: the exporter cannot reformat numbers, cannot sort
+keys, and cannot normalize escapes even when asked. Those are features it does
+not have, and it does not have them *because* of this decision. That is the
+right trade for a tool whose users are handing it production data, and it is
+worth stating rather than discovering.
+
+*Rules out:* parse-then-render for any format claiming fidelity; "we tested the
+converter" as a substitute for not needing one.
+
+### C69 — Token equality is a stronger check than index equality — **revised**
+
+SPEC's exit criterion asked that "the re-imported index is identical to the
+original's for every fixture". Implemented as written, that check would pass for
+an exporter that rewrote every number: the index stores **where things start**
+and what kind they are (C1), and `1.0000000000000002` and `1.0` start at the
+same place and are both numbers.
+
+The index is *derived from* the token stream, so token equality implies index
+equality and is strictly stronger. The check compares tokens.
+
+This is the general form of something worth keeping: when a criterion names an
+artifact to compare, ask what that artifact **discards**. An index that
+deliberately stores almost nothing is a weak thing to compare, and it is weak
+for exactly the reason it is good.
+
+*Rules out:* comparing derived artifacts when the source of the derivation is
+available.
+
+### C70 — A record that will not lex must be copied, not summarized — **validated**
+
+The round-trip run over the corpus turned a 1.0 MB fixture into **608 KB** and
+reported success. The fixture is `badutf8`: structurally valid JSON whose string
+bytes are not valid UTF-8, which is a real thing in real log exports. The lexer
+stops inside the bad string, and the exporter wrote the tokens it had found
+before that point — a record that looks complete, is not, and says nothing.
+
+The fix is to notice that the record did not yield a complete value and copy its
+**bytes** instead. That is both more faithful and the only honest reading of
+"minified is the source's own tokens" when the source has no tokens to give.
+1.0 MB in, 1.0 MB out, and `salvaged()` reports how many records took that path.
+
+Two lessons, and the second is the one that generalizes:
+
+- **Degrading gracefully is not the same as degrading silently.** C6 says a
+  partial result beats refusing, and that is right; it does not license a
+  partial result presented as a whole one.
+- **The checker needed the same honesty.** With both files failing to lex at the
+  same byte, the token comparison ran out of tokens on both sides simultaneously
+  and returned "equal" — a pass that was really "we compared nothing after byte
+  N". It now reports `lexes_fully` and says *ok as far as it lexes* instead.
+  A test that cannot fail is not evidence, and the way this one could not fail
+  was subtle enough to survive a review.
+
+*Rules out:* emitting the parsed prefix of an unparseable record; a comparison
+that treats "both sides stopped" as agreement.
+
+### C71 — The third time for the read bug, and the first time it was cheap — **validated**
+
+Export ran at 41 MB/s: one `read` per record, 1.77 million of them. That is C60
+and C66 for the third time.
+
+It was caught before publishing, and it cost about fifteen minutes, because by
+now the shape is recognizable and the benchmark table puts `export` next to
+`index` where the ratio is visible. A 1 MiB forward window inside `Export`
+itself took it to **64.8 MB/s** — and putting it *inside* `Export` rather than
+in each driver means the CLI and the WASM host both got it, and the next caller
+will too.
+
+The progression is the interesting part: C60 cost a day of confusion, C66 cost
+an hour and was caught by a benchmark, C71 cost fifteen minutes and was caught by
+recognizing the shape. Nothing stopped the mistake from being made a third time.
+What changed is how fast it is found — which is the realistic goal, because the
+per-record loop is what the streaming shape naturally suggests and no amount of
+having written it down prevents writing it again.
+
+*Rules out:* nothing new. It is the same rule as C60, and the entry exists to
+record that the defence that works is a ratio in a table, not a memory.
+
+---
+
 ## Log of revisions
 
 *(Append here as concepts are validated or revised. Format: date — concept id — what changed — the number that changed it.)*
 
+- **2026-08-05 — C1 — validated at the last layer that could have broken it.**
+  Export writes 500 MB while holding 22.1 MB, against 22.2 MB to index the same
+  file. Every stage of this product now runs in the memory of the index alone,
+  which is what C1 traded for and the last place it could still have failed.
+- **2026-08-05 — C6 — sharpened.** "Partial is a result, not a failure" needed
+  the clause it did not have: a partial result must not be presented as a whole
+  one. C70 is the export writing 60 % of a file and reporting success.
+- **2026-08-05 — C16 — the ceilings caught a bug, not just a context.** The
+  benchmark's reference workloads existed to make "300 MB/s" mean something.
+  This is the first time one of them *found* a defect: dedup at 1.7 MB/s next to
+  `walk` at 140 MB/s over the same file is a 80× gap no correctness test could
+  see (C66).
+- **2026-08-05 — C20 — the invariance test earned its keep.** "The answer must
+  not depend on where the window falls" caught the dedup hasher reading only the
+  visible half of a token that straddled a read boundary — at window size 13,
+  and at no other size tried.
 - **2026-08-05 — C59 — verified, not asserted.** "Unsupported constructs are
   named rather than misread" was a design claim with four unit tests behind it.
   The compliance run checks it on **477 cases**, by reading the parser's own

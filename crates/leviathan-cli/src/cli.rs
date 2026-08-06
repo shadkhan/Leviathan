@@ -83,6 +83,20 @@ impl Args {
             .filter(|value| !value.is_empty())
     }
 
+    /// Every value given for `--name`, in the order they appeared.
+    ///
+    /// For flags the usage text calls repeatable. `get` returning only the first
+    /// is what made `--workload a --workload b` silently run just `a`.
+    #[must_use]
+    pub fn all(&self, name: &str) -> Vec<&str> {
+        self.flags
+            .iter()
+            .filter(|(flag, _)| flag == name)
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+
     /// Parse `--name` as a byte size, falling back to `default`.
     ///
     /// # Errors

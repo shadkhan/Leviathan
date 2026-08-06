@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Leviathan MV3 extension shell — UI, worker host, and typed protocol.",
   "scripts": {
-    "build:wasm": "wasm-pack build ../../crates/leviathan-wasm --target web --out-dir ../../packages/extension/src/wasm --out-name leviathan_wasm",
+    "icons": "node scripts/icons.mjs",
+    "build:wasm": "wasm-pack build ../../crates/leviathan-wasm --target web --out-dir ../../packages/extension/src/wasm --out-name leviathan_wasm && node scripts/pack-npm.mjs",
     "build": "pnpm build:wasm && node build.mjs",
     "dev": "pnpm build:wasm && node build.mjs --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p src/worker/tsconfig.json --noEmit",

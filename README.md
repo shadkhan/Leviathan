@@ -10,18 +10,18 @@ No freezing, no upload, no server.
 [![CI](https://github.com/shadkhan/leviathan/actions/workflows/ci.yml/badge.svg)](https://github.com/shadkhan/leviathan/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/core-rust%20%E2%86%92%20wasm-orange.svg)](crates/leviathan-core)
-[![Tests](https://img.shields.io/badge/tests-349%20rust%20%C2%B7%2030%20ui%20%C2%B7%2022%20wasm-green.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-388%20rust%20%C2%B7%2030%20ui%20%C2%B7%2036%20wasm-green.svg)](#testing)
 
 </div>
 
 > [!WARNING]
-> **Status: M5 next.** The engine, the viewer, validation and filtering
-> all run: a 500 MB NDJSON file paints its first rows in **141 ms**, indexes at
-> **140 MB/s** in WASM, scrolls at a median **16.6 ms** per frame with zero long
-> tasks, and answers `@.level == "error"` over 1.77 M records in **8.7 s** while
-> staying interactive throughout. One criterion is not met — 0.7 % of frames
-> exceed 32 ms ([details](#numbers)). Dedup and export are not built.
-> See the [roadmap](#roadmap).
+> **Status: M7 next — every feature is built.** A 500 MB NDJSON file paints its
+> first rows in **141 ms**, indexes at **140 MB/s** in WASM, scrolls at a median
+> **16.6 ms** per frame with zero long tasks, answers `@.level == "error"` over
+> 1.77 M records in **8.7 s**, checks 24.8 M keys for duplicates in **6.5 s**,
+> and writes itself back out in **7.7 s** — all while staying interactive, and
+> all in **22 MB**. One criterion is not met: 0.7 % of frames exceed 32 ms
+> ([details](#numbers)). What remains is publishing. See the [roadmap](#roadmap).
 
 ---
 
@@ -71,8 +71,8 @@ against hundreds of megabytes to store them.
 | 🔍 | **Find** — literal search streamed over the *whole file*, not just what's on screen | M2 |
 | ✅ | **Validate** — byte/line/column-accurate errors, jump to the break, JSON Schema | M3 |
 | 🧭 | **Filter** — `@.status == "error" && @.latency_ms > 1000`, evaluated against the index, results streamed | M4 |
-| 🧬 | **Dedup** — duplicate keys and elements, reported with both locations | M5 |
-| 📤 | **Export** — JSON, NDJSON, CSV, or the current query result — streamed to disk | M6 |
+| 🧬 | **Dedup** — duplicate keys and elements, reported with **both** locations | M5 |
+| 📤 | **Export** — JSON, NDJSON, CSV, or the current filter result — streamed to disk, byte-faithful | M6 |
 
 Everything rides one engine. Nothing needs a server, an account, or a network.
 
@@ -189,6 +189,11 @@ than by convention:
 | JSON Schema, 50 MB / 177,906 records (WASM) | < 5 s | ✗ crashes | **2.78 s** ✅ |
 | Filter, 500 MB / 1.77 M records (WASM) | — | ✗ crashes | **8.7 s** (55–57 MB/s, ~200 k records/s) |
 | Longest filter step | < 500 ms | ✗ crashes | **52 ms** ✅ |
+| Duplicate keys, 500 MB / 24.8 M keys | — | ✗ crashes | **6.5 s** (77 MB/s) |
+| Element dedup, marginal cost | < 20 % | ✗ crashes | **+1.5 %** ✅ |
+| Element dedup, marginal memory | < 64 MB | ✗ crashes | **+34.6 MB** ✅ |
+| Export 500 MB to NDJSON | — | ✗ crashes | **7.7 s** (65 MB/s) |
+| Export peak memory, over index | < 64 MB | ✗ crashes | **+0 MB** ✅ (22.1 vs 22.2 MB) |
 | Lex throughput | ≥ 200 MB/s | — | **248–327 MB/s** ✅ |
 | Parse + validate | — | ✗ crashes | 216 MB/s |
 | First rows painted (browser) | < 2 s | ✗ never | **124–143 ms** ✅ |
@@ -227,6 +232,15 @@ than by convention:
 > bought nothing (C54): there the cost scaled with bytes, here with calls, and
 > the two look identical from the source ([C60, C61](DEEP_REASONING.md)).
 >
+> **The duplicate check got 30× faster before it was published, twice for the
+> same reason.** It first read a fresh 256 KB window and then consumed only the
+> ~165 bytes up to the first newline — 78 GB of reading for a 50 MB file, at
+> 1.7 MB/s. Consuming every record in the window took it to 2.7 s; hashing
+> tokens in place instead of copying each into a `Vec` took it to 0.99 s. That is
+> the same mistake as the filter's (C60), in a second place, and no test could
+> see either: every answer was already correct
+> ([C66](DEEP_REASONING.md)).
+>
 > **Opening a file is six times cheaper than parsing it.** NDJSON indexing scans
 > for newlines and never parses — exact, not heuristic, because JSON forbids raw
 > control characters in strings. It runs at 1.4 GB/s against a 1.2 GB/s
@@ -243,6 +257,7 @@ than by convention:
 |---|---|
 | [JSONTestSuite](https://github.com/nst/JSONTestSuite) (RFC 8259) | **95/95** must-accept · **185/188** must-reject — [3 documented deviations](docs/adr/ADR-001-parser-strategy.md) |
 | [JSONPath CTS](https://github.com/jsonpath-standard/jsonpath-compliance-test-suite) (RFC 9535) | **133/133** in scope · **93/93** invalid selectors refused — [support table below](#what-the-filter-supports) |
+| Export round trip (requirement 11) | **7/7** fixtures token-exact and idempotent — `leviathan roundtrip` |
 | Fuzzing | **1,969,106,501 cases** in 30 min — 0 panics, 0 chunk-size disagreements |
 | Determinism | The same fixture always yields 108,133,846 tokens and 1,772,686 records, at every chunk size |
 
@@ -354,9 +369,9 @@ CLI, and (v2) an MCP server.
 | **M2** | Virtual tree, navigation, find + filter, trust indicators | ✅ scope complete · measured, with 1 published miss |
 | **M3** | Validation: byte-accurate errors, jump-to-position, JSON Schema | ✅ measured — 50 MB schema-checked in 2.78 s |
 | **M4** | Query: JSONPath filters over the index | ✅ measured · 133/133 in-scope CTS cases, 93/93 invalid refused |
-| **M5** | Dedup: duplicate keys and elements | ⬜ |
-| **M6** | Export: JSON / NDJSON / CSV, streamed | ⬜ |
-| **M7** | Publish: crates.io + npm + Chrome Web Store | ⬜ |
+| **M5** | Dedup: duplicate keys and elements | ✅ measured — 24.8 M keys checked in 6.5 s |
+| **M6** | Export: JSON / NDJSON / CSV, streamed | ✅ measured — 500 MB out in 7.7 s, round trip token-exact |
+| **M7** | Publish: crates.io + npm + Chrome Web Store | 🔷 packaged and verified · awaiting the demo recording and the publish itself |
 
 v1 stops there. **Not in v1:** cloud sync, accounts, telemetry, JSON-LD/SEO
 checking, an AI-agent surface, or editing.
@@ -365,11 +380,17 @@ checking, an AI-agent surface, or editing.
 
 Your data never leaves your machine, and you needn't take that on faith:
 
-- The manifest requests **zero permissions** and **zero host permissions**
-- The `.wasm` is bundled — MV3 forbids remote code, and nothing is fetched
-- No analytics, no telemetry, no network code of any kind
+- The manifest requests **zero permissions** and **zero host permissions**. A
+  Chrome extension cannot make a cross-origin request without one, and Chrome
+  enforces that — not us.
+- No analytics, no telemetry, no accounts, no storage.
+- **One** network request, ever: the Worker loads the bundled
+  `leviathan_wasm_bg.wasm` from `chrome-extension://` at startup, before your
+  file is touched. Open DevTools' Network tab and you will see it, and nothing
+  after it.
 
-Unzip the extension and check.
+Unzip the extension and check — [`PRIVACY.md`](PRIVACY.md) says how, in about a
+minute.
 
 ## Design documents
 
@@ -382,6 +403,10 @@ This repository is written to be read — the reasoning is checked in, not impli
 | [`DEEP_REASONING.md`](DEEP_REASONING.md) | Every core concept, dated — what it rules out, how it was validated |
 | [`docs/adr/`](docs/adr/) | One architectural decision each, with the rejected alternatives and what it cost |
 | [`USER_MANUAL.md`](USER_MANUAL.md) | Installing, using, testing |
+| [`CHANGELOG.md`](CHANGELOG.md) | What shipped, and the known limitations of it |
+| [`PRIVACY.md`](PRIVACY.md) | The policy, and how to verify it yourself |
+| [`docs/RELEASE.md`](docs/RELEASE.md) | The publishing runbook, and what is irreversible |
+| [`docs/store-listing.md`](docs/store-listing.md) | Store copy, reviewed here rather than typed into a form |
 
 ## License
 

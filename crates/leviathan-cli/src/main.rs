@@ -23,6 +23,7 @@ mod file_source;
 mod fixtures;
 mod fuzz;
 mod json;
+mod roundtrip;
 mod sys;
 
 use std::io::Read;
@@ -47,6 +48,7 @@ COMMANDS:
     bench [FILE...]         Benchmark against fixtures
     conformance [DIR]       Run a JSONTestSuite corpus (RFC 8259; default: fixtures/generated/JSONTestSuite)
     cts [FILE]              Run the JSONPath compliance suite (RFC 9535; default: fixtures/generated/cts.json)
+    roundtrip [FILE...]     Export each fixture and prove nothing changed (requirement 11)
     fuzz                    Fuzz the lexer and grammar walk for panics and disagreements
     help                    Print this message
 
@@ -63,7 +65,7 @@ FIXTURES OPTIONS:
     --count <N>             Element count, for `wide`. Default 5000000
 
 BENCH OPTIONS:
-    --workload <NAME>       One of read, scan, sniff, lex. Repeatable. Default: all
+    --workload <NAME>       Restrict to one workload. Repeatable. Default: all
     --chunk <SIZE>          Read chunk size. Default 1MiB
     --json                  Machine-readable output, for CI regression tracking
 
@@ -116,6 +118,7 @@ fn run(command: &str, rest: &[String]) -> Result<String, String> {
         "bench" => bench_command(rest),
         "conformance" => conformance_command(rest),
         "cts" => cts_command(rest),
+        "roundtrip" => roundtrip_command(rest),
         "fuzz" => fuzz_command(rest),
         "help" | "--help" | "-h" => Ok(USAGE.to_string()),
         other => Err(format!("unknown command: {other}\n\n{USAGE}")),
@@ -177,6 +180,45 @@ fn cts_command(rest: &[String]) -> Result<String, String> {
         Err(format!(
             "{report}
 RFC 9535 conformance failed"
+        ))
+    }
+}
+
+/// Export each fixture, re-import it, and prove nothing changed.
+///
+/// Fails on a token that did not survive, or on an export that is not a fixed
+/// point. This is requirement 11 as a gate rather than as a sentence.
+fn roundtrip_command(rest: &[String]) -> Result<String, String> {
+    let args = Args::parse(rest)?;
+    args.reject_unknown(&["out"])?;
+
+    let paths = args.positionals_from(0);
+    if paths.is_empty() {
+        return Err("roundtrip requires at least one fixture
+
+             generate one first:
+                 leviathan fixtures ndjson --size 50MB"
+            .to_string());
+    }
+
+    let scratch = PathBuf::from(
+        args.get("out")
+            .unwrap_or("fixtures/generated/roundtrip.tmp"),
+    );
+
+    let mut trips = Vec::new();
+    for path in paths {
+        trips.push(roundtrip::run(Path::new(path), &scratch).map_err(|e| format!("{path}: {e}"))?);
+    }
+    let _ = std::fs::remove_file(&scratch);
+
+    let report = roundtrip::report(&trips);
+    if trips.iter().all(roundtrip::Trip::passed) {
+        Ok(report)
+    } else {
+        Err(format!(
+            "{report}
+round trip failed"
         ))
     }
 }
@@ -268,20 +310,25 @@ fn bench_command(rest: &[String]) -> Result<String, String> {
             .to_string());
     }
 
-    let workloads: Vec<&'static str> = match args.get("workload") {
-        Some(name) => {
-            let known = bench::WORKLOADS
-                .iter()
-                .find(|w| **w == name)
-                .ok_or_else(|| {
-                    format!(
-                        "unknown workload: {name} (known: {})",
-                        bench::WORKLOADS.join(", ")
-                    )
-                })?;
-            vec![*known]
-        }
-        None => bench::WORKLOADS.to_vec(),
+    let named = args.all("workload");
+    let workloads: Vec<&'static str> = if named.is_empty() {
+        bench::WORKLOADS.to_vec()
+    } else {
+        named
+            .iter()
+            .map(|name| {
+                bench::WORKLOADS
+                    .iter()
+                    .find(|w| *w == name)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "unknown workload: {name} (known: {})",
+                            bench::WORKLOADS.join(", ")
+                        )
+                    })
+            })
+            .collect::<Result<_, _>>()?
     };
 
     let chunk = usize::try_from(args.size("chunk", bench::DEFAULT_CHUNK as u64)?)

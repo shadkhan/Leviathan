@@ -30,6 +30,13 @@
 //! - `find` — scan the whole file for a literal string that is deliberately
 //!   *absent*, so every byte is read. A needle that hit early would measure how
 //!   fast the scan can stop, which is a property of the fixture.
+//! - `dupkeys` / `dupvalues` — duplicate detection. The first checks object keys
+//!   only; the second adds element hashing, which is the expensive half and the
+//!   one SPEC M5 puts a 20 % budget on. Run them next to `index` to read that
+//!   budget directly.
+//! - `export` — convert every record to NDJSON and throw the bytes away. The
+//!   throwing away is the point: it measures the converter, not the disk, and
+//!   its peak RSS answers SPEC M6's memory criterion directly.
 //! - `filter` — evaluate a two-condition filter expression against every record,
 //!   in the same windowed shape the Worker uses. Reports matched *and* tested,
 //!   so a pass that skipped records cannot be read as a whole-file rate.
@@ -138,8 +145,20 @@ impl Run {
 /// and reading them top to bottom says what fraction of the possible the engine
 /// achieved. A bare MB/s says nothing; "62 % of memory bandwidth" says whether
 /// there is headroom left worth chasing.
-pub const WORKLOADS: [&str; 10] = [
-    "read", "scan", "sniff", "lex", "walk", "index", "rows", "expand", "find", "filter",
+pub const WORKLOADS: [&str; 13] = [
+    "read",
+    "scan",
+    "sniff",
+    "lex",
+    "walk",
+    "index",
+    "rows",
+    "expand",
+    "find",
+    "filter",
+    "dupkeys",
+    "dupvalues",
+    "export",
 ];
 
 /// Run every workload in `workloads` against `path`.
@@ -175,6 +194,9 @@ pub fn run_file(path: &Path, workloads: &[&'static str], chunk: usize) -> io::Re
             "expand" => expand(&name, path)?,
             "find" => find(&name, path, chunk)?,
             "filter" => filter(&name, path, chunk)?,
+            "dupkeys" => dedup(&name, "dupkeys", path, chunk, false)?,
+            "dupvalues" => dedup(&name, "dupvalues", path, chunk, true)?,
+            "export" => export(&name, path, chunk)?,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -477,7 +499,7 @@ const SLICE: usize = 50;
 /// Building the index is not timed: the criterion is about scrolling, and by the
 /// time a user scrolls, the index exists.
 fn rows(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
-    let table = build_table(path, chunk)?;
+    let table = build_table_of(path, chunk)?;
     let mut source = crate::file_source::FileSource::open(path)?;
     let options = leviathan_core::RowOptions::default();
 
@@ -674,7 +696,7 @@ fn find(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
 fn filter(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
     use leviathan_core::ByteRange as _;
 
-    let table = build_table(path, chunk)?;
+    let table = build_table_of(path, chunk)?;
     let mut source = crate::file_source::FileSource::open(path)?;
 
     let expression = leviathan_core::Filter::parse(FILTER)
@@ -760,6 +782,136 @@ fn filter(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
     })
 }
 
+/// Convert every record to NDJSON, discarding the output.
+///
+/// Discarding is deliberate. Writing 500 MB would put the disk in the number and
+/// the criterion this answers is about *memory*: peak RSS here is the export
+/// path's own footprint, with no writer buffering to hide behind. What a real
+/// export adds on top is one `FileSystemWritableFileStream`, which is the
+/// browser's memory and not this crate's.
+fn export(name: &str, path: &Path, chunk: usize) -> io::Result<Run> {
+    let format = leviathan_core::sniff_format(&read_prefix_of(path)?);
+    let table = build_table_of(path, chunk)?;
+    let mut source = crate::file_source::FileSource::open(path)?;
+    let total = path.metadata()?.len();
+
+    let whole = format == leviathan_core::Format::SingleDocument
+        && read_prefix_of(path)?
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .copied()
+            != Some(b'[');
+
+    let mut writer = leviathan_core::Export::new(leviathan_core::ExportFormat::Ndjson);
+    let mut bytes_out = 0u64;
+    let mut checksum = 0u64;
+
+    let began = Instant::now();
+    bytes_out += writer.open().len() as u64;
+
+    let count = if whole { 1 } else { table.len() };
+    for row in 0..count {
+        let (start, end) = if whole {
+            (0, total)
+        } else {
+            match table.child(row) {
+                Some(start) => (start, table.child(row + 1).unwrap_or(total)),
+                None => continue,
+            }
+        };
+        let chunk = writer
+            .push(&mut source, start, end)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        // Touched, not stored: a loop whose result is unused is a loop the
+        // optimizer may delete, and then the number measures nothing.
+        checksum = checksum.wrapping_add(chunk.len() as u64);
+        bytes_out += chunk.len() as u64;
+    }
+    bytes_out += writer.close().len() as u64;
+    let wall = began.elapsed();
+
+    let records = writer.written();
+    let salvaged = writer.salvaged();
+    Ok(Run {
+        fixture: name.to_string(),
+        workload: "export",
+        bytes: total,
+        metric: Metric::Throughput,
+        wall,
+        reps: 1,
+        peak_rss: sys::peak_rss(),
+        observed: format!(
+            "{records} record(s), {} out{}, checksum {checksum}",
+            human_bytes(bytes_out),
+            if salvaged > 0 {
+                format!(", {salvaged} copied verbatim")
+            } else {
+                String::new()
+            }
+        ),
+    })
+}
+
+/// Walk the file looking for repeats — what the dedup report is built on.
+///
+/// Reported next to `index` deliberately: SPEC M5's budget is stated as a
+/// percentage of index time, so the two numbers are only meaningful together.
+fn dedup(
+    name: &str,
+    workload: &'static str,
+    path: &Path,
+    chunk: usize,
+    elements: bool,
+) -> io::Result<Run> {
+    let mut source = crate::file_source::FileSource::open(path)?;
+    let format = leviathan_core::sniff_format(&read_prefix_of(path)?);
+
+    let options = leviathan_core::DedupOptions {
+        window: u32::try_from(chunk.max(64)).unwrap_or(u32::MAX),
+        budget: 8 * 1024 * 1024,
+        // The product's own limit, not `usize::MAX`. Counting every repeat is
+        // free; *proving* one costs two reads, and a fixture with two million
+        // duplicate keys would spend the whole benchmark verifying them. The
+        // walk still covers the file — `total` is exact — so this caps the
+        // report, not the pass (unlike C23, where a cap really did end one).
+        limit: 1_000,
+        keys: true,
+        elements,
+        max_members: usize::MAX,
+    };
+
+    let mut pass = leviathan_core::Dedup::new(format);
+    let began = Instant::now();
+    while !pass.is_done() {
+        pass.advance(&mut source, &options)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
+    let wall = began.elapsed();
+
+    let found = pass.total();
+    let keys = pass.keys_checked();
+    let values = pass.elements_checked();
+    Ok(Run {
+        fixture: name.to_string(),
+        workload,
+        bytes: pass.walked(),
+        metric: Metric::Throughput,
+        wall,
+        reps: 1,
+        peak_rss: sys::peak_rss(),
+        observed: format!("{found} duplicate(s), {keys} key(s), {values} element(s)"),
+    })
+}
+
+/// The first 64 KiB, for format detection.
+fn read_prefix_of(path: &Path) -> io::Result<Vec<u8>> {
+    const PREFIX: usize = 64 * 1024;
+    let mut file = File::open(path)?;
+    let mut buf = Vec::with_capacity(PREFIX);
+    file.by_ref().take(PREFIX as u64).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 /// The offset of the first non-whitespace byte — where the root value begins.
 fn first_value_offset(path: &Path) -> io::Result<u64> {
     const PREFIX: usize = 64 * 1024;
@@ -776,7 +928,7 @@ fn first_value_offset(path: &Path) -> io::Result<u64> {
 }
 
 /// Build whichever tier-1 table this file supports, for workloads that need one.
-fn build_table(path: &Path, chunk: usize) -> io::Result<leviathan_core::ChildTable> {
+pub fn build_table_of(path: &Path, chunk: usize) -> io::Result<leviathan_core::ChildTable> {
     let format = sniff_prefix(path)?;
     let mut file = File::open(path)?;
     let mut buf = vec![0u8; chunk];

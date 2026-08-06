@@ -69,7 +69,9 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod build;
+mod dedup;
 mod expand;
+mod export;
 mod find;
 mod format;
 mod index;
@@ -82,7 +84,9 @@ mod structure;
 mod validate;
 
 pub use build::{Build, BuildOptions, Built};
+pub use dedup::{Dedup, DedupOptions, Duplicate, DuplicateKind};
 pub use expand::{DEFAULT_EXPANSION_BUDGET, ExpandOptions, Expansion, ExpansionCache, Stopped};
+pub use export::{Export, ExportFormat};
 pub use find::{Find, FindOptions, FindStop, rows_of};
 pub use format::{Format, sniff_format};
 pub use index::{ChildTable, RecordScanner, RootCollector, Tier1};

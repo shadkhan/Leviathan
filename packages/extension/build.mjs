@@ -69,6 +69,43 @@ async function copyAssets() {
         'the WASM package is generated, not committed.',
     );
   });
+
+  await checkManifestAssets();
+}
+
+/**
+ * Every file the manifest names must actually be in `dist`.
+ *
+ * `public/` is copied wholesale, so a missing icon produces a package that
+ * builds cleanly, installs, and shows a blank square — and the store rejects it
+ * days later. The manifest is the only place that knows which files are load
+ * bearing, so it is the thing to check against.
+ */
+async function checkManifestAssets() {
+  const manifest = JSON.parse(await readFile(join(dist, 'manifest.json'), 'utf8'));
+
+  const declared = new Set(
+    [
+      manifest.background?.service_worker,
+      ...Object.values(manifest.icons ?? {}),
+      ...Object.values(manifest.action?.default_icon ?? {}),
+    ].filter(Boolean),
+  );
+
+  const missing = [];
+  for (const file of declared) {
+    try {
+      await readFile(join(dist, file));
+    } catch {
+      missing.push(file);
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `manifest.json names ${missing.length} file(s) that are not in dist: ` +
+        `${missing.join(', ')}. Icons are generated — run \`pnpm icons\`.`,
+    );
+  }
 }
 
 /** Report gzipped sizes and fail the build if the JS/CSS budget is blown. */

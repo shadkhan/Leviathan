@@ -273,10 +273,22 @@ Scope:
 
 Scope:
 - Duplicate keys within an object (the silent JSON footgun — most parsers keep the last one). Reported with both locations.
-- Duplicate elements within an array, by structural hash of the canonical form, computed during indexing so it costs one pass.
+- Duplicate elements within an array, by structural hash of the canonical form, in **one pass of its own** — folding it into indexing was the plan and is not possible, because NDJSON indexing never parses a record (see the criterion note below).
 - Report panel with counts, locations, click-to-navigate; hashing behind a feature flag so the cost is opt-in on huge files.
 
-**Exit criterion:** duplicate-key-heavy fixture reports 100 % of duplicates with correct locations; enabling element dedup on the 500 MB fixture adds **< 20 %** to index time and < 64 MB to memory.
+**Exit criterion:** duplicate-key-heavy fixture reports 100 % of duplicates with correct locations; enabling element dedup on the 500 MB fixture adds **< 20 %** to the duplicate pass and **< 64 MB** to memory.
+
+> **Revised on evidence (C65).** The second clause read "adds < 20 % to *index*
+> time", which assumed dedup could be folded into indexing — "computed during
+> indexing so it costs one pass", as the scope line above still says. It cannot,
+> and the reason is the product's own best result: NDJSON tier-1 indexing is a
+> newline scan at 1.3 GB/s that never parses a record. Structural hashing
+> requires parsing every record. Measured, dedup is 6.5 s against indexing's
+> 0.38 s — **+1 620 %**, and no implementation makes that number small.
+>
+> What the clause was actually protecting is the opt-in flag: element hashing is
+> the expensive half and must not be forced on everyone. So it is now stated
+> against the pass it is optional within. Measured: **+1.5 %** and **+34.6 MB**.
 
 ---
 
@@ -289,6 +301,18 @@ Scope:
 - **Round-trip fidelity** (requirement 11): what comes out re-parses to the same thing. Verified as a test, not asserted in a README.
 
 **Exit criterion:** export a 500 MB document to NDJSON with peak memory unchanged from idle +64 MB; round-trip (export → re-import → index) is byte-stable for the minified case, and the re-imported index is identical to the original's for every fixture in the corpus.
+
+> **Met, and the second clause is checked more strictly than it asks.** Peak
+> memory exporting 500 MB is **22.1 MB** against **22.2 MB** to index the same
+> file — the export adds nothing measurable, because the index is the memory and
+> the converter holds one 1 MiB window. Round trip is byte-stable and idempotent
+> on all seven fixtures.
+>
+> "The re-imported index is identical" is checked as **token equality** instead,
+> which is strictly stronger: the index is derived from the token stream, so two
+> files with the same tokens have the same index, while two files with the same
+> index can still differ in the values the index does not store — which is
+> exactly where a float round-trip would hide ([C68](DEEP_REASONING.md)).
 
 ---
 
@@ -304,6 +328,8 @@ Scope:
   - Semver from 0.1.0; CHANGELOG from day one.
 - **Ship:** Chrome Web Store, then the identical package to Edge Add-ons the same day.
 - Store assets, privacy policy ("no data leaves your machine" — trivially true, and verifiable because the manifest requests no host permissions).
+
+**Packaging status (2026-08-06).** Everything mechanical is done and verified: licence texts travel with all three crates, `cargo publish --dry-run` passes and `cargo doc` is warning-free, `examples/browse.rs` and `examples/extract.rs` run against real fixtures, the npm package is generated with its real name and an `exports` map (`npm pack --dry-run`: 8 files, 107.5 kB), extension icons are generated from a checked-in 16×16 source and the build now fails if the manifest names a file that is not in `dist`. `CHANGELOG.md`, `PRIVACY.md`, `docs/RELEASE.md` and `docs/store-listing.md` are written. What remains is not code: recording the demo, and pressing publish.
 
 **Exit criterion:** the definition of done, executed as a scripted demo start to finish without a stumble — *drag a 500 MB JSON/NDJSON file in, the tree appears and stays interactive, find a record by typing part of it, run a JSONPath query, see duplicate-key warnings, export the result as CSV; all client-side, no freeze, no upload, with the memory readout visibly steady throughout.* Plus: `cargo install leviathan-cli` and `npm i @shadkhan/leviathan-core` both work from a clean machine; extension live on both stores.
 
