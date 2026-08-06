@@ -57,6 +57,8 @@ use crate::structure::{ContainerKind, Event};
 pub struct ChildTable {
     kind: Option<ContainerKind>,
     offsets: Vec<u64>,
+    /// Set when a push could not be allocated. See [`ChildTable::exhausted`].
+    exhausted: bool,
 }
 
 impl ChildTable {
@@ -69,6 +71,7 @@ impl ChildTable {
         Self {
             kind,
             offsets: Vec::new(),
+            exhausted: false,
         }
     }
 
@@ -145,8 +148,38 @@ impl ChildTable {
         self.offsets.capacity() * size_of::<u64>()
     }
 
+    /// Whether the table ran out of memory and stopped accepting children.
+    ///
+    /// The index is 8 bytes per child, which is 2.8 % of a record-shaped file
+    /// and ~81 % of a flat array of small scalars (C29). On wasm32 the second
+    /// shape can exhaust the address space: a 1 GB array of numbers needs
+    /// 800 MB of table, and a 2.5 GB one cannot be held at all.
+    ///
+    /// When that happens the children found *so far* are still real children,
+    /// exactly as for a malformed document (C6) — so this is a stopping
+    /// condition to report, not a failure to propagate. Everything already in
+    /// the table stays browsable.
+    #[must_use]
+    pub const fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
     /// Append a child offset. Callers must supply them in document order.
+    ///
+    /// Uses `try_reserve` rather than `push`, because the alternative is not a
+    /// Rust panic that something could catch — the release profile is
+    /// `panic = "abort"`, so an allocation failure becomes a raw wasm
+    /// `unreachable` trap. That surfaces in JavaScript as
+    /// `RuntimeError: unreachable`, which tells the user nothing and leaves the
+    /// module in a state nothing should keep calling into.
     fn push(&mut self, offset: u64) {
+        if self.exhausted {
+            return;
+        }
+        if self.offsets.len() == self.offsets.capacity() && self.offsets.try_reserve(1).is_err() {
+            self.exhausted = true;
+            return;
+        }
         self.offsets.push(offset);
     }
 

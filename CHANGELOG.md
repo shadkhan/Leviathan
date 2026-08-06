@@ -50,7 +50,12 @@ list rather than as a diff.
 ### Extension
 
 - Virtualized tree over files far larger than memory; first rows painted in
-  141 ms on a 500 MB file.
+  141 ms on a 500 MB file, and ~23 ms into the first batch at any size.
+- **Out-of-memory is a stopping condition, not a crash.** A file whose *shape*
+  needs more index than a 32-bit engine can hold stops part-way, says "index too
+  large", and keeps every record it found — browsable, searchable, exportable.
+  The viewer also projects the index size from measured bytes-per-node once 2 %
+  of the file is read, and warns before the wait rather than after it.
 - Drag-and-drop, file picker, folder and paste. JSON and NDJSON auto-detected.
 - Find bar that doubles as a filter bar: text searches the file, an expression
   beginning with `@` filters records.
@@ -71,15 +76,30 @@ list rather than as a diff.
 - **Fuzzing**: 1.97 billion cases, no panics, no chunk-size disagreements.
 - **Round trip**: seven fixtures, token-exact and idempotent.
 
+### How large is large
+
+Measured against the shipped `.wasm`, not extrapolated:
+
+| File | Records | Index | Peak WASM | Indexed in |
+|---:|---:|---:|---:|---:|
+| 500 MB | 1.8 M | 14.2 MB | 22 MB | 1.1 s |
+| 2 GB | 7.1 M | 56.6 MB | 136 MB | 4.4 s |
+| 8 GB | 28.2 M | 226 MB | 539 MB | 17.8 s |
+
+First rows paint ~23 ms into the first batch at every size.
+
 ### Known limitations
 
 - One published benchmark miss: 0.7 % of frames exceed 32 ms while scrolling
   100 000 rows (median 16.6 ms, p95 16.9 ms, zero long tasks).
-- The index is 8 bytes per node, which is 2.8 % of a record-shaped file and
-  about 80 % of a flat array of small scalars. Two mitigations are identified in
-  ADR-004; neither is built.
-- The size claim is **500 MB**, because that is the largest fixture measured.
-  A 2 GB file is plausible and unproven, and the README does not extrapolate.
+- **Cost follows shape, not size.** The index is 8 bytes per node whatever the
+  node is: 2.8 % of a record-shaped file, ~81 % of a flat array of small
+  scalars. A 1 GB array of bare numbers needs 2.15 GB of WASM memory, and a
+  2.5 GB one does not fit in a 32-bit address space at all — indexing stops
+  part-way, says so, and keeps every record it found. Two mitigations are
+  identified in ADR-004; neither is built.
+- The size claim is **8 GB**, because that is the largest fixture measured.
+  Larger is plausible and unproven, and this project does not extrapolate.
 - CSV export flattens objects by dotted path and renders arrays as one cell.
   That is lossy, and the rule is documented rather than clever.
 - Filter is a subset of RFC 9535, not RFC 9535. The support table says how much.

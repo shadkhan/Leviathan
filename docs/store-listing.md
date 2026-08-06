@@ -19,7 +19,7 @@ Leviathan — large JSON viewer
 ## Short description (132 characters max)
 
 ```
-Open multi-gigabyte JSON and NDJSON without freezing your browser. Streams and indexes locally. No upload, no permissions.
+Open multi-gigabyte JSON and NDJSON without freezing your browser. Tested to 8 GB. Streams locally: no upload, no permissions.
 ```
 
 *(122 characters.)*
@@ -41,12 +41,13 @@ A Rust engine compiled to WebAssembly streams the file in a Web Worker and recor
 
 MEASURED, NOT CLAIMED
 
-• 500 MB NDJSON: first rows painted in 141 ms
-• Indexed in 3.6–6.8 seconds, at 22 MB of memory
+• 8 GB NDJSON: 28.2 million records indexed in 17.8 seconds, using 539 MB
+• Fifty rows from record 28,239,470: 2.5 milliseconds
+• 500 MB: first rows painted in 141 ms, indexed in 3.6-6.8 seconds, 22 MB of memory
 • Scrolling 100,000 rows: median 16.6 ms per frame, zero long tasks
 • A filter across 1.77 million records: 8.7 seconds, interactive throughout
 
-The full benchmark table, including the one criterion that is missed, is in the README.
+Every figure comes from running the shipped engine against a generated fixture. The full table, including the one criterion that is missed and the file shape that does not fit, is in the README.
 
 WHAT IT DOES
 

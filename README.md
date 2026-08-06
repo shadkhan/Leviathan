@@ -15,13 +15,15 @@ No freezing, no upload, no server.
 </div>
 
 > [!WARNING]
-> **Status: M7 next — every feature is built.** A 500 MB NDJSON file paints its
-> first rows in **141 ms**, indexes at **140 MB/s** in WASM, scrolls at a median
-> **16.6 ms** per frame with zero long tasks, answers `@.level == "error"` over
-> 1.77 M records in **8.7 s**, checks 24.8 M keys for duplicates in **6.5 s**,
-> and writes itself back out in **7.7 s** — all while staying interactive, and
-> all in **22 MB**. One criterion is not met: 0.7 % of frames exceed 32 ms
-> ([details](#numbers)). What remains is publishing. See the [roadmap](#roadmap).
+> **Status: M7 next — every feature is built.** An **8 GB** NDJSON file indexes
+> in **17.8 s** inside **539 MB**, and paints fifty rows from record 28,239,470
+> in 2.5 ms ([how big is "large"?](#how-big-is-large)). On the 500 MB benchmark
+> fixture: first rows in **141 ms**, a median **16.6 ms** frame with zero long
+> tasks, `@.level == "error"` over 1.77 M records in **8.7 s**, 24.8 M keys
+> checked for duplicates in **6.5 s**, and the whole file written back out in
+> **7.7 s** — all in **22 MB**. One criterion is not met: 0.7 % of frames exceed
+> 32 ms ([details](#numbers)). What remains is publishing.
+> See the [roadmap](#roadmap).
 
 ---
 
@@ -88,7 +90,7 @@ Large JSON is a specialist problem. These are the people who hit it.
 | Persona | The moment they reach for it | What carries the load |
 |---|---|---|
 | 👩‍💻 **Priya** — Backend / API | A 300 MB API dump with one malformed record among 200,000 | Tree + find + JSONPath, without dropping to `jq` |
-| 🛠️ **Rahul** — Data / ETL | 500 MB–2 GB NDJSON out of Kafka or BigQuery, before a load job | NDJSON auto-detection, validation, dedup |
+| 🛠️ **Rahul** — Data / ETL | 500 MB–2 GB NDJSON out of Kafka or BigQuery, before a load job | NDJSON auto-detection, validation, dedup — his whole range is [measured](#how-big-is-large), with 4× of headroom above it |
 | 🔬 **Sofia** — QA / Test | A pile of captured responses and one JSON Schema | "Does it conform, and *exactly* where does it break" |
 | 🚨 **Marcus** — Platform / SRE | Mid-incident, inside a depth-20 Terraform or k8s state file | Fast deep navigation and subtree export |
 | 🧩 **Aisha** — Integration dev | An unfamiliar third-party payload, learning its shape from a sample | Shape inference — *v1.5, not v1* |
@@ -172,6 +174,53 @@ than by convention:
 | Parsing never happens on the main thread | The Worker compiles with `lib: WebWorker` — the UI has no parser to call |
 | The core stays portable and publishable | [`check-layering.sh`](scripts/check-layering.sh) fails CI on any wasm/IO dependency |
 | The bundle stays small | [`build.mjs`](packages/extension/build.mjs) fails the build above 150 KB gz |
+
+## How big is "large"?
+
+**Measured to 8 GB.** Not extrapolated — the numbers below come from running the
+shipped `.wasm` against generated fixtures of each size, and the row that fails
+is in the table too.
+
+| File | Records | Index | Peak WASM memory | Indexed in | 50 rows from the far end |
+|---:|---:|---:|---:|---:|---:|
+| 500 MB | 1.8 M | 14.2 MB · 2.8 % | 22 MB | 1.1 s | 68 µs |
+| **2 GB** | **7.1 M** | **56.6 MB · 2.8 %** | **136 MB** | **4.4 s** | **2.1 ms** |
+| **8 GB** | **28.2 M** | **226 MB · 2.8 %** | **539 MB** | **17.8 s** | **2.5 ms** |
+
+First rows paint **~23 ms** into the first batch at every size — you are
+browsing while the rest indexes. Filtering all 28 M records of the 8 GB file
+takes 160 s at 50 MB/s, and the longest single step is 171 ms, so the UI never
+stops answering.
+
+<details>
+<summary><b>Where it actually stops, and why it is about shape rather than size</b></summary>
+
+The index is 8 bytes per node whatever that node is. A log record is ~280 bytes
+and costs 8 to index — **2.8 %**. A bare number is ~10 bytes and costs the same
+8 — **81 %**. So cost tracks how many *values* a file holds, not how many bytes.
+
+| Shape | File | Index | Peak WASM | Result |
+|---|---:|---:|---:|---|
+| Records (NDJSON) | 8 GB | 226 MB | 539 MB | ✅ complete |
+| Flat array of numbers | 1 GB | 800 MB | 2.15 GB | ✅ complete, near the limit |
+| Flat array of numbers | 2.5 GB | 1.07 GB | 2.15 GB | ⚠️ **stops at 134 M of 250 M records** |
+
+WebAssembly is 32-bit: 4 GiB of address space, and the table is not the only
+thing in it. The last row is the ceiling, and it is handled rather than hit —
+indexing stops, says *index too large*, and **the 134 million records it did
+find stay fully browsable**: painting fifty rows from record 134,217,668 still
+takes 1.6 ms.
+
+The viewer also warns *before* you wait: once 2 % of the file is indexed it
+projects the total from measured bytes-per-node, and says so if the projection
+will not fit.
+
+This is [ADR-004](docs/adr/ADR-004-index-representation.md)'s known trade,
+measured at its boundary rather than argued about. Two mitigations are
+identified there; neither is built, because no one has yet asked this tool to
+open a two-gigabyte array of bare integers.
+
+</details>
 
 ## Numbers
 

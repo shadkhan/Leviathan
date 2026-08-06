@@ -173,6 +173,7 @@ pub struct Progress {
     rows: u32,
     done: bool,
     malformed: bool,
+    exhausted: bool,
 }
 
 #[wasm_bindgen]
@@ -212,6 +213,18 @@ impl Progress {
     #[must_use]
     pub fn malformed(&self) -> bool {
         self.malformed
+    }
+
+    /// Whether it stopped because the index would not fit in memory.
+    ///
+    /// Distinct from `malformed` and from a read failure, because the three
+    /// send a user to three different places: fix the file, check the disk, or
+    /// accept that this shape does not fit in a 32-bit address space. The rows
+    /// found before the limit are still real rows.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
     }
 }
 
@@ -752,6 +765,7 @@ impl Document {
             rows: clamp_u32(self.build.rows()),
             done: !reason.resumable(),
             malformed: reason == Built::Malformed,
+            exhausted: reason == Built::Exhausted,
         })
     }
 

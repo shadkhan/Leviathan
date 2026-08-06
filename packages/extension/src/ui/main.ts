@@ -21,6 +21,9 @@ import {
   searchModeOf,
   type ExportFormat,
   type FoundEvent,
+  // Aliased: the DOM has a global `ProgressEvent`, and an unqualified reference
+  // silently resolves to that one — which type-checks until it does not.
+  type ProgressEvent as IndexProgress,
   type Format,
   type SearchMode,
   type WorkerEvent,
@@ -150,11 +153,28 @@ const FORMAT_LABEL: Record<Format, string> = {
 };
 
 /** Why indexing stopped early, said the way a user would say it. */
-const STOPPED: Record<"malformed" | "cancelled" | "error", string> = {
+const STOPPED: Record<
+  "malformed" | "cancelled" | "error" | "exhausted",
+  string
+> = {
   malformed: "stopped at a syntax error",
   cancelled: "stopped",
   error: "unreadable",
+  exhausted: "stopped — index too large",
 };
+
+/**
+ * How much index a 32-bit engine can realistically hold, in bytes.
+ *
+ * WebAssembly's address space is 4 GiB and the table is not the only thing in
+ * it; a flat array of numbers was measured needing 800 MB of table and 2.15 GB
+ * of linear memory for a 1 GB file, and failing outright at 2.5 GB. This is the
+ * line at which it is worth saying something before the user has waited.
+ */
+const INDEX_CEILING = 1_400_000_000;
+
+/** Whether the shape warning has already been given for this file. */
+let warnedAboutShape = false;
 
 /**
  * Group a non-negative integer's digits: `1772686` → `1,772,686`.
@@ -1521,6 +1541,42 @@ function runSearch(): void {
   );
 }
 
+/**
+ * Say something early if this file's *shape* will not fit.
+ *
+ * The index is 8 bytes per node whatever the node is, so cost is driven by how
+ * many values a file has rather than how big it is: a record-shaped 8 GB NDJSON
+ * needs 226 MB, and a 1 GB flat array of numbers needs 800 MB. The second shape
+ * runs out of address space, and it does so *late* — after minutes of work that
+ * is about to be thrown away.
+ *
+ * The projection uses only measured bytes: index-so-far divided by
+ * bytes-consumed-so-far, multiplied out to the whole file. It waits for 2 % of
+ * the file so the ratio has settled, and it is said once.
+ */
+function warnIfShapeIsExpensive(event: IndexProgress): void {
+  if (warnedAboutShape || event.total === 0 || event.consumed === 0) {
+    return;
+  }
+  const seen = event.consumed / event.total;
+  if (seen < 0.02) {
+    return;
+  }
+
+  const projected = (event.usage.index / event.consumed) * event.total;
+  if (projected < INDEX_CEILING) {
+    return;
+  }
+
+  warnedAboutShape = true;
+  say(
+    "err",
+    `this file needs about ${humanBytes(projected)} of index — ` +
+      `more than a browser can hold. Indexing will stop part-way, and ` +
+      `everything found before then stays browsable.`,
+  );
+}
+
 /** One instalment of results from the Worker. */
 function onFound(event: FoundEvent): void {
   const first = search.size === 0;
@@ -1671,6 +1727,7 @@ async function openFile(source: File): Promise<void> {
   findInput.value = "";
   resetSearch();
   resetProblems();
+  warnedAboutShape = false;
   validating = 0;
   renderCrumbs();
   renderSelectionInfo();
@@ -1732,6 +1789,7 @@ function onEvent(event: WorkerEvent): void {
   if (!event.done) {
     progressFill.dataset["state"] = "";
     indexState.textContent = `${humanBytes(event.consumed)} · ${rows}`;
+    warnIfShapeIsExpensive(event);
   } else if (event.stopped) {
     progressFill.dataset["state"] = "stopped";
     indexState.textContent = `${STOPPED[event.stopped]} · ${rows}`;

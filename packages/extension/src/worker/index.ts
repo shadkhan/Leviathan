@@ -596,11 +596,20 @@ async function indexToEnd(document: Document): Promise<void> {
       try {
         return document.indexStep();
       } catch (thrown) {
+        // A WebAssembly trap is not a read failure, and saying it is sends the
+        // user to check their disk when the engine ran out of address space.
+        // The index path returns `exhausted` rather than trapping, so anything
+        // that still gets here is an allocation somewhere else — but the
+        // message has to be honest about which of the two it might be.
+        const trapped = thrown instanceof WebAssembly.RuntimeError;
         emit({
-          ...halted(document, "error"),
+          ...halted(document, trapped ? "exhausted" : "error"),
           error: toProtocolError(
             thrown,
-            "Indexing stopped: the file could not be read.",
+            trapped
+              ? "Indexing stopped: the engine ran out of memory. " +
+                  "The rows found so far are still browsable."
+              : "Indexing stopped: the file could not be read.",
           ),
         });
         return undefined;
@@ -619,6 +628,7 @@ async function indexToEnd(document: Document): Promise<void> {
         rows: step.rows,
         done,
         ...(step.malformed ? { stopped: "malformed" as const } : {}),
+        ...(step.exhausted ? { stopped: "exhausted" as const } : {}),
         usage: usage(document),
       });
     } finally {
@@ -636,7 +646,10 @@ async function indexToEnd(document: Document): Promise<void> {
 }
 
 /** The final progress event for an index that stopped without finishing. */
-function halted(document: Document, why: "cancelled" | "error"): ProgressEvent {
+function halted(
+  document: Document,
+  why: "cancelled" | "error" | "exhausted",
+): ProgressEvent {
   return {
     kind: "progress",
     consumed: document.indexedBytes,

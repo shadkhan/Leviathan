@@ -71,6 +71,17 @@ pub enum Built {
     /// indexed and still correct (C6) — this is a stopping condition, not a
     /// failure.
     Malformed,
+    /// The index would not fit in memory.
+    ///
+    /// Reached only by a shape that costs nearly as much to index as to store:
+    /// a flat array of small scalars is 8 bytes of table per ~10 bytes of file
+    /// (C29), so a 2.5 GB one cannot be held in a 32-bit address space. Records
+    /// — the shape this product exists for — are 2.8 %, and an 8 GB NDJSON file
+    /// indexes in 539 MB.
+    ///
+    /// Like `Malformed`, everything indexed before the limit is still real and
+    /// still browsable. Unlike a panic, it is a value the caller can explain.
+    Exhausted,
 }
 
 impl Built {
@@ -257,6 +268,14 @@ impl Build {
                     }
                 }
             }
+
+            // Checked after every window rather than at the end: once the table
+            // has stopped accepting children, reading the remaining bytes buys
+            // nothing but time, and on the file that reaches this the remaining
+            // bytes are measured in gigabytes.
+            if self.table().exhausted() {
+                return Ok(self.stop(Built::Exhausted));
+            }
         }
 
         Ok(self.stop(Built::Batch))
@@ -365,6 +384,30 @@ mod tests {
     }
 
     // ---- the two formats --------------------------------------------------
+
+    #[test]
+    fn an_index_that_fits_never_reports_exhaustion() {
+        // The contract, stated where it can rot loudly. Actually exhausting a
+        // 64-bit heap in a unit test is not practical — it is verified against a
+        // 2.5 GB scalar-dense fixture in wasm32, where it stops at 134,217,728
+        // records and the tree stays browsable. What is checkable here is that
+        // the flag is not set by ordinary work, and that `Exhausted` is not
+        // resumable: calling `advance` again would only fail the same way.
+        let source: &[u8] = b"{\"a\":1}
+{\"b\":2}
+{\"c\":3}
+";
+        let mut build = Build::new(Format::Ndjson);
+        let mut bytes = source;
+        let reason = build
+            .run_to_end(&mut bytes, &BuildOptions::default())
+            .unwrap();
+
+        assert_eq!(reason, Built::Complete);
+        assert!(!build.table().exhausted());
+        assert!(!Built::Exhausted.resumable());
+        assert!(Built::Batch.resumable());
+    }
 
     #[test]
     fn ndjson_indexes_one_row_per_record() {

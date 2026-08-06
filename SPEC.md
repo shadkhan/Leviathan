@@ -18,7 +18,7 @@ These are the constraints that shape every phase. If one of them turns out to be
 | # | Truth | Consequence |
 |---|---|---|
 | G1 | A 500 MB file cannot be held in JS as parsed objects, and should not be held in WASM linear memory in full either. | The core is **streaming and sans-IO**; source bytes stay in a JS `Blob`/`File` and are re-read by byte range on demand. |
-| G2 | wasm32 has a 4 GB address space and realistically a ~2 GB usable heap. | The **index must be far smaller than the file**. Budget ≤16 bytes/node, plus lazy tier-2 indexing. |
+| G2 | wasm32 has a 4 GB address space and realistically a ~2 GB usable heap. | The **index must be far smaller than the file**. Budget ≤16 bytes/node, plus lazy tier-2 indexing. **Measured (2026-08-06):** 8 GB of NDJSON indexes in 539 MB of linear memory; a 2.5 GB flat array of numbers does not fit and now stops cleanly rather than trapping (C72). G2 holds, and the binding constraint is node count, not file size. |
 | G3 | The index is a *navigation aid, not a replica*. Any detail (key names, string values, exact spans) can be re-derived by re-lexing a small byte range. | Never store what a 4 KB re-scan can recompute. |
 | G4 | Chrome MV3 forbids remote code and blocking `webRequest`. | `.wasm` is a bundled asset; CSP needs `wasm-unsafe-eval`; auto-interception of `application/json` navigations is **not** a v1 make-or-break (see R3). |
 | G5 | The Rust core must be independently publishable and reusable (crates.io + npm + future native CLI/MCP). | Core crate has **zero** `wasm-bindgen` and zero I/O dependencies. The WASM wrapper is a separate crate. |

@@ -394,7 +394,7 @@ export type WorkerEvent =
       done: boolean;
       /** Why, when it is worth saying: a malformed document, or a cancel. The
        * rows found before that point are still real rows (C6). */
-      stopped?: "malformed" | "cancelled" | "error";
+      stopped?: "malformed" | "cancelled" | "error" | "exhausted";
       /** Present when `stopped` is `'error'`. */
       error?: ProtocolError;
       /** What the engine occupies right now. Carried on the event that already

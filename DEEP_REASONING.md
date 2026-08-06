@@ -1804,10 +1804,93 @@ record that the defence that works is a ratio in a table, not a memory.
 
 ---
 
+## 2026-08-06 — How big is large, answered
+
+### C72 — The ceiling is a shape, not a size, and it is now a stopping condition — **validated**
+
+C29 predicted this from a 49 MB fixture: the index is 8 bytes per node whatever
+the node is, so a flat array of small scalars approaches the size of the data it
+indexes. The prediction has now been run against the real `.wasm` at the
+boundary, and it was right in both directions.
+
+| Shape | File | Records | Index | Peak WASM | Result |
+|---|---:|---:|---:|---:|---|
+| NDJSON records | 2 GB | 7.1 M | 56.6 MB (2.8 %) | 136 MB | complete, 4.4 s |
+| NDJSON records | **8 GB** | **28.2 M** | **226 MB (2.8 %)** | **539 MB** | complete, 17.8 s |
+| Array of numbers | 1 GB | 100 M | 800 MB (81 %) | **2.15 GB** | complete, barely |
+| Array of numbers | 2.5 GB | 250 M | 1.07 GB | 2.15 GB | **stops at 134 M** |
+
+Two things worth separating.
+
+**The good number is better than the claim was.** The README said 500 MB because
+that was the largest fixture measured, and the rule was to never publish the
+extrapolation. Measured, it does 8 GB — sixteen times the published figure — and
+the limit for that shape is not in sight: 226 MB of index for 8 GB leaves most
+of a 32-bit address space unused. Rahul's persona range (500 MB–2 GB) has four
+times its own headroom above it.
+
+**The bad case was worse than "slow".** At 2.5 GB of scalar-dense data it did not
+degrade — it died, with `RuntimeError: unreachable`. That is Rust's
+allocation-failure abort: the release profile is `panic = "abort"`, so a failed
+`Vec` growth becomes a raw wasm trap. Three separate defects in one line of
+output:
+
+1. **The user was told the wrong thing.** The Worker caught the trap and reported
+   *"the file could not be read"* — sending someone to check their disk when the
+   engine had run out of address space. Requirement 7 was met in the letter (no
+   white screen) and missed in the spirit.
+2. **The partial index was lost.** C6 says everything found before a failure is
+   still real. A trap does not honour that: the module is unwound and there is
+   nothing to keep.
+3. **`unreachable` is not a message.** It names a WebAssembly instruction.
+
+The fix is not a bigger buffer. `Vec::try_reserve` turns the failure into a
+value, so exhaustion joins `Malformed` as a *stopping condition* — the same
+machinery C6 already built for broken files. The 2.5 GB file now indexes
+134,217,728 records, reports `exhausted`, and stays fully usable: fifty rows from
+record 134,217,668 in 1.6 ms.
+
+The general form, and the reason this is its own entry: **an out-of-memory is a
+result, not an exception.** A program that can predict the limit can report it,
+and a program that reports it can keep what it earned. Aborting throws away work
+that was already correct in order to avoid writing four lines of error handling.
+
+*Rules out:* `Vec::push` on any structure whose size is driven by input, in a
+32-bit target; reporting an allocation failure as an I/O failure; a size claim
+without a fixture behind it.
+
+### C73 — Warn from measured shape, before the wait — **assumed**
+
+Knowing the ceiling is only half of it. The scalar-dense file failed after
+**nine seconds** of indexing, and on a slower browser read path that is minutes
+of work thrown away.
+
+Nothing needs predicting: after 2 % of the file, index-bytes ÷ bytes-consumed is
+a measured ratio, and multiplying it out says whether the whole file will fit.
+The viewer now says so — once, early, naming the projected size — rather than
+letting the user find out at the end.
+
+This is the same instinct as every honest-instrument entry in this log, pointed
+forward instead of backward. The harness refuses to publish a rate it cannot
+justify (C58); this refuses to start a wait it can already see the end of.
+
+*Rules out:* discovering a resource limit only by reaching it, when the ratio
+that predicts it is already being measured.
+
+---
+
 ## Log of revisions
 
 *(Append here as concepts are validated or revised. Format: date — concept id — what changed — the number that changed it.)*
 
+- **2026-08-06 — C29 — validated at its boundary, and promoted to a handled
+  case.** The 81 %-index shape was predicted from a 49 MB fixture and is now
+  measured at 1 GB (2.15 GB of WASM) and 2.5 GB (does not fit). It no longer
+  traps; it stops and keeps what it found (C72).
+- **2026-08-06 — the 500 MB claim is retired.** Measured at 8 GB: 28.2 M
+  records, 226 MB of index, 539 MB of linear memory, 17.8 s. The rule that
+  produced the conservative claim — measure it or claim the last measurement —
+  is what made this an upgrade rather than a correction.
 - **2026-08-05 — C1 — validated at the last layer that could have broken it.**
   Export writes 500 MB while holding 22.1 MB, against 22.2 MB to index the same
   file. Every stage of this product now runs in the memory of the index alone,
